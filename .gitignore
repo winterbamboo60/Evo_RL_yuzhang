@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+logs/
+outputs/
+checkpoints/
+wandb/
+
+*.tar
+*.tar.gz
+*.zip
+*.ckpt
+*.pth
+*.pt

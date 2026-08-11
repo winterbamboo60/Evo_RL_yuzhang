@@ -1,0 +1,18 @@
+{
+  "events": [
+    "bad_depth",
+    "bad_edge"
+  ],
+  "key_bindings": {
+    "d": [
+      "bad_depth"
+    ],
+    "e": [
+      "bad_edge"
+    ],
+    "a": [
+      "bad_depth",
+      "bad_edge"
+    ]
+  }
+}

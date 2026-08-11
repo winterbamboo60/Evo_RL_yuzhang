@@ -1,0 +1,398 @@
+# Piper RLT Actor-Critic Online RL 开发计划
+
+## 1. 目标与边界
+
+在 `/home/yz/projects/Evo-RL-loop-0609/src/lerobot/onlineRL/` 新建一个
+独立的在线 RLT actor-critic 执行模块，用单 Piper 从臂完成实际任务。
+
+本计划中的约束：
+
+- 所有后续新增代码只放在 `src/lerobot/onlineRL/`。
+- 不修改 `scripts/RL_data.sh`、现有 `lerobot/rl`、Piper driver 或其他目录。
+- Stage1 Pi0.5 VLA 冻结，只产生 RLT 特征和 reference action；不参与 Stage2 更新。
+- 不使用 `TARGET_EE_POSE`，不根据末端位姿自动判断成功。
+- 成功由人工按 `S` 确认；超时视为失败；只有按 `R` 才执行回初始姿态。
+- 当前实现默认所有进程都在本机；接口预留 learner（含 critic）放到另一台机器。
+- 当前机器没有真实机械臂时，只运行 fake hardware 的 dry-run 测试，不触发 CAN 控制。
+
+## 2. 硬件语义
+
+任务执行对象只有一个 Piper 从臂。主臂不作为独立任务机器人，也不构成
+14 维双臂策略 action；模型 state/action 均保持单 Piper 的 7 维定义。
+
+自动模式：
+
+```text
+Stage1 VLA reference action 或 RLT actor action
+  ├─ follower.send_action(action)       从臂真实执行
+  └─ leader.send_feedback(action)       主臂接收相同动作以同步镜像
+```
+
+人工接管模式：
+
+```text
+leader.get_action()                     人工操作主臂
+  └─ follower.send_action(human_action) 从臂执行主臂动作
+```
+
+无论哪种模式，唯一记录到训练数据的 action 都是：
+
+```text
+follower.send_action(...) 的实际返回值
+```
+
+它包含从臂驱动器实际采用的关节指令，因此能如实反映限幅、限速等控制差异。
+
+硬件连接和配置仿照 `scripts/RL_data.sh`：
+
+- follower：`piper_follower`，默认 CAN 为 `can1`；
+- leader：`piper_leader`，默认 CAN 为 `can0`；
+- 相机、速度比例、CAN 自动初始化、校准目录及设备 ID 均配置化；
+- 复用目标项目已有的 Piper robot/teleoperator 类，不重新实现 CAN 或 Piper SDK。
+
+## 3. 部署拓扑
+
+默认本机采用两个独立进程：
+
+```text
+进程 A：Actor / 真机执行                     actor_device，例如 cuda:0
+  Stage1 VLA 推理
+  RLT Stage2 actor 推理
+  Piper 主从臂控制
+  键盘事件处理
+  完整 episode 暂存与发送
+  接收并热更新 actor 权重
+
+进程 B：Learner / Actor-Critic 训练           learner_device，例如 cuda:1
+  episode replay buffer
+  可训练 actor 副本
+  twin critic 与 target critic
+  所有 optimizer 和 target update
+  将更新后的 actor state_dict 回传给进程 A
+```
+
+当前本机通信默认使用 `127.0.0.1`。接口固定为 host/port 和序列化消息，未来
+只需要将 `learner_host` 改为远程训练机 IP，即可把进程 B 放到其他机器。
+
+远程部署时：
+
+- 本地执行机保留 Stage1 VLA 和仅用于推理的 Stage2 actor；
+- 训练机保留可训练 actor 副本、critic、target critic、replay、优化器；
+- 训练机只回传 actor 参数，不回传 critic、target critic、优化器或 replay；
+- actor 仅在 action chunk 边界完整接收一个新版本后原子替换权重。
+
+这与当前 RLinf RLT 的算法职责一致，但部署不同。RLinf 当前将 actor、critic、
+target critic、replay 和优化器都置于同一个 Actor worker；本方案把采样 actor
+与训练 learner 显式分开。
+
+## 4. RLT 模型定义
+
+保持当前 RLT Stage2 的输入输出：
+
+```text
+冻结 Stage1 VLA：
+  observation -> z_rl, proprio, ref_action_chunk
+
+Stage2 actor：
+  (z_rl, proprio, ref_action_chunk) -> actor_action_chunk
+
+twin critic：
+  (z_rl, proprio, ref_action_chunk, executed_action_chunk) -> Q1, Q2
+```
+
+默认模型和算法参数：
+
+```text
+z_dim = 2048
+proprio_dim = 7
+action_dim = 7
+ref_num_action_chunks = 50
+num_action_chunks = 10
+gamma = 0.96
+tau = 0.005
+q_weight = 0.1
+bc_weight = 5.0
+reference_dropout_prob = 0.5
+critic_actor_ratio = 4
+```
+
+每次 Stage1 VLA 产生 50 步 reference chunk；RLT actor 产生 10 步 actor chunk。
+执行完一个 10 步 chunk 后重新采集观测并推理，保持对人工操作和视觉变化的响应。
+
+critic loss：
+
+```text
+L_critic = MSE(Q1(s, a), y) + MSE(Q2(s, a), y)
+y = r + gamma^chunk_horizon * bootstrap_mask * min(Q_target(s_next, pi(s_next)))
+```
+
+actor loss：
+
+```text
+L_actor = -q_weight * Q1(s, pi(s)) + bc_weight * BC(pi(s), bc_target)
+```
+
+BC target：自动模式使用 Stage1 reference action；人工接管 action 使用从臂实际执行的
+人工动作。人工样本由 `intervention_flag` 区分。
+
+## 5. Replay：以完整 episode 为缓存单位
+
+缓存单位明确规定为完整 episode，而不是单个 transition。
+
+```text
+Actor
+  当前 episode accumulator
+      -> episode 结束后封口
+  有界 episode outbox（按 episode 个数计数）
+      -> Learner 收到、落盘并确认后删除
+
+Learner
+  episode replay ring buffer（按 episode 个数计数）
+      -> 采样一个或多个完整 episode
+      -> 从其内部按 action chunk 构造 TD transition batch
+      -> 更新 critic/actor
+```
+
+默认参数与现有 RLT 的容量数值保持一致，但单位改为 episode：
+
+```text
+max_cached_episodes = 200
+sample_window_episodes = 200
+min_buffer_episodes = 2
+train_actor_episodes = 2
+update_epoch = 8
+critic_actor_ratio = 4
+```
+
+含义：
+
+- learner 最多保留最近 200 个完整、已确认的 episode；超过时按 FIFO 淘汰最旧 episode；
+- 训练采样窗口默认为最近 200 个 episode；
+- 缓存少于 2 个完整 episode 时，不启动 critic 或 actor 更新；
+- 达到 2 个完整 episode 后，learner 持续消费缓存做 critic 更新；
+- 每 4 次 critic 更新，执行 1 次 actor 更新；
+- 每个 episode 到达后，根据 `update_epoch` 增加应完成更新预算，learner 可异步持续补齐；
+- actor 的未确认 outbox 也最多保留 200 个 episode；若满则不丢数据，而是保持机械臂当前位置、
+  暂停开始新 episode，等待 learner 确认。
+
+每个 episode 内仍保留完整有序 transition 序列：
+
+```text
+episode = [
+  (s0, a0, r0, s1, terminal0),
+  (s1, a1, r1, s2, terminal1),
+  ...,
+  (sT, aT, rT, sT+1, terminalT),
+]
+```
+
+采样时可先按 episode 均匀采样，再在 episode 内均匀采样 action chunk transition；
+这既满足 episode 级缓存，又维持 RLT/SAC 的单 transition TD 目标。为避免长 episode
+被过度采样，默认不直接将所有 transition 混合后做全局均匀采样。
+
+完整 episode 缓存解决了终止奖励的归因：actor 在 episode 封口前不会把不完整序列交给
+learner，因此最后一步的成功/失败/超时标记和前后 state 均已对齐。
+
+## 6. Episode 终止、奖励和 TD 归因
+
+按键和状态规则：
+
+| 事件 | 结果 | reward | bootstrap | 回位 |
+|---|---|---:|---:|---:|
+| B | 切换 VLA reference / actor action chunk | 无 | 无 | 否 |
+| I | 切换人工接管开/关 | 无 | 无 | 否 |
+| S | 人工确认成功，封口当前 episode | 末步为 1 | 0 | 否 |
+| Q | 人工确认失败，封口当前 episode | 末步为 0 | 0 | 否 |
+| 超时 | 失败，封口当前 episode | 末步为 0 | 0 | 否 |
+| R | 放弃当前 episode，丢弃它并回位 | 不写入 | 不适用 | 是 |
+
+除最后一步外，默认每个 transition 的 reward 为 0。成功 episode 的最后一步为：
+
+```text
+(s_T, a_T, reward=1, s_T+1, terminal=True, bootstrap_mask=0)
+```
+
+失败或超时 episode 的最后一步为：
+
+```text
+(s_T, a_T, reward=0, s_T+1, terminal=True, bootstrap_mask=0)
+```
+
+critic 不要求将 success reward 回填到每一历史步。TD bootstrap 会把末步的成功 Q 值
+通过后继状态逐次传播到先前 action。超时按本任务语义是明确失败，因此即便保留
+`truncated=True` 供日志使用，也必须令 `bootstrap_mask=0`，不能像一般 Gym 截断那样
+继续 bootstrap。
+
+S、Q、超时后的动作规则：
+
+- 主从臂保持当前位置；
+- 不自动回初始位；
+- 不自动输出下一条 VLA 或 actor action；
+- 进入 hold 状态，等待本次运行结束或未来明确扩展启动下一 episode 的独立按键。
+
+R 是唯一复位路径：
+
+1. 丢弃当前未封口 episode；
+2. 读取启动时保存的从臂初始关节姿态；
+3. 在 `reset_duration_s` 内插值回位；
+4. 每一个插值动作同时发送到 follower，并发 feedback 到 leader；
+5. 回位完成后开始新的 episode。
+
+## 7. 键盘与控制状态机
+
+`keyboard.py` 使用独立监听线程和线程安全事件队列，不能阻塞 CAN 或推理线程。
+
+```text
+B：持久切换自动 source：VLA <-> actor
+I：持久切换 control mode：automatic <-> human
+S：写 success terminal event
+Q：写 explicit failure terminal event
+R：abort 当前 episode、回位、重新开始
+```
+
+人工模式：
+
+- 第一次 I：启用主臂 manual control；每个控制周期读取 `leader.get_action()` 并发送给从臂；
+- 第二次 I：关闭 manual control；先将当前从臂姿态/最后实际 action 回馈给主臂，再恢复自动
+  source，避免主从切换时关节跳变；
+- 人工阶段写入 `action_source=human` 和 `intervention_flag=True`。
+
+## 8. Stage1 VLA 与观测适配
+
+`vla.py` 仅运行在 actor 进程的 `actor_device`：
+
+- 加载 Stage1 Pi0.5 checkpoint；
+- 加载对应 `norm_stats.json`；
+- 从从臂读取本体 state、读取两路相机；
+- 产生 `ref_action_chunk` 和 RLT 需要的 `z_rl`；
+- 将 raw observation 转为 actor 所需的 `z_rl + proprio + ref_chunk`。
+
+启动前必须验证：
+
+```text
+z_rl 维度与 RLT checkpoint 一致
+proprio 为 7 维
+action 为 7 维
+reference chunk 长度为 50
+actor chunk 长度为 10
+相机字段、图像尺寸与 norm_stats 字段一致
+```
+
+如 Stage1 模型没有公开的 `z_rl` 输出，优先调用其 RLT feature 接口；否则使用配置指定的
+模块名注册 forward hook。若提取维度不匹配，程序必须在连接硬件前失败，不得猜测特征。
+
+## 9. 进程、通信和参数同步
+
+将新增如下接口：
+
+```text
+Actor -> Learner
+  hello/capability
+  complete_episode
+  episode_metrics
+  checkpoint_request
+
+Learner -> Actor
+  episode_ack
+  actor_state_dict
+  actor_version
+  training_metrics
+  stop/error
+```
+
+本机默认实现使用 `multiprocessing` 队列；另提供使用相同消息格式的 gRPC transport。
+
+- outbox 中的 episode 有唯一 `episode_id`、序列号和持久化文件；
+- learner 先持久化/写入 replay，再回复 `episode_ack`；
+- actor 只在收到 ack 后删除本地 outbox episode；
+- learner 按 `actor_sync_interval_updates` 推送 actor 权重；
+- actor 用 `actor_version` 拒绝旧版本或不完整权重；
+- learner 断开时，actor 保持最后完整 actor 权重，不接受半包，不丢弃 outbox；
+- 本机和远程模式只替换 transport，模型、缓存、TD 和控制逻辑完全相同。
+
+## 10. 目录和模块职责
+
+后续新增目录结构：
+
+```text
+src/lerobot/onlineRL/
+├── __init__.py
+├── config.py            配置 dataclass、校验与默认值
+├── run.py               启动 actor、learner 或本机双进程模式
+├── actor_runtime.py     VLA/actor 推理、Piper rollout、episode outbox
+├── learner_runtime.py   episode replay、critic/actor 更新、参数发布
+├── protocol.py          episode 和参数消息的数据结构及版本
+├── transport.py         multiprocessing 与 gRPC transport
+├── hardware.py          Piper 主从适配、同步下发、初始姿态与回位
+├── keyboard.py          B/I/S/Q/R 按键事件状态机
+├── rollout.py           episode accumulator、封口与 hold 状态
+├── vla.py               Stage1 Pi0.5/RLT feature 适配
+├── rlt_model.py         RLT MLP actor、twin critic、target critic、loss
+├── replay.py            episode 级 ring buffer 和 transition sampler
+├── safety.py            action 限幅、异常停机和健康检查
+├── configs/piper_rlt_ac.json
+└── tests/
+```
+
+## 11. 安全策略
+
+- 每个模型 action 做 NaN/Inf、shape、关节限位和速度限位检查；
+- 只接受 follower 实际返回 action 作为记录值；
+- CAN、相机、VLA、主臂读取或 learner 通信发生错误时，停止发送新 action 并保持当前位置；
+- Ctrl+C 时关闭 transport、保存本地 outbox/replay 元数据、断开设备；
+- actor/learner GPU 可以相同，但配置会提示 VLA 与训练竞争显存；推荐 `cuda:0` / `cuda:1`；
+- 先用 fake hardware + fake VLA 的 dry-run；真实 CAN 控制不允许由自动测试触发。
+
+## 12. 配置和启动方式
+
+默认本机双进程：
+
+```bash
+cd /home/yz/projects/Evo-RL-loop-0609/src
+
+/home/yz/projects/env/package_sorting_env/bin/python \
+  -m lerobot.onlineRL.run \
+  --config_path lerobot/onlineRL/configs/piper_rlt_ac.json \
+  --mode local \
+  --actor_device cuda:0 \
+  --learner_device cuda:1
+```
+
+未来远程 learner：
+
+```bash
+# 训练机
+python -m lerobot.onlineRL.run --mode learner --learner_device cuda:0 --listen 0.0.0.0:<port>
+
+# 机械臂执行机
+python -m lerobot.onlineRL.run --mode actor --actor_device cuda:0 --learner_host <训练机IP>
+```
+
+## 13. 测试与验收
+
+在指定环境中执行的自动测试：
+
+```bash
+cd /home/yz/projects/Evo-RL-loop-0609/src
+
+/home/yz/projects/env/package_sorting_env/bin/python -m pytest \
+  lerobot/onlineRL/tests -q
+```
+
+测试范围：
+
+- RLT actor、twin critic、target critic 的输入输出、梯度与 target update；
+- 50 步 reference chunk 到 10 步 actor chunk 的形状和截取；
+- 只记录 follower 实际 action；
+- 完整 episode 缓存、FIFO 淘汰、按 episode 采样及最小 2 episode 更新门槛；
+- 成功奖励在末步的 TD 传播、失败/超时 bootstrap 禁止；
+- B/I/S/Q/R/timeout 状态机；
+- 只有 R 回位，S/Q/timeout 后均保持当前位置；
+- 本机 actor -> learner -> actor 参数热更新；
+- mock gRPC 的远程协议兼容性、ack 重传和 actor version；
+- fake Piper/fake VLA 的 end-to-end dry-run；
+- checkpoint、outbox、episode replay 和 actor version 恢复。
+
+`pynput` 在没有 X11 DISPLAY 的环境中不能直接加载。因此键盘后端必须延迟导入；自动测试
+使用 fake keyboard，真实运行需提供有效 DISPLAY。当前没有真实机械臂时，只进行 dry-run
+和导入/逻辑测试，不执行 CAN 控制。

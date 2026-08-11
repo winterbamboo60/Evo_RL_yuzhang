@@ -1,0 +1,125 @@
+{
+  "dataset": null,
+  "env": {
+    "type": "gym_manipulator",
+    "task": "piper_online_rl",
+    "fps": 10,
+    "features": {
+      "agent_pos": {
+        "type": "STATE",
+        "shape": [7]
+      },
+      "action": {
+        "type": "ACTION",
+        "shape": [7]
+      }
+    },
+    "features_map": {
+      "agent_pos": "observation.state",
+      "action": "action"
+    },
+    "name": "real_robot",
+    "robot": {
+      "type": "piper_follower",
+      "id": "piper_follower",
+      "port": "can1",
+      "speed_ratio": 30,
+      "require_calibration": true,
+      "enable_on_connect": true,
+      "cameras": {}
+    },
+    "teleop": {
+      "type": "piper_leader",
+      "id": "piper_leader",
+      "port": "can0",
+      "manual_control": true,
+      "command_speed_ratio": 30
+    },
+    "processor": {
+      "control_mode": "piper_leader",
+      "observation": {
+        "add_joint_velocity_to_observation": false,
+        "add_current_to_observation": false,
+        "add_ee_pose_to_observation": false,
+        "display_cameras": false
+      },
+      "image_preprocessing": null,
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "fixed_reset_joint_positions": null,
+        "reset_time_s": 5.0,
+        "control_time_s": 20.0,
+        "terminate_on_success": true
+      },
+      "inverse_kinematics": null,
+      "reward_classifier": null,
+      "max_gripper_pos": 100.0
+    }
+  },
+  "policy": {
+    "type": "sac",
+    "device": "cuda",
+    "storage_device": "cpu",
+    "vision_encoder_name": null,
+    "freeze_vision_encoder": true,
+    "shared_encoder": true,
+    "num_discrete_actions": null,
+    "dataset_stats": {
+      "observation.state": {
+        "min": [-180.0, -180.0, -180.0, -180.0, -180.0, -180.0, 0.0],
+        "max": [180.0, 180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+      },
+      "action": {
+        "min": [-180.0, -180.0, -180.0, -180.0, -180.0, -180.0, 0.0],
+        "max": [180.0, 180.0, 180.0, 180.0, 180.0, 180.0, 100.0]
+      }
+    },
+    "online_steps": 1000000,
+    "online_buffer_capacity": 100000,
+    "offline_buffer_capacity": 100000,
+    "async_prefetch": false,
+    "online_step_before_learning": 100,
+    "policy_update_freq": 1,
+    "discount": 0.99,
+    "temperature_init": 1.0,
+    "num_critics": 2,
+    "num_subsample_critics": null,
+    "critic_lr": 0.0003,
+    "actor_lr": 0.0003,
+    "temperature_lr": 0.0003,
+    "critic_target_update_weight": 0.005,
+    "utd_ratio": 1,
+    "state_encoder_hidden_dim": 256,
+    "latent_dim": 256,
+    "target_entropy": null,
+    "use_backup_entropy": true,
+    "grad_clip_norm": 40.0,
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "policy_parameters_push_frequency": 4,
+      "queue_get_timeout": 2.0
+    },
+    "concurrency": {
+      "actor": "threads",
+      "learner": "threads"
+    },
+    "use_torch_compile": false
+  },
+  "output_dir": "/home/yz/projects/outputs/piper_online_rl",
+  "job_name": "piper_online_rl",
+  "resume": false,
+  "seed": 1000,
+  "batch_size": 32,
+  "steps": 1000000,
+  "eval_freq": 20000,
+  "log_freq": 100,
+  "save_checkpoint": true,
+  "save_freq": 10000,
+  "wandb": {
+    "enable": false
+  }
+}
