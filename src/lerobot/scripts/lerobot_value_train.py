@@ -94,6 +94,14 @@ def _finish_training_logger(wandb_logger: Any | None) -> None:
     if wandb_logger is None:
         return
 
+    logger_finish = getattr(wandb_logger, "finish", None)
+    if callable(logger_finish):
+        try:
+            logger_finish()
+        except Exception:
+            logging.debug("Failed to finish experiment logger.", exc_info=True)
+        return
+
     wandb = getattr(wandb_logger, "_wandb", None)
     if wandb is not None:
         try:

@@ -42,6 +42,7 @@ else:
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from lerobot.policies.pi05.rlt_token_transformer import RLTTokenTransformer
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
@@ -570,6 +571,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        if config.use_rlt:
+            rlt_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
+            self.rlt_module = RLTTokenTransformer(
+                input_dim=config.rlt_input_dim,
+                embed_dim=config.rlt_embed_dim,
+                num_rl_tokens=config.rlt_num_rl_tokens,
+                prefix_seq_len=config.rlt_prefix_seq_len,
+                num_layers=config.rlt_num_layers,
+                num_heads=config.rlt_num_heads,
+                mlp_ratio=config.rlt_mlp_ratio,
+            ).to(dtype=rlt_dtype)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -728,7 +741,78 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def _select_rlt_prefix_embeddings(
+        self,
+        prefix_output: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        tokens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.config.rlt_image_only and tokens is not None:
+            num_image_tokens = prefix_output.shape[1] - tokens.shape[1]
+            prefix_output = prefix_output[:, :num_image_tokens]
+            prefix_pad_masks = prefix_pad_masks[:, :num_image_tokens]
+        return prefix_output, prefix_pad_masks
+
+    def build_prefix_cache(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        tokens: torch.Tensor,
+        masks: torch.Tensor,
+        *,
+        use_cache: bool = True,
+    ):
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks
+        )
+        backbone_dtype = self.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype
+        if prefix_embs.dtype != backbone_dtype:
+            prefix_embs = prefix_embs.to(dtype=backbone_dtype)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=use_cache,
+        )
+        return prefix_output, prefix_pad_masks, past_key_values
+
+    def encode_rlt(
+        self,
+        prefix_output: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.config.use_rlt or not hasattr(self, "rlt_module"):
+            raise ValueError("encode_rlt requires config.use_rlt=True and an initialized rlt_module.")
+
+        prefix_output, prefix_pad_masks = self._select_rlt_prefix_embeddings(
+            prefix_output, prefix_pad_masks, tokens
+        )
+        rlt_param = next(self.rlt_module.parameters())
+        prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+        rlt_mask = prefix_pad_masks if self.config.rlt_use_mask else None
+        return self.rlt_module.encode_flat(prefix_output, rlt_mask).to(dtype=torch.float32)
+
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        return_rlt_prefix: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         """Do a full training forward pass and compute the loss."""
         # 训练目标：让模型在任意时间步 t，给定加噪动作 x_t​ 和多模态条件，预测出正确的"去噪方向" u_t​，推理时沿反方向积分即可从噪声恢复出真实动作。
 
@@ -775,8 +859,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # PaliGemma + Expert 双分支前向
             # PaliGemma 主干：处理 prefix（图像+语言）
             # Expert 分支：处理 suffix（动作），接受时间步条件调制（AdaRMS）
-            # 只取 suffix_out，丢弃 prefix 输出
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_output, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -784,9 +867,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_output, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_output, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -801,7 +884,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         # 模型预测的速度场 v_t 与真实速度场 u_t 之间的误差，用于反向传播
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        if return_rlt_prefix:
+            return losses, prefix_output.detach(), prefix_pad_masks
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -815,35 +901,65 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
+        _, prefix_pad_masks, past_key_values = self.build_prefix_cache(
+            images, img_masks, tokens, masks, use_cache=True
+        )
+        return self.sample_actions_from_prefix_cache(
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            noise=noise,
+            num_steps=num_steps,
+            **kwargs,
+        )
+
+    @torch.no_grad()
+    def sample_actions_and_rlt(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        noise=None,
+        num_steps=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> dict[str, torch.Tensor]:
+        """Compute action chunk and z_rl from one shared prefix forward."""
+        prefix_output, prefix_pad_masks, past_key_values = self.build_prefix_cache(
+            images, img_masks, tokens, masks, use_cache=True
+        )
+        z_rl = self.encode_rlt(prefix_output, prefix_pad_masks, tokens)
+        actions = self.sample_actions_from_prefix_cache(
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            noise=noise,
+            num_steps=num_steps,
+            **kwargs,
+        )
+        return {"actions": actions, "z_rl": z_rl}
+
+    @torch.no_grad()
+    def sample_actions_from_prefix_cache(
+        self,
+        prefix_pad_masks,
+        past_key_values,
+        noise=None,
+        num_steps=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """Denoise an action chunk using a precomputed prefix KV cache."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
-        bsize = tokens.shape[0]
-        device = tokens.device
+        bsize = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
 
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
                 bsize,
                 self.config.chunk_size,
                 self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
+            )
             noise = self.sample_noise(actions_shape, device)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
 
         dt = -1.0 / num_steps
 
@@ -1043,18 +1159,30 @@ class PI05Policy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # Load the remapped state dict into the model. Base PI05 checkpoints do
+            # not contain RLT module weights; keep those freshly initialized.
+            allow_missing_rlt = bool(getattr(model.config, "use_rlt", False))
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_state_dict, strict=strict and not allow_missing_rlt
+            )
+            rlt_missing_keys = [key for key in missing_keys if key.startswith("model.rlt_module.")]
+            non_rlt_missing_keys = [key for key in missing_keys if not key.startswith("model.rlt_module.")]
 
-            if missing_keys:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
+            if rlt_missing_keys:
+                print(
+                    "RLT module weights not found in pretrained checkpoint; "
+                    f"initialized from scratch ({len(rlt_missing_keys)} keys)."
+                )
+
+            if non_rlt_missing_keys:
+                print(f"Missing non-RLT keys when loading state dict: {len(non_rlt_missing_keys)} keys")
+                if len(non_rlt_missing_keys) <= 5:
+                    for key in non_rlt_missing_keys:
                         print(f"  - {key}")
                 else:
-                    for key in missing_keys[:5]:
+                    for key in non_rlt_missing_keys[:5]:
                         print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
+                    print(f"  ... and {len(non_rlt_missing_keys) - 5} more")
 
             if unexpected_keys:
                 print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
@@ -1066,8 +1194,19 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(unexpected_keys) - 5} more")
 
-            if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
+            if strict and (non_rlt_missing_keys or unexpected_keys):
+                error_parts = []
+                if non_rlt_missing_keys:
+                    error_parts.append(f"missing non-RLT keys: {len(non_rlt_missing_keys)}")
+                if unexpected_keys:
+                    error_parts.append(f"unexpected keys: {len(unexpected_keys)}")
+                raise RuntimeError("Error(s) in loading PI05 state_dict: " + ", ".join(error_parts))
+
+            if not non_rlt_missing_keys and not unexpected_keys:
+                if rlt_missing_keys:
+                    print("All pretrained VLA keys loaded successfully; RLT keys initialized from scratch.")
+                else:
+                    print("All keys loaded successfully!")
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
@@ -1268,6 +1407,24 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    @torch.no_grad()
+    def predict_action_chunk_with_rlt(
+        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
+    ) -> dict[str, Tensor]:
+        """Predict actions and z_rl from one shared prefix forward."""
+        if not self.config.use_rlt:
+            raise ValueError("predict_action_chunk_with_rlt requires config.use_rlt=True.")
+
+        self.eval()
+
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        outputs = self.model.sample_actions_and_rlt(images, img_masks, tokens, masks, **kwargs)
+
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        outputs["actions"] = outputs["actions"][:, :, :original_action_dim]
+        return outputs
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1277,6 +1434,9 @@ class PI05Policy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction: {reduction}")
+
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -1285,26 +1445,65 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        if self.config.use_rlt:
+            losses, prefix_output, prefix_mask = self.model.forward(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                actions,
+                return_rlt_prefix=True,
+            )
+        else:
+            losses = self.model.forward(images, img_masks, tokens, masks, actions)
+            prefix_output = None
+            prefix_mask = None
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        vla_loss = losses.mean()
+        per_sample_vla_loss = losses.mean(dim=(1, 2))
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 
+        if self.config.use_rlt:
+            if not hasattr(self.model, "rlt_module"):
+                raise ValueError("config.use_rlt=True requires PI05Pytorch.rlt_module.")
+            prefix_output, prefix_mask = self.model._select_rlt_prefix_embeddings(
+                prefix_output, prefix_mask, tokens
+            )
+            rlt_param = next(self.model.rlt_module.parameters())
+            prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+            rlt_mask = prefix_mask if self.config.rlt_use_mask else None
+            rlt_loss, rlt_info = self.model.rlt_module(
+                prefix_output, rlt_mask, reduction=reduction
+            )
+            rlt_loss_mean = rlt_info["mse"]
+
+            if reduction == "none":
+                per_sample_loss = self.config.rlt_alpha * per_sample_vla_loss + rlt_loss
+                loss_dict["loss"] = per_sample_loss.mean().item()
+                loss_dict["vla_loss"] = vla_loss.item()
+                loss_dict["rlt_loss"] = rlt_loss_mean.item()
+                return per_sample_loss, loss_dict
+
+            loss = rlt_loss + self.config.rlt_alpha * vla_loss
+            loss_dict["loss"] = loss.item()
+            loss_dict["vla_loss"] = vla_loss.item()
+            loss_dict["rlt_loss"] = rlt_loss_mean.item()
+            return loss, loss_dict
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
-        else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            loss_dict["loss"] = per_sample_vla_loss.mean().item()
+            return per_sample_vla_loss, loss_dict
+
+        # Default: return scalar mean loss
+        loss_dict["loss"] = vla_loss.item()
+        return vla_loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""

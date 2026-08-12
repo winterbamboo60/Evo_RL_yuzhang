@@ -303,8 +303,8 @@ lerobot-train \
     "--policy.pretrained_path=${POLICY_PRETRAINED_PATH}" \
     --policy.device="cuda" \
     --policy.train_expert_only=true \
-    --batch_size=32 \
-    --gradient_accumulation_steps=1 \
+    --batch_size=16 \
+    --gradient_accumulation_steps=2 \
     --steps=50000 \
     --save_freq=10000 \
     --acp.enable=true \
@@ -318,6 +318,7 @@ lerobot-train \
     --sft_train=true \
     --policy.dtype=bfloat16 \
     --policy.use_rlt=true \
+    # --policy.device=cpu \
     # --resume=true \
     # --config_path=/path/to/output_dir/checkpoints/last/pretrained_model/train_config.json
     # --policy.gradient_checkpointing=true \

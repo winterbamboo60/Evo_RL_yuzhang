@@ -22,6 +22,11 @@ from pathlib import Path
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
@@ -202,6 +207,9 @@ class WandBLogger:
         wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
         self._wandb.log({f"{mode}/video": wandb_video}, step=step)
 
+    def finish(self):
+        self._wandb.finish()
+
 
 class SwanLabLogger:
     """A helper class to log training metrics using SwanLab."""
@@ -285,15 +293,87 @@ class SwanLabLogger:
         except Exception as exc:
             logging.warning("Failed to log video to SwanLab: %s", exc)
 
+    def finish(self):
+        finish = getattr(self._run, "finish", None)
+        if callable(finish):
+            finish()
 
-def make_logger(cfg: TrainPipelineConfig) -> WandBLogger | SwanLabLogger | None:
+
+class TensorBoardLogger:
+    """A local TensorBoard logger used when WandB is disabled."""
+
+    def __init__(self, cfg: TrainPipelineConfig):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise ImportError(
+                "TensorBoard is required when wandb is disabled. "
+                "Install it with: pip install tensorboard"
+            ) from exc
+
+        self.log_dir = Path(cfg.output_dir) / "tensorboard"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._writer = SummaryWriter(log_dir=str(self.log_dir))
+        logging.info(colored("Logs will be saved to TensorBoard.", "blue", attrs=["bold"]))
+        logging.info("Track this run --> tensorboard --logdir %s", self.log_dir)
+
+    def log_policy(self, checkpoint_dir: Path):
+        return
+
+    @staticmethod
+    def _to_scalar(value):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int | float):
+            return value
+        if torch is not None and isinstance(value, torch.Tensor) and value.numel() == 1:
+            return value.detach().float().cpu().item()
+        return None
+
+    def log_dict(
+        self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
+    ):
+        if mode not in {"train", "eval"}:
+            raise ValueError(mode)
+        if step is None and custom_step_key is None:
+            raise ValueError("Either step or custom_step_key must be provided.")
+
+        if custom_step_key is not None and custom_step_key in d and step is None:
+            custom_step = self._to_scalar(d[custom_step_key])
+            if custom_step is not None:
+                step = int(custom_step)
+        if step is None:
+            raise ValueError(f'Could not infer TensorBoard step from key "{custom_step_key}".')
+
+        for key, value in d.items():
+            if custom_step_key is not None and key == custom_step_key:
+                continue
+            scalar = self._to_scalar(value)
+            if scalar is None:
+                continue
+            self._writer.add_scalar(f"{mode}/{key}", scalar, step)
+        self._writer.flush()
+
+    def log_video(self, video_path: str, step: int, mode: str = "train"):
+        if mode not in {"train", "eval"}:
+            raise ValueError(mode)
+        logging.warning("TensorBoard video logging is not implemented; skipped %s.", video_path)
+
+    def finish(self):
+        self._writer.flush()
+        self._writer.close()
+
+
+def make_logger(cfg: TrainPipelineConfig) -> WandBLogger | SwanLabLogger | TensorBoardLogger | None:
     """Create a training logger based on config and environment.
 
-    Returns SwanLabLogger if SWANLAB_API_KEY is set, WandBLogger otherwise.
-    Returns None if logging is disabled.
+    Uses SwanLab or WandB when enabled. Falls back to TensorBoard when WandB is disabled.
     """
-    if not (cfg.wandb.enable and cfg.wandb.project):
-        return None
+    if not cfg.wandb.enable:
+        return TensorBoardLogger(cfg)
+    if not cfg.wandb.project:
+        logging.warning("wandb.enable=true but wandb.project is empty. Falling back to TensorBoard.")
+        return TensorBoardLogger(cfg)
 
     if os.getenv("SWANLAB_API_KEY"):
         try:

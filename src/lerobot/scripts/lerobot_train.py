@@ -637,9 +637,13 @@ def train(
 
     # Explicitly release resources that can otherwise keep the process alive
     # after training finishes (DataLoader worker subprocesses / pin_memory
-    # thread held by the `cycle` iterator, and the wandb background process).
-    if wandb_logger is not None and getattr(wandb_logger, "_wandb", None) is not None:
-        wandb_logger._wandb.finish()
+    # thread held by the `cycle` iterator, and logger background resources).
+    if wandb_logger is not None:
+        finish = getattr(wandb_logger, "finish", None)
+        if callable(finish):
+            finish()
+        elif getattr(wandb_logger, "_wandb", None) is not None:
+            wandb_logger._wandb.finish()
     try:
         del dl_iter
         del dataloader

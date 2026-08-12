@@ -249,6 +249,18 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # RLT Stage1 settings. Enabled only when ``use_rlt`` is set on the base policy config.
+    rlt_alpha: float = 1.0
+    rlt_input_dim: int = 2048
+    rlt_embed_dim: int = 2048
+    rlt_num_rl_tokens: int = 1
+    rlt_prefix_seq_len: int = 1024
+    rlt_num_layers: int = 2
+    rlt_num_heads: int = 8
+    rlt_mlp_ratio: float = 4.0
+    rlt_image_only: bool = False
+    rlt_use_mask: bool = True
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
