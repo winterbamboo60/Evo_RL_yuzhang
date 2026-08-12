@@ -1159,12 +1159,21 @@ class PI05Policy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
+
+            model_state_keys = set(model.state_dict().keys())
+            discarded_unexpected_keys = [key for key in remapped_state_dict if key not in model_state_keys]
+            if discarded_unexpected_keys:
+                remapped_state_dict = {
+                    key: value for key, value in remapped_state_dict.items() if key in model_state_keys
+                }
+
             # Load the remapped state dict into the model. Base PI05 checkpoints do
-            # not contain RLT module weights; keep those freshly initialized.
+            # not contain RLT module weights; keep those freshly initialized. Extra
+            # checkpoint tensors are intentionally ignored so RL/RLT heads can coexist
+            # with plain VLA checkpoints. Shape mismatches still raise from PyTorch.
             allow_missing_rlt = bool(getattr(model.config, "use_rlt", False))
-            missing_keys, unexpected_keys = model.load_state_dict(
-                remapped_state_dict, strict=strict and not allow_missing_rlt
-            )
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            unexpected_keys = list(unexpected_keys) + discarded_unexpected_keys
             rlt_missing_keys = [key for key in missing_keys if key.startswith("model.rlt_module.")]
             non_rlt_missing_keys = [key for key in missing_keys if not key.startswith("model.rlt_module.")]
 
@@ -1185,7 +1194,7 @@ class PI05Policy(PreTrainedPolicy):
                     print(f"  ... and {len(non_rlt_missing_keys) - 5} more")
 
             if unexpected_keys:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+                print(f"Ignored unexpected keys when loading state dict: {len(unexpected_keys)} keys")
                 if len(unexpected_keys) <= 5:
                     for key in unexpected_keys:
                         print(f"  - {key}")
@@ -1194,15 +1203,13 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(unexpected_keys) - 5} more")
 
-            if strict and (non_rlt_missing_keys or unexpected_keys):
-                error_parts = []
-                if non_rlt_missing_keys:
-                    error_parts.append(f"missing non-RLT keys: {len(non_rlt_missing_keys)}")
-                if unexpected_keys:
-                    error_parts.append(f"unexpected keys: {len(unexpected_keys)}")
-                raise RuntimeError("Error(s) in loading PI05 state_dict: " + ", ".join(error_parts))
+            if strict and non_rlt_missing_keys:
+                raise RuntimeError(
+                    "Error(s) in loading PI05 state_dict: "
+                    f"missing non-RLT keys: {len(non_rlt_missing_keys)}"
+                )
 
-            if not non_rlt_missing_keys and not unexpected_keys:
+            if not non_rlt_missing_keys:
                 if rlt_missing_keys:
                     print("All pretrained VLA keys loaded successfully; RLT keys initialized from scratch.")
                 else:

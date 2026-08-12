@@ -457,6 +457,7 @@ class PiperLeader(Teleoperator):
         success/failure labels. Treat manual-control mode as human intervention;
         use a reward classifier or another event source when success labels are
         required.
+        Piper leader 没有 success/failure 按钮，需要 reward classifier 或其他事件源
         """
         return {
             TeleopEvents.IS_INTERVENTION: self._manual_control_enabled is True,

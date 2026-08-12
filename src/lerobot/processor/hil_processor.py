@@ -434,6 +434,8 @@ class InterventionActionProcessorStep(ProcessorStep):
         teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
         is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
         terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
+        # 这里是根据机械臂的函数判断是否成功，但目前未实现
+        # TODO 需要完善success信号
         success = info.get(TeleopEvents.SUCCESS, False)
         rerecord_episode = info.get(TeleopEvents.RERECORD_EPISODE, False)
 

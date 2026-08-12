@@ -41,6 +41,22 @@ class ACPConfig:
 
 
 @dataclass
+class ActorVLAPolicyConfig:
+    enabled: bool = False
+    policy_path: str | None = None
+    policy_poll_s: float = 5.0
+    reload_on_episode_boundary: bool = True
+
+
+@dataclass
+class ActorOnlyConfig:
+    enabled: bool = False
+    episode_output_dir: str | None = None
+    save_episode_images: bool = True
+    save_episode_viewer: bool = True
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -245,3 +261,5 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     # NOTE: In RL, we don't need an offline dataset
     # TODO: Make `TrainPipelineConfig.dataset` optional
     dataset: DatasetConfig | None = None  # type: ignore[assignment] # because the parent class has made it's type non-optional
+    actor_vla_policy: ActorVLAPolicyConfig = field(default_factory=ActorVLAPolicyConfig)
+    actor_only: ActorOnlyConfig = field(default_factory=ActorOnlyConfig)

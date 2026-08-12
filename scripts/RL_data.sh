@@ -32,13 +32,13 @@
 #   --top_camera.index_or_path 4
 
 # 策略模型 + 人工介入
-# bash /home/ghr/yuzhang/Evo-RL-loop/scripts/RL_data.sh \
-#   --dataset.root /home/ghr/datasets/package_sorting_task2_loop_0612_1 \
+# bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_data.sh \
+#   --dataset.root /home/yz/datasets/onineRL_test_1 \
 #   --dataset.single_task "Flip the package if the barcode is not facing up. Advantage: positive" \
 #   --wrist_camera.index_or_path 4 \
 #   --top_camera.index_or_path 10 \
-#   --policy.path /home/ghr/mm/package_scan_model_v6 \
-#   --event.config.path /home/ghr/projects/VLA/Evo-RL-loop-0609/scripts/event_config.json
+#   --policy.path /home/yz/projects/outputs/pi05_base_smovla_v3_0720/train/checkpoints/050000/pi05_base_smovla_v3_0720_50k \
+#   --event.config.path /home/yz/projects/Evo-RL-loop-0810/scripts/event_config.json
 
 # 合并数据集
 # cd /home/yz/projects/Evo-RL-loop-0609/src
@@ -91,6 +91,23 @@ MISSING=()
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "[错误] 缺少必填参数：${MISSING[*]}" >&2
     exit 1
+fi
+
+if [[ -n "$POLICY_PATH" ]]; then
+    if [[ ! -d "$POLICY_PATH" ]]; then
+        echo "[错误] --policy.path 必须是可读取的 LeRobot policy 目录：$POLICY_PATH" >&2
+        exit 1
+    fi
+    if [[ ! -f "$POLICY_PATH/config.json" ]]; then
+        echo "[错误] --policy.path 缺少 config.json：$POLICY_PATH" >&2
+        exit 1
+    fi
+    if [[ ! -f "$POLICY_PATH/model.safetensors" ]]; then
+        echo "[错误] --policy.path 缺少 model.safetensors：$POLICY_PATH" >&2
+        exit 1
+    fi
+    echo "policy.path: ${POLICY_PATH}"
+    echo "[提示] PI05 模型加载时会忽略 checkpoint 中当前模型不需要的多余参数。"
 fi
 
 # ---------- 构建摄像头配置 ----------
