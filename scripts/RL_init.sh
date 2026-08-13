@@ -9,6 +9,9 @@ Step1. 切换环境
 # mkdir -p ./package_sorting_env_raw && tar -xzf ./package_sorting.tar.gz -C ./package_sorting_env_raw
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
+
+# 修改lerobot库路径
+pip install -e . --no-deps --no-build-isolation
 ```
 
 模型下载A800
