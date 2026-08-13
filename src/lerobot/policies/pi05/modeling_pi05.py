@@ -901,16 +901,73 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
-        _, prefix_pad_masks, past_key_values = self.build_prefix_cache(
-            images, img_masks, tokens, masks, use_cache=True
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        bsize = tokens.shape[0]
+        device = tokens.device
+
+        if noise is None:
+            # Sample noise with padded dimension as expected by action_in_proj
+            actions_shape = (
+                bsize,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+            )  # Use config max_action_dim for internal processing
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
         )
-        return self.sample_actions_from_prefix_cache(
-            prefix_pad_masks=prefix_pad_masks,
-            past_key_values=past_key_values,
-            noise=noise,
-            num_steps=num_steps,
-            **kwargs,
-        )
+
+        dt = -1.0 / num_steps
+
+        x_t = noise
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+
+            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                return self.denoise_step(
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=input_x_t,
+                    timestep=current_timestep,
+                )
+
+            if self._rtc_enabled():
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=time,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
+            x_t = x_t + dt * v_t
+
+            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        return x_t
 
     @torch.no_grad()
     def sample_actions_and_rlt(
