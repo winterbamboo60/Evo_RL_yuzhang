@@ -150,6 +150,16 @@
 #   > "/home/yz/projects/outputs/logs/pi05_base_smovla_v3_0720_RLT_Train0811.log" 2>&1 &
 # echo "PID: $!"
 
+
+# pi05_base_cup_catch_0813
+# source /home/yz/projects/env/package_sorting_env/bin/activate
+# nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
+#   --DATASET_ROOT "/home/yz/datasets/cup_catch_0813/cup_catch_0813_merged" \
+#   --ModelZoo /home/yz/modelZoo \
+#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_base_cup_catch_0813_tain0813" \
+#   > "/home/yz/projects/outputs/logs/pi05_base_cup_catch_0813_tain0813.log" 2>&1 &
+# echo "PID: $!"
+
 set -e
 
 # ---------- 解析参数 ----------
@@ -317,7 +327,7 @@ lerobot-train \
     --policy.repo_id=local_policy_model \
     --sft_train=true \
     --policy.dtype=bfloat16 \
-    --policy.use_rlt=true \
+    # --policy.use_rlt=true \
     # --policy.device=cpu \
     # --resume=true \
     # --config_path=/path/to/output_dir/checkpoints/last/pretrained_model/train_config.json

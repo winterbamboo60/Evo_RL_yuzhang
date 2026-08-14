@@ -25,8 +25,8 @@
 # 打印DATASET_ROOT所在位置
 
 # 纯人工示范（不传 policy.path）
-# bash /home/ghr/yuzhang/Evo-RL-loop/scripts/RL_data.sh \
-#   --dataset.root /home/ghr/datasets/output_001 \
+# bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_data.sh \
+#   --dataset.root /home/yz/datasets/output_001 \
 #   --dataset.single_task "Flip the package if the barcode is not facing up. Advantage: positive" \
 #   --wrist_camera.index_or_path 10 \
 #   --top_camera.index_or_path 4
@@ -47,10 +47,11 @@
 #     --operation.type merge \
 #     --operation.repo_ids "['/home/yz/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/yz/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/yz/datasets/task2_grab_the_package_and_place_it_into_the_b']"
 
+# cd /home/yz/projects/Evo-RL-loop-0810/src
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/yz/datasets/v9_task2_0728/v9_task2_0728_merged \
+#     --repo_id /home/yz/datasets/cup_catch_0813/cup_catch_0813_merged \
 #     --operation.type merge \
-#     --operation.source_dir /home/yz/datasets/v9_task2_0728
+#     --operation.source_dir /home/yz/datasets/cup_catch_0813
 
 set -e
 
@@ -110,6 +111,13 @@ if [[ -n "$POLICY_PATH" ]]; then
     echo "[提示] PI05 模型加载时会忽略 checkpoint 中当前模型不需要的多余参数。"
 fi
 
+if [[ -n "$EVENT_CONFIG_PATH" ]]; then
+    if [[ ! -f "$EVENT_CONFIG_PATH" ]]; then
+        echo "[错误] --event.config.path 必须是可读取的 JSON 文件：$EVENT_CONFIG_PATH" >&2
+        exit 1
+    fi
+fi
+
 # ---------- 构建摄像头配置 ----------
 CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
 
@@ -134,13 +142,17 @@ CMD=(
     --dataset.push_to_hub=False
     --display_data=true
     --resume=false
-    "--event_config_path=${EVENT_CONFIG_PATH}"
     --reset_on_timeout=false
 )
 
 # 若提供了策略模型路径则追加（启用人机协同模式）
 if [[ -n "$POLICY_PATH" ]]; then
     CMD+=("--policy.path=${POLICY_PATH}")
+fi
+
+# 若提供了事件配置路径则追加（未提供时不启用质量事件标签）
+if [[ -n "$EVENT_CONFIG_PATH" ]]; then
+    CMD+=("--event_config_path=${EVENT_CONFIG_PATH}")
 fi
 
 # ---------- 执行 ----------

@@ -128,11 +128,11 @@ Actor-only + VLA：
 
 ```bash
 /home/yz/projects/env/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json \
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_1F.json \
   --actor_only.enabled true \
   --actor_vla_policy.enabled true \
-  --actor_vla_policy.policy_path /home/yz/projects/outputs/pi05_base_smovla_v3_0720/train/checkpoints/050000/pi05_base_smovla_v3_0720_50k \
-  --actor_only.episode_output_dir /home/yz/projects/outputs/piper_package_sorting_online_rl/actor_episodes
+  --actor_vla_policy.policy_path /home/hpc/yuzhang/outputs/pi05_base_smovla_v3_0720_RLT_30K \
+  --actor_only.episode_output_dir /home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_episodes
 ```
 
 保存结构：

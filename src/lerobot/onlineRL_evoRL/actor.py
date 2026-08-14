@@ -585,7 +585,7 @@ def act_with_policy(
 
     # 创建在线环境。可能是真实机器人，也可能是 gym_hil 仿真。
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
-    # 创建 observation processor 和 action processor。
+    # 创建 observation processor 和 action processor。包裹各种控制器，如按键控制、超时控制等
     env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
     set_seed(cfg.seed)
@@ -600,6 +600,7 @@ def act_with_policy(
     ### To avoid sending a SACPolicy object through the port, we create a policy instance
     ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
     # 本地创建 SACPolicy。actor 不直接接收整个 policy 对象，而是本地建模型，之后只加载 learner 推来的 state dict，Learner 每隔 n 步发送更新后的参数，以更新 Actor 的参数。
+    # TODO 我们训练时使用pi05或smolvla时可以考虑type来适配，目前可能不适配pi05
     policy: SACPolicy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
@@ -607,6 +608,8 @@ def act_with_policy(
     policy = policy.eval()
     assert isinstance(policy, nn.Module)
 
+    # VLA推理,将预训练的VLA模型加载进来，越过了make_policy的推理
+    # TODO 后续需要将模型与make_policy统一起来处理，代码中有针对不同模型的处理方式
     vla_runtime = ActorVLARuntime(cfg) if cfg.actor_vla_policy.enabled else None
 
     # 获取初始观测
@@ -759,6 +762,7 @@ def act_with_policy(
             hold_arms_current_pose(getattr(online_env, "robot", None), teleop_device)
         reset_episode_state()
 
+    # 初始时默认由VLA控制
     set_teleop_manual_control(False)
     try:
         for interaction_step in range(cfg.policy.online_steps):
@@ -791,6 +795,7 @@ def act_with_policy(
 
             with policy_timer:
                 if vla_runtime is not None:
+                    # TODO 这里后续需要统一用make_policy的模型获取动作
                     action = vla_runtime.select_action(env=online_env, device=device)
                 else:
                     action = policy.select_action(batch=observation)
