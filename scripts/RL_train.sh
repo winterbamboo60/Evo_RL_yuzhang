@@ -160,6 +160,17 @@
 #   > "/home/yz/projects/outputs/logs/pi05_base_cup_catch_0813_tain0813.log" 2>&1 &
 # echo "PID: $!"
 
+# smolvla_base_cup_catch_0813
+# source /home/yz/projects/env/package_sorting_env/bin/activate
+# nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
+#   --DATASET_ROOT "/home/yz/datasets/cup_catch_0813/cup_catch_0813_merged" \
+#   --ModelZoo /home/yz/modelZoo \
+#   --policy_type "smolvla" \
+#   --OUTPUT_DIR "/home/yz/projects/outputs/smovla_base_cup_catch_0813_train0814_0810" \
+#   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
+#   > "/home/yz/projects/outputs/logs/smovla_base_cup_catch_0813_train0814_0810.log" 2>&1 &
+# echo "PID: $!"
+
 set -e
 
 # ---------- 解析参数 ----------
@@ -313,8 +324,8 @@ lerobot-train \
     "--policy.pretrained_path=${POLICY_PRETRAINED_PATH}" \
     --policy.device="cuda" \
     --policy.train_expert_only=true \
-    --batch_size=16 \
-    --gradient_accumulation_steps=2 \
+    --batch_size=32 \
+    --gradient_accumulation_steps=1 \
     --steps=50000 \
     --save_freq=10000 \
     --acp.enable=true \
@@ -326,7 +337,8 @@ lerobot-train \
     --policy.push_to_hub=False \
     --policy.repo_id=local_policy_model \
     --sft_train=true \
-    --policy.dtype=bfloat16 \
+    --policy.vlm_model_name=/home/yz/modelZoo/HuggingFaceTB--SmolVLM2-500M-Video-Instruct \
+    # --policy.dtype=bfloat16 \
     # --policy.use_rlt=true \
     # --policy.device=cpu \
     # --resume=true \

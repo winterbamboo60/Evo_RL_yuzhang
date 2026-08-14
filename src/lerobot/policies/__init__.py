@@ -12,38 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
+from .act.configuration_act import ACTConfig as ACTConfig
+from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .evo1.configuration_evo1 import Evo1Config as Evo1Config
+from .groot.configuration_groot import GrootConfig as GrootConfig
+from .pi0.configuration_pi0 import PI0Config as PI0Config
+from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
+from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
+from .smolvla.processor_smolvla import SmolVLANewLineProcessor
+from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
+from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
+from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
+from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
-from importlib import import_module
-from typing import Any
-
-_LAZY_ATTRS = {
-    "ACTConfig": ".act.configuration_act",
-    "DiffusionConfig": ".diffusion.configuration_diffusion",
-    "Evo1Config": ".evo1.configuration_evo1",
-    "GrootConfig": ".groot.configuration_groot",
-    "PI0Config": ".pi0.configuration_pi0",
-    "PI0FastConfig": ".pi0_fast.configuration_pi0_fast",
-    "PI05Config": ".pi05.configuration_pi05",
-    "SmolVLAConfig": ".smolvla.configuration_smolvla",
-    "SmolVLANewLineProcessor": ".smolvla.processor_smolvla",
-    "TDMPCConfig": ".tdmpc.configuration_tdmpc",
-    "VQBeTConfig": ".vqbet.configuration_vqbet",
-    "WallXConfig": ".wall_x.configuration_wall_x",
-    "XVLAConfig": ".xvla.configuration_xvla",
-}
-
-__all__ = list(_LAZY_ATTRS)
-
-
-def __getattr__(name: str) -> Any:
-    if name not in _LAZY_ATTRS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = import_module(_LAZY_ATTRS[name], __name__)
-    value = getattr(module, name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted([*globals(), *_LAZY_ATTRS])
+__all__ = [
+    "ACTConfig",
+    "DiffusionConfig",
+    "Evo1Config",
+    "PI0Config",
+    "PI05Config",
+    "PI0FastConfig",
+    "SmolVLAConfig",
+    "SARMConfig",
+    "TDMPCConfig",
+    "VQBeTConfig",
+    "GrootConfig",
+    "XVLAConfig",
+    "WallXConfig",
+]
