@@ -46,7 +46,6 @@ For more details on the complete HILSerl training workflow, see:
 https://github.com/michel-aractingi/lerobot-hilserl-guide
 """
 
-import html
 import json
 import logging
 import os
@@ -56,27 +55,32 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
+import draccus
 import grpc
+import numpy as np
 import torch
+from draccus.utils import DecodingError
 from torch import nn
 from torch.multiprocessing import Event, Queue
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.train import TrainRLServerPipelineConfig
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.policies.factory import make_policy, make_pre_post_processors
-from lerobot.policies.sac.modeling_sac import SACPolicy
-from lerobot.processor import TransitionKey
+from lerobot.configs.train import ActorOnlyConfig, TrainRLServerPipelineConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.onlineRL_evoRL.process import ProcessSignalHandler
 from lerobot.onlineRL_evoRL.queue import get_last_item_from_queue
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.sac.modeling_sac import SACPolicy
+from lerobot.policies.utils import make_robot_action
+from lerobot.processor import TransitionKey, make_default_processors
 from lerobot.robots import piper_follower, so_follower  # noqa: F401
+from lerobot.scripts.recording_hil import PolicySyncDualArmExecutor
+from lerobot.scripts.recording_loop import _OnlinePolicyActionSmoother, _postprocess_policy_action
 from lerobot.teleoperators import gamepad, piper_leader, so_leader  # noqa: F401
-from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.utils.control_utils import predict_action
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
     bytes_to_state_dict,
@@ -86,6 +90,8 @@ from lerobot.transport.utils import (
     send_bytes_in_chunks,
     transitions_to_bytes,
 )
+from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
+from lerobot.utils.control_utils import predict_action
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import (
@@ -98,12 +104,12 @@ from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
 )
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 from .gym_manipulator import (
     create_transition,
     make_processors,
     make_robot_env,
-    step_env_and_process_transition,
 )
 from .keyboard_control import (
     EPISODE_FAILURE,
@@ -113,11 +119,90 @@ from .keyboard_control import (
     start_keyboard_listener,
     stop_keyboard_listener,
 )
-from .piper_episode_control import home_arms_to_default, hold_arms_current_pose
+from .piper_episode_control import hold_arms_current_pose, home_arms_to_default
 
 INTERVENTION_STATE_POLICY = 0.0
 INTERVENTION_STATE_ACTIVE = 1.0
 INTERVENTION_STATE_RELEASE = 2.0
+
+_ACTOR_SAVE_FORMAT_TYPE = get_type_hints(ActorOnlyConfig)["save_format"]
+
+
+def _decode_actor_save_format(raw_value: Any, path):
+    allowed = get_args(_ACTOR_SAVE_FORMAT_TYPE)
+    if raw_value not in allowed:
+        raise DecodingError(path, f"Expected one of {allowed}, got {raw_value!r}")
+    return raw_value
+
+
+draccus.decode.register(_ACTOR_SAVE_FORMAT_TYPE, _decode_actor_save_format)
+
+
+def _run_with_connection_retry(action_name: str, fn, timeout_s: float = 2.0, interval_s: float = 0.1):
+    """Local copy of RL_data's bounded retry behavior for transient CAN failures."""
+    deadline_t = time.perf_counter() + max(timeout_s, 0.0)
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            result = fn()
+            if attempts > 1:
+                logging.warning("%s recovered after %d retries.", action_name, attempts - 1)
+            return result
+        except ConnectionError as error:
+            if attempts == 1:
+                logging.warning(
+                    "%s failed with transient communication error; retrying for up to %.2fs (%s)",
+                    action_name,
+                    timeout_s,
+                    error,
+                )
+            remaining_s = deadline_t - time.perf_counter()
+            if timeout_s <= 0.0 or remaining_s <= 0.0:
+                raise
+            time.sleep(min(max(interval_s, 0.0) or remaining_s, remaining_s))
+
+
+class _RetryingActionSender:
+    def __init__(self, target, action_name: str):
+        self.target = target
+        self.action_name = action_name
+
+    def send_action(self, action, **kwargs):
+        return _run_with_connection_retry(
+            self.action_name,
+            lambda: self.target.send_action(action, **kwargs),
+        )
+
+
+def _select_actor_action(policy_action, teleop_action, last_teleop_action, is_intervention: bool):
+    """Apply the same policy/teleop priority used by RL_data."""
+    if teleop_action is not None:
+        last_teleop_action = teleop_action
+    if is_intervention:
+        if teleop_action is not None:
+            return teleop_action, False, last_teleop_action
+        if last_teleop_action is not None:
+            return last_teleop_action, False, last_teleop_action
+        if policy_action is not None:
+            return policy_action, True, last_teleop_action
+        return None, False, last_teleop_action
+    return (
+        policy_action if policy_action is not None else teleop_action,
+        policy_action is not None,
+        last_teleop_action,
+    )
+
+
+def _observation_frame_to_cpu_tensors(frame: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Freeze one RL_data-style frame without changing image layout or pixel dtype."""
+    tensors = {}
+    for key, value in frame.items():
+        if isinstance(value, torch.Tensor):
+            tensors[key] = value.detach().cpu().clone()
+        else:
+            tensors[key] = torch.from_numpy(np.asarray(value).copy())
+    return tensors
 
 
 @dataclass
@@ -179,7 +264,6 @@ def _sanitize_path_component(name: str) -> str:
 
 def _tensor_to_pil_image(value: Any):
     from PIL import Image
-    import numpy as np
 
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu()
@@ -205,14 +289,36 @@ def _tensor_to_pil_image(value: Any):
 
 class ActorEpisodeWriter:
     def __init__(self, cfg: TrainRLServerPipelineConfig):
+        self.cfg = cfg
+        self.save_format = cfg.actor_only.save_format
         output_dir = cfg.actor_only.episode_output_dir
         if output_dir is None:
             output_dir = str(Path(cfg.output_dir) / "actor_episodes")
         self.output_dir = Path(output_dir).expanduser()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.save_images = cfg.actor_only.save_episode_images
         self.save_viewer = cfg.actor_only.save_episode_viewer
-        self.episode_index = self._next_episode_index()
+        self.dataset: LeRobotDataset | None = None
+        self.action_names: list[str] = []
+        self.observation_features: dict[str, dict[str, Any]] = {}
+        self.robot_type: str | None = None
+        if self.save_format == "transition":
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.episode_index = self._next_episode_index()
+        else:
+            if self.output_dir.exists():
+                raise FileExistsError(
+                    f"LeRobotDataset output directory already exists: {self.output_dir}"
+                )
+            self.episode_index = 0
+
+    def configure_robot(self, robot: Any) -> None:
+        if robot is None:
+            return
+        self.action_names = list(robot.action_features)
+        self.observation_features = hw_to_dataset_features(
+            robot.observation_features, prefix=OBS_STR, use_video=True
+        )
+        self.robot_type = getattr(robot, "name", type(robot).__name__)
 
     def _next_episode_index(self) -> int:
         max_index = -1
@@ -225,6 +331,9 @@ class ActorEpisodeWriter:
         return max_index + 1
 
     def save_episode(self, *, transitions: list[Transition], metadata: dict[str, Any]) -> Path:
+        if self.save_format == "lerobot":
+            return self._save_lerobot_episode(transitions=transitions, metadata=metadata)
+
         episode_dir = self.output_dir / f"episode_{self.episode_index:06d}"
         self.episode_index += 1
         episode_dir.mkdir(parents=True, exist_ok=False)
@@ -238,6 +347,105 @@ class ActorEpisodeWriter:
             self._write_viewer(episode_dir, payload, frames)
         logging.info("[ACTOR] Saved actor-only episode to %s", episode_dir)
         return episode_dir
+
+    @staticmethod
+    def _unbatch(value: torch.Tensor) -> torch.Tensor:
+        value = value.detach().cpu()
+        return value.squeeze(0) if value.ndim > 0 and value.shape[0] == 1 else value
+
+    def _ensure_lerobot_dataset(self, transition: Transition) -> LeRobotDataset:
+        if self.dataset is not None:
+            return self.dataset
+
+        features = {key: dict(feature) for key, feature in self.observation_features.items()}
+        if not features:
+            for key, tensor in transition["state"].items():
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                value = self._unbatch(tensor)
+                names = self.action_names if key == OBS_STATE and value.numel() == len(self.action_names) else None
+                features[key] = {"dtype": "float32", "shape": tuple(value.shape), "names": names}
+
+        action = self._unbatch(transition["action"])
+        features[ACTION] = {
+            "dtype": "float32",
+            "shape": tuple(action.shape),
+            "names": self.action_names or None,
+        }
+        features["complementary_info.policy_action"] = dict(features[ACTION])
+        features["complementary_info.is_intervention"] = {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["is_intervention"],
+        }
+        features["complementary_info.state"] = {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["state"],
+        }
+        features["complementary_info.collector_policy_id"] = {
+            "dtype": "string",
+            "shape": (1,),
+            "names": ["collector_policy_id"],
+        }
+        repo_id = self.cfg.dataset.repo_id if self.cfg.dataset is not None else "actor_only"
+        self.dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=self.cfg.env.fps,
+            root=self.output_dir,
+            robot_type=self.robot_type,
+            features=features,
+            use_videos=True,
+            image_writer_threads=4 * len([key for key in features if "image" in key]),
+        )
+        return self.dataset
+
+    def _save_lerobot_episode(
+        self, *, transitions: list[Transition], metadata: dict[str, Any]
+    ) -> Path:
+        cpu_transitions = [move_transition_to_device(transition=tr, device="cpu") for tr in transitions]
+        dataset = self._ensure_lerobot_dataset(cpu_transitions[0])
+        for transition in cpu_transitions:
+            complementary_info = transition.get("complementary_info") or {}
+            is_intervention = float(self._unbatch(complementary_info["is_intervention"]).item())
+            frame = {
+                key: self._unbatch(value)
+                for key, value in transition["state"].items()
+                if isinstance(value, torch.Tensor) and key in dataset.features
+            }
+            frame.update(
+                {
+                    ACTION: self._unbatch(transition["action"]).float(),
+                    "complementary_info.policy_action": self._unbatch(
+                        complementary_info["policy_action"]
+                    ).float(),
+                    "complementary_info.is_intervention": np.array(
+                        [is_intervention], dtype=np.float32
+                    ),
+                    "complementary_info.state": np.array(
+                        [float(self._unbatch(complementary_info["intervention_state"]).item())],
+                        dtype=np.float32,
+                    ),
+                    "complementary_info.collector_policy_id": (
+                        "human" if is_intervention else metadata.get("actor_policy_path") or "policy"
+                    ),
+                    "task": metadata.get("task") or "",
+                }
+            )
+            dataset.add_frame(frame)
+
+        outcome = metadata.get("episode_outcome")
+        dataset.save_episode(
+            extra_episode_metadata={
+                "episode_success": "failure" if outcome == "timeout" else outcome or "none"
+            }
+        )
+        logging.info("[ACTOR] Saved actor-only episode as LeRobotDataset to %s", dataset.root)
+        return dataset.root
+
+    def finalize(self) -> None:
+        if self.dataset is not None:
+            self.dataset.finalize()
 
     def _write_frames(self, episode_dir: Path, transitions: list[Transition]) -> list[dict[str, Any]]:
         frames: list[dict[str, Any]] = []
@@ -341,7 +549,6 @@ class ActorVLARuntime:
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
-        self.ds_meta = None
         self.reload()
 
     def reload(self) -> None:
@@ -351,12 +558,10 @@ class ActorVLARuntime:
         policy_cfg.pretrained_path = self.policy_path
         if self.cfg.policy is not None and getattr(self.cfg.policy, "device", None):
             policy_cfg.device = self.cfg.policy.device
-        self.ds_meta = self._make_dataset_meta()
-        policy = make_policy(policy_cfg, ds_meta=self.ds_meta).eval()
+        policy = make_policy(policy_cfg, env_cfg=self.cfg.env).eval()
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy_cfg,
             pretrained_path=str(policy_cfg.pretrained_path),
-            dataset_stats=self.ds_meta.stats,
             preprocessor_overrides={"device_processor": {"device": policy_cfg.device}},
         )
         reset = getattr(policy, "reset", None)
@@ -369,11 +574,6 @@ class ActorVLARuntime:
         self.fingerprint = _fingerprint_policy_path(self.policy_path)
         logging.info("[ACTOR] Loaded VLA policy from %s", self.policy_path)
 
-    def _make_dataset_meta(self) -> LeRobotDatasetMetadata:
-        if self.cfg.dataset is None or self.cfg.dataset.repo_id is None:
-            raise ValueError("actor_vla_policy requires cfg.dataset.repo_id/root to build policy metadata")
-        return LeRobotDatasetMetadata(repo_id=self.cfg.dataset.repo_id, root=self.cfg.dataset.root)
-
     def reload_if_changed(self) -> None:
         now = time.monotonic()
         if now - self.last_check_t < self.cfg.actor_vla_policy.policy_poll_s:
@@ -385,22 +585,23 @@ class ActorVLARuntime:
         logging.info("[ACTOR] VLA policy checkpoint changed; reloading before next episode.")
         self.reload()
 
-    def select_action(self, env, device: torch.device) -> torch.Tensor:
+    def select_action(
+        self,
+        observation_frame: dict[str, Any],
+        robot_type: str | None,
+        device: torch.device,
+    ) -> torch.Tensor:
         if self.policy is None or self.preprocessor is None or self.postprocessor is None:
             raise RuntimeError("VLA runtime is not loaded")
-        robot = getattr(env, "robot", None)
-        if robot is None:
-            raise ValueError("VLA actor policy requires an environment with a robot")
-        raw_observation = robot.get_observation()
         action = predict_action(
-            observation=raw_observation,
+            observation=observation_frame,
             policy=self.policy,
             device=get_safe_torch_device(self.policy_cfg.device),
             preprocessor=self.preprocessor,
             postprocessor=self.postprocessor,
             use_amp=getattr(self.policy_cfg, "use_amp", False),
             task=getattr(self.cfg.env, "task", None),
-            robot_type=getattr(robot, "robot_type", None),
+            robot_type=robot_type,
         )
         if isinstance(action, torch.Tensor):
             action = action.to(device)
@@ -463,6 +664,7 @@ def run_actor_only(cfg: TrainRLServerPipelineConfig, shutdown_event: Event):  # 
             actor_episode_writer=writer,
         )
     finally:
+        writer.finalize()
         transitions_queue.close()
         interactions_queue.close()
         parameters_queue.close()
@@ -583,10 +785,65 @@ def act_with_policy(
 
     logging.info("make_env online")
 
+    # 环境准备
+    # → init_rerun("actor")
+    # → 创建 can1 PiperFollower
+    # → 创建 can0 PiperLeader
+    # → 连接摄像头 4、12
+    # → 创建观测/动作处理器
+    # → 创建 PolicySyncDualArmExecutor
+
+    display_data = (
+        cfg.env.processor.observation is not None
+        and cfg.env.processor.observation.display_cameras
+    )
+    if display_data:
+        init_rerun(session_name="actor")
+        logging.info("[ACTOR] Rerun visualization enabled.")
+
     # 创建在线环境。可能是真实机器人，也可能是 gym_hil 仿真。
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
     # 创建 observation processor 和 action processor。包裹各种控制器，如按键控制、超时控制等
-    env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
+    env_processor, action_processor = make_processors(
+        online_env,
+        teleop_device,
+        cfg.env,
+        cfg.policy.device,
+        explicit_intervention_selection=True,
+    )
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
+    robot = getattr(online_env, "robot", None)
+    robot_action_features = (
+        hw_to_dataset_features(robot.action_features, prefix=ACTION, use_video=False)
+        if robot is not None
+        else None
+    )
+    action_names = robot_action_features[ACTION]["names"] if robot_action_features is not None else []
+    robot_observation_features = (
+        hw_to_dataset_features(robot.observation_features, prefix=OBS_STR, use_video=False)
+        if robot is not None
+        else None
+    )
+    policy_action_smoother = (
+        _OnlinePolicyActionSmoother(action_names, window=9) if action_names else None
+    )
+    policy_sync_executor = (
+        PolicySyncDualArmExecutor(robot=robot, teleop=teleop_device, parallel_dispatch=True)
+        if robot is not None and teleop_device is not None and hasattr(teleop_device, "send_feedback")
+        else None
+    )
+    robot_action_sender = (
+        _RetryingActionSender(robot, "robot.send_action") if robot is not None else None
+    )
+    policy_action_sender = (
+        _RetryingActionSender(policy_sync_executor, "policy_sync_executor.send_action")
+        if policy_sync_executor is not None
+        else None
+    )
+    if actor_episode_writer is not None:
+        actor_episode_writer.configure_robot(robot)
 
     set_seed(cfg.seed)
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -612,15 +869,14 @@ def act_with_policy(
     # TODO 后续需要将模型与make_policy统一起来处理，代码中有针对不同模型的处理方式
     vla_runtime = ActorVLARuntime(cfg) if cfg.actor_vla_policy.enabled else None
 
-    # 获取初始观测
-    obs, info = online_env.reset()
+    # Reset hardware once; the first recorded observation is read at the top of the control loop.
+    online_env.reset()
     env_processor.reset()
     action_processor.reset()
-
-    # Process initial observation， 把初始 observation 包成 transition。
-    transition = create_transition(observation=obs, info=info)
-    # 经过 env_processor，变成 policy 可用的 tensor/batch/device 格式。
-    transition = env_processor(transition)
+    teleop_action_processor.reset()
+    robot_action_processor.reset()
+    robot_observation_processor.reset()
+    pending_step = None
 
     # NOTE: For the moment we will solely handle the case of a single environment
     sum_reward_episode = 0
@@ -636,6 +892,7 @@ def act_with_policy(
     keyboard_state = KeyboardState()
     keyboard_listener = start_keyboard_listener(keyboard_controller)
     intervention_state = INTERVENTION_STATE_POLICY
+    last_teleop_action = None
 
     def set_teleop_manual_control(enabled: bool) -> None:
         if teleop_device is None or not hasattr(teleop_device, "set_manual_control"):
@@ -646,42 +903,39 @@ def act_with_policy(
             logging.exception("Failed to switch teleop manual-control mode to %s", enabled)
 
     def reset_policy_runtime() -> None:
-        reset = getattr(policy, "reset", None)
-        if callable(reset):
-            reset()
+        active_policy = vla_runtime.policy if vla_runtime is not None else policy
+        for component in (
+            active_policy,
+            vla_runtime.preprocessor if vla_runtime is not None else None,
+            vla_runtime.postprocessor if vla_runtime is not None else None,
+        ):
+            reset = getattr(component, "reset", None)
+            if callable(reset):
+                reset()
+        if policy_action_smoother is not None:
+            policy_action_smoother.reset()
 
     def action_to_robot_action_dict(action) -> dict[str, float] | None:
-        robot = getattr(online_env, "robot", None)
-        bus = getattr(robot, "bus", None)
-        motors = getattr(bus, "motors", None)
-        if motors is None:
-            return None
         if isinstance(action, dict):
             return {str(k): float(v) for k, v in action.items()}
-        if isinstance(action, torch.Tensor):
-            values = action.detach().squeeze().cpu().tolist()
-        else:
-            values = action
-        if not isinstance(values, list):
+        if not isinstance(action, torch.Tensor) or robot_action_features is None:
             return None
-        return {f"{name}.pos": float(values[i]) for i, name in enumerate(motors.keys()) if i < len(values)}
+        return make_robot_action(action, robot_action_features)
 
-    def sync_policy_action_to_teleop(action) -> None:
-        if teleop_device is None or not hasattr(teleop_device, "send_feedback"):
-            return
-        feedback = action_to_robot_action_dict(action)
-        if feedback is None:
-            logging.debug("Skip policy-to-teleop sync: action cannot be converted to robot dict.")
-            return
-        try:
-            teleop_device.send_feedback(feedback)
-        except Exception:
-            logging.exception("Failed to sync policy action to teleop leader.")
+    def action_to_tensor(action) -> torch.Tensor:
+        if isinstance(action, torch.Tensor):
+            return action.to(device)
+        if not isinstance(action, dict):
+            return torch.as_tensor(action, dtype=torch.float32, device=device)
+        missing = [name for name in action_names if name not in action]
+        if missing:
+            raise ValueError(f"Action is missing robot keys: {missing}")
+        return torch.tensor([action[name] for name in action_names], dtype=torch.float32, device=device)
 
     def reset_episode_state() -> None:
         nonlocal sum_reward_episode, list_transition_to_send_to_learner
         nonlocal episode_intervention, episode_intervention_steps, episode_total_steps
-        nonlocal transition, keyboard_state, intervention_state
+        nonlocal pending_step, keyboard_state, intervention_state, last_teleop_action
         sum_reward_episode = 0.0
         list_transition_to_send_to_learner = []
         episode_intervention = False
@@ -689,12 +943,16 @@ def act_with_policy(
         episode_total_steps = 0
         keyboard_state = KeyboardState()
         intervention_state = INTERVENTION_STATE_POLICY
+        last_teleop_action = None
         set_teleop_manual_control(False)
-        obs, info = online_env.reset()
+        reset_policy_runtime()
+        online_env.reset()
         env_processor.reset()
         action_processor.reset()
-        transition = create_transition(observation=obs, info=info)
-        transition = env_processor(transition)
+        teleop_action_processor.reset()
+        robot_action_processor.reset()
+        robot_observation_processor.reset()
+        pending_step = None
 
     def finish_episode(
         *,
@@ -787,100 +1045,178 @@ def act_with_policy(
                     reset_policy_runtime()
                     logging.info("[ACTOR] Intervention release requested: returning control to policy.")
 
+            raw_observation = _run_with_connection_retry(
+                "robot.get_observation", online_env.read_raw_observation
+            )
+            current_transition = env_processor(
+                create_transition(observation=online_env.format_observation(raw_observation))
+            )
             observation = {
                 k: v
-                for k, v in transition[TransitionKey.OBSERVATION].items()
+                for k, v in current_transition[TransitionKey.OBSERVATION].items()
                 if k in cfg.policy.input_features
             }
-
-            with policy_timer:
-                if vla_runtime is not None:
-                    # TODO 这里后续需要统一用make_policy的模型获取动作
-                    action = vla_runtime.select_action(env=online_env, device=device)
-                else:
-                    action = policy.select_action(batch=observation)
-            policy_fps = policy_timer.fps_last
-            log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
-
-            new_transition = step_env_and_process_transition(
-                env=online_env,
-                transition=transition,
-                action=action,
-                env_processor=env_processor,
-                action_processor=action_processor,
-            )
-
-            next_observation = {
-                k: v
-                for k, v in new_transition[TransitionKey.OBSERVATION].items()
-                if k in cfg.policy.input_features
-            }
-
-            is_intervention = intervention_state == INTERVENTION_STATE_ACTIVE
-            executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
-            if not is_intervention:
-                sync_policy_action_to_teleop(executed_action)
-
-            reward = float(new_transition[TransitionKey.REWARD])
-            done = bool(new_transition.get(TransitionKey.DONE, False))
-            truncated = bool(new_transition.get(TransitionKey.TRUNCATED, False))
-            episode_outcome = keyboard_state.episode_outcome
-            if episode_outcome == EPISODE_SUCCESS:
-                reward = 1.0
-                done = True
-                truncated = False
-            elif episode_outcome == EPISODE_FAILURE:
-                reward = 0.0
-                done = True
-                truncated = False
-
-            sum_reward_episode += float(reward)
-            episode_total_steps += 1
-            if is_intervention:
-                episode_intervention = True
-                episode_intervention_steps += 1
-
-            complementary_info = {
-                "discrete_penalty": torch.tensor(
-                    [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-                ),
-                "is_intervention": torch.tensor([float(is_intervention)]),
-                "intervention_state": torch.tensor([float(intervention_state)]),
-                "success": torch.tensor([float(episode_outcome == EPISODE_SUCCESS)]),
-                "failure": torch.tensor([float(episode_outcome == EPISODE_FAILURE)]),
-                "actor_policy_is_vla": torch.tensor([float(vla_runtime is not None)]),
-            }
-            state_to_store = transition[TransitionKey.OBSERVATION] if actor_episode_writer is not None else observation
-            next_state_to_store = (
-                new_transition[TransitionKey.OBSERVATION] if actor_episode_writer is not None else next_observation
-            )
-            list_transition_to_send_to_learner.append(
-                Transition(
-                    state=state_to_store,
-                    action=executed_action,
-                    reward=reward,
-                    next_state=next_state_to_store,
-                    done=done,
-                    truncated=truncated,
-                    complementary_info=complementary_info,
+            obs_processed = robot_observation_processor(raw_observation)
+            observation_frame = (
+                build_dataset_frame(
+                    robot_observation_features,
+                    obs_processed,
+                    prefix=OBS_STR,
                 )
+                if robot_observation_features is not None
+                else {}
             )
+            actor_state = (
+                _observation_frame_to_cpu_tensors(observation_frame)
+                if actor_episode_writer is not None
+                else None
+            )
+            current_state_to_store = actor_state if actor_state is not None else observation
 
-            transition = new_transition
+            reward = float(current_transition[TransitionKey.REWARD])
+            done = bool(current_transition.get(TransitionKey.DONE, False))
+            truncated = bool(current_transition.get(TransitionKey.TRUNCATED, False))
+            episode_outcome = keyboard_state.episode_outcome
+            if pending_step is not None:
+                reward += pending_step["action_reward"]
+                done = done or pending_step["action_done"]
+                truncated = truncated or pending_step["action_truncated"]
+                if episode_outcome == EPISODE_SUCCESS:
+                    reward = 1.0
+                    done = True
+                    truncated = False
+                elif episode_outcome == EPISODE_FAILURE:
+                    reward = 0.0
+                    done = True
+                    truncated = False
+
+                complementary_info = pending_step["complementary_info"]
+                complementary_info["success"] = torch.tensor(
+                    [float(episode_outcome == EPISODE_SUCCESS)]
+                )
+                complementary_info["failure"] = torch.tensor(
+                    [float(episode_outcome == EPISODE_FAILURE)]
+                )
+                list_transition_to_send_to_learner.append(
+                    Transition(
+                        state=pending_step["state"],
+                        action=pending_step["action"],
+                        reward=reward,
+                        next_state=current_state_to_store,
+                        done=done,
+                        truncated=truncated,
+                        complementary_info=complementary_info,
+                    )
+                )
+                sum_reward_episode += reward
+                episode_total_steps += 1
+                if pending_step["is_intervention"]:
+                    episode_intervention = True
+                    episode_intervention_steps += 1
+                pending_step = None
 
             discard_episode = keyboard_state.rerecord_episode or keyboard_state.reset_episode
             keyboard_episode_end = keyboard_state.exit_episode or episode_outcome is not None
             if done or truncated or keyboard_episode_end:
-                should_send = not discard_episode
-                reset_to_home = keyboard_state.reset_episode
-                hold_current_pose = episode_outcome in {EPISODE_SUCCESS, EPISODE_FAILURE} or keyboard_state.rerecord_episode
                 finish_episode(
                     interaction_step=interaction_step,
-                    should_send=should_send,
-                    reset_to_home=reset_to_home,
-                    hold_current_pose=hold_current_pose,
+                    should_send=not discard_episode,
+                    reset_to_home=keyboard_state.reset_episode,
+                    hold_current_pose=(
+                        episode_outcome in {EPISODE_SUCCESS, EPISODE_FAILURE}
+                        or keyboard_state.rerecord_episode
+                        or (truncated and not keyboard_state.reset_episode)
+                    ),
                     episode_outcome=episode_outcome,
                     timeout=bool(truncated and episode_outcome is None and not discard_episode),
+                )
+                continue
+
+            is_intervention = intervention_state == INTERVENTION_STATE_ACTIVE
+            act_processed_policy = None
+            with policy_timer:
+                if not is_intervention and vla_runtime is not None:
+                    # TODO 这里后续需要统一用make_policy的模型获取动作
+                    policy_action = vla_runtime.select_action(
+                        observation_frame=observation_frame,
+                        robot_type=getattr(robot, "robot_type", None),
+                        device=device,
+                    )
+                    act_processed_policy = action_to_robot_action_dict(policy_action)
+                elif not is_intervention:
+                    policy_action = policy.select_action(batch=observation)
+                    act_processed_policy = action_to_robot_action_dict(policy_action)
+            policy_fps = policy_timer.fps_last
+            log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
+
+            act_processed_teleop = None
+            if teleop_device is not None:
+                teleop_action = _run_with_connection_retry(
+                    "teleop.get_action", teleop_device.get_action
+                )
+                act_processed_teleop = teleop_action_processor(
+                    (teleop_action, raw_observation)
+                )
+
+            action_values, selected_from_policy, last_teleop_action = _select_actor_action(
+                act_processed_policy,
+                act_processed_teleop,
+                last_teleop_action,
+                is_intervention,
+            )
+            zero_policy_action = dict.fromkeys(action_names, 0.0)
+            policy_action_for_storage = (
+                act_processed_policy if act_processed_policy is not None else zero_policy_action
+            )
+            if action_values is None:
+                action_values = zero_policy_action
+                logging.warning("No policy/teleop action is available; sending zero action.")
+            if selected_from_policy and policy_action_smoother is not None:
+                action_values = _postprocess_policy_action(action_values, policy_action_smoother)
+                policy_action_for_storage = action_values
+
+            robot_action_to_send = robot_action_processor((action_values, raw_observation))
+            action = action_to_tensor(robot_action_to_send)
+
+            if robot is not None and hasattr(online_env, "action_sender"):
+                online_env.action_sender = (
+                    policy_action_sender
+                    if policy_action_sender is not None and selected_from_policy
+                    else robot_action_sender
+                )
+                online_env.action_add_offset = policy_action_sender is not None and selected_from_policy
+
+            action_transition = action_processor(
+                create_transition(observation=raw_observation, action=action)
+            )
+            sent_action = action_to_tensor(action_transition[TransitionKey.ACTION]).detach()
+            online_env.send_action(sent_action)
+            complementary_info = {
+                "discrete_penalty": torch.tensor(
+                    [action_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
+                ),
+                "is_intervention": torch.tensor([float(is_intervention)]),
+                "intervention_state": torch.tensor([float(intervention_state)]),
+                "success": torch.tensor([0.0]),
+                "failure": torch.tensor([0.0]),
+                "actor_policy_is_vla": torch.tensor([float(vla_runtime is not None)]),
+                "policy_action": action_to_tensor(policy_action_for_storage).unsqueeze(0).detach(),
+            }
+            pending_step = {
+                "state": current_state_to_store,
+                "action": sent_action,
+                "action_reward": float(action_transition[TransitionKey.REWARD]),
+                "action_done": bool(action_transition.get(TransitionKey.DONE, False)),
+                "action_truncated": bool(action_transition.get(TransitionKey.TRUNCATED, False)),
+                "complementary_info": complementary_info,
+                "is_intervention": is_intervention,
+            }
+
+            if display_data:
+                log_rerun_data(
+                    observation=obs_processed,
+                    action=action_values,
+                    compress_images=False,
                 )
 
             if intervention_state == INTERVENTION_STATE_RELEASE:
@@ -891,6 +1227,8 @@ def act_with_policy(
                 precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
     finally:
         stop_keyboard_listener(keyboard_listener)
+        if policy_sync_executor is not None:
+            policy_sync_executor.shutdown()
 
 
 #  Communication Functions - Group all gRPC/messaging functions

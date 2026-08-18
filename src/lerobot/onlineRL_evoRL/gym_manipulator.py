@@ -26,8 +26,10 @@ import torch
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import hw_to_dataset_features
 from lerobot.envs.configs import HILSerlRobotEnvConfig
 from lerobot.model.kinematics import RobotKinematics
+from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     AddTeleopActionAsComplimentaryDataStep,
@@ -143,6 +145,8 @@ class RobotEnv(gym.Env):
         super().__init__()
 
         self.robot = robot
+        self.action_sender = robot
+        self.action_add_offset = False
         self.display_cameras = display_cameras
 
         # Connect to the robot if not already connected.
@@ -153,7 +157,10 @@ class RobotEnv(gym.Env):
         self.current_step = 0
         self.episode_data = None
 
-        self._joint_names = [f"{key}.pos" for key in self.robot.bus.motors]
+        self._action_keys = list(self.robot.action_features)
+        self._dataset_action_features = hw_to_dataset_features(
+            self.robot.action_features, prefix=ACTION, use_video=False
+        )
         self._image_keys = self.robot.cameras.keys()
 
         self.reset_pose = reset_pose
@@ -161,20 +168,29 @@ class RobotEnv(gym.Env):
 
         self.use_gripper = use_gripper
 
-        self._joint_names = list(self.robot.bus.motors.keys())
+        self._joint_names = [key.removesuffix(".pos") for key in self._action_keys]
         self._raw_joint_positions = None
+        self.last_raw_observation: RobotObservation | None = None
 
         self._setup_spaces()
 
-    def _get_observation(self) -> RobotObservation:
-        """Get current robot observation including joint positions and camera images."""
-        obs_dict = self.robot.get_observation()
+    def format_observation(self, obs_dict: RobotObservation) -> RobotObservation:
+        """Convert one raw robot observation to the Gym observation format."""
         raw_joint_joint_position = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
         joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
 
         images = {key: obs_dict[key] for key in self._image_keys}
 
         return {"agent_pos": joint_positions, "pixels": images, **raw_joint_joint_position}
+
+    def read_raw_observation(self) -> RobotObservation:
+        """Read and cache exactly one raw robot observation."""
+        self.last_raw_observation = self.robot.get_observation()
+        return self.last_raw_observation
+
+    def _get_observation(self) -> RobotObservation:
+        """Read and cache one raw observation, then convert it for the Gym pipeline."""
+        return self.format_observation(self.read_raw_observation())
 
     def _setup_spaces(self) -> None:
         """Configure observation and action spaces based on robot capabilities."""
@@ -252,20 +268,36 @@ class RobotEnv(gym.Env):
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
+    def send_action(self, action: torch.Tensor) -> None:
+        """Send one action without performing an implicit observation read."""
+        if not isinstance(action, torch.Tensor) or action.ndim != 1:
+            raise ValueError(
+                f"Robot action must be a 1-D tensor, got {type(action)} "
+                f"with shape {getattr(action, 'shape', None)}"
+            )
+        if action.numel() != len(self._action_keys):
+            raise ValueError(
+                f"Robot action has {action.numel()} values, expected {len(self._action_keys)}"
+            )
+        joint_targets_dict = make_robot_action(action, self._dataset_action_features)
+
+        if self.action_add_offset:
+            self.action_sender.send_action(joint_targets_dict, add_offset=True)
+        else:
+            self.action_sender.send_action(joint_targets_dict)
+
+        self.current_step += 1
+
     def step(self, action) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
-
-        self.robot.send_action(joint_targets_dict)
+        self.send_action(action)
 
         obs = self._get_observation()
 
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
 
         if self.display_cameras:
-            self.render()
-
-        self.current_step += 1
+            self.render(self.last_raw_observation)
 
         reward = 0.0
         terminated = False
@@ -279,17 +311,19 @@ class RobotEnv(gym.Env):
             {TeleopEvents.IS_INTERVENTION: False},
         )
 
-    def render(self) -> None:
-        """Display robot camera feeds."""
+    def render(self, raw_observation: RobotObservation | None = None) -> None:
+        """Display camera feeds without reading the robot again."""
         import cv2
 
-        current_observation = self._get_observation()
-        if current_observation is not None:
-            image_keys = [key for key in current_observation if "image" in key]
-
-            for key in image_keys:
-                cv2.imshow(key, cv2.cvtColor(current_observation[key].numpy(), cv2.COLOR_RGB2BGR))
-                cv2.waitKey(1)
+        raw_observation = raw_observation or self.last_raw_observation
+        if raw_observation is None:
+            return
+        for key in self._image_keys:
+            image = raw_observation[key]
+            if isinstance(image, torch.Tensor):
+                image = image.detach().cpu().numpy()
+            cv2.imshow(key, cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
 
     def close(self) -> None:
         """Close environment and disconnect robot."""
@@ -355,7 +389,11 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
 
 
 def make_processors(
-    env: gym.Env, teleop_device: Teleoperator | None, cfg: HILSerlRobotEnvConfig, device: str = "cpu"
+    env: gym.Env,
+    teleop_device: Teleoperator | None,
+    cfg: HILSerlRobotEnvConfig,
+    device: str = "cpu",
+    explicit_intervention_selection: bool = False,
 ) -> tuple[
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
@@ -366,6 +404,7 @@ def make_processors(
         teleop_device: Teleoperator device for intervention. 用于干预的遥控设备。
         cfg: Processor configuration. 处理器配置。
         device: Target device for computations. 用于计算的目标设备（GPU）。
+        explicit_intervention_selection: The caller already selected policy/teleop action.
 
     Returns:
         Tuple of (environment processor, action processor). 返回（环境处理器，动作处理器）
@@ -376,10 +415,12 @@ def make_processors(
 
     # 仿真环境配置
     if cfg.name == "gym_hil":
-        action_pipeline_steps = [
-            InterventionActionProcessorStep(terminate_on_success=terminate_on_success),
-            Torch2NumpyActionProcessorStep(),
-        ]
+        action_pipeline_steps = []
+        if not explicit_intervention_selection:
+            action_pipeline_steps.append(
+                InterventionActionProcessorStep(terminate_on_success=terminate_on_success)
+            )
+        action_pipeline_steps.append(Torch2NumpyActionProcessorStep())
 
         env_pipeline_steps = [
             Numpy2TorchActionProcessorStep(),
@@ -396,7 +437,7 @@ def make_processors(
 
     # Full processor pipeline for real robot environment 获取机器人和电机的运动学信息
     # Get robot and motor information for kinematics
-    motor_names = list(env.robot.bus.motors.keys())
+    motor_names = [key.removesuffix(".pos") for key in env.robot.action_features]
 
     # Set up kinematics solver if inverse kinematics is configured
     kinematics_solver = None
@@ -481,22 +522,20 @@ def make_processors(
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
     # 构造 action processor pipeline，作用是在 policy action 真正送进环境/机器人之前，先把遥操作信息、人类介入事件、实际执行动作整理到 transition 里
-    action_pipeline_steps = [
-        # 从 teleop_device 读取当前遥操作器动作，并写入 transition 的 COMPLEMENTARY_DATA。后面 actor 会用这个字段作为“实际执行动作”：
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        # 从遥操作器读取事件状态，写入 transition 的 INFO。如：
-        # - 是否人类介入：TeleopEvents.IS_INTERVENTION（actor 后面用这个判断 episode 中有没有人类介入）
-        # - 是否成功
-        # - 是否失败
-        # - 是否重录
-        # - 其他 teleop 设备定义的事件
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
-        # 决定最终送进环境的 action 是 policy action 还是 teleop action
-        InterventionActionProcessorStep(
-            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
-            terminate_on_success=terminate_on_success,
-        ),
-    ]
+    action_pipeline_steps = []
+    if not explicit_intervention_selection:
+        action_pipeline_steps.extend(
+            [
+                AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
+                AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+                InterventionActionProcessorStep(
+                    use_gripper=(
+                        cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+                    ),
+                    terminate_on_success=terminate_on_success,
+                ),
+            ]
+        )
 
     # Replace InverseKinematicsProcessor with new kinematic processors
     if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
@@ -541,6 +580,7 @@ def step_env_and_process_transition(
     action: torch.Tensor,
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+    action_observation: RobotObservation | None = None,
 ) -> EnvTransition:
     """
     Execute one step with processor pipeline.
@@ -551,20 +591,30 @@ def step_env_and_process_transition(
         action: Action to execute
         env_processor: Environment processor
         action_processor: Action processor
+        action_observation: Raw observation paired with this action.
 
     Returns:
         Processed transition with updated state.
     """
 
-    # Create action transition
-    # 把 policy action 写入 transition
-    transition[TransitionKey.ACTION] = action
-    # 果环境支持 get_raw_joint_positions，把当前原始关节位置放进 observation，供 action processor 使用。
-    transition[TransitionKey.OBSERVATION] = (
-        env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+    # A single environment executes one unbatched action. Policy inference commonly returns [1, N].
+    if action.ndim == 2 and action.shape[0] == 1:
+        action = action.squeeze(0)
+    if action.ndim != 1:
+        raise ValueError(f"Expected a single 1-D action, got shape {tuple(action.shape)}")
+
+    # Keep the caller's state intact: it is the observation paired with this action.
+    action_transition = transition.copy()
+    action_transition[TransitionKey.ACTION] = action
+    action_transition[TransitionKey.OBSERVATION] = (
+        action_observation
+        if action_observation is not None
+        else env.get_raw_joint_positions()
+        if hasattr(env, "get_raw_joint_positions")
+        else {}
     )
     # 执行 action_processor。这里会处理 teleop、人类介入、IK、安全边界、夹爪等。在 policy action 真正送进环境/机器人之前，先把遥操作信息、人类介入事件、实际执行动作整理到 transition 里。
-    processed_action_transition = action_processor(transition)
+    processed_action_transition = action_processor(action_transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     # 用 env.step(processed_action) 真正执行动作。

@@ -89,21 +89,21 @@ policy_postprocessor.json
 先启动 learner：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.learner \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json
+/home/hpc/yuzhang/envs/package_sorting_env/bin/pytho -m lerobot.onlineRL_evoRL.learner \
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_leanerOnly_transion.json
 ```
 
 再启动 actor。默认 SAC actor：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
+/home/hpc/yuzhang/envs/package_sorting_env/bin/pytho -m lerobot.onlineRL_evoRL.actor \
   --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json
 ```
 
 Online + VLA actor：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
+/home/hpc/yuzhang/envs/package_sorting_env/bin/pytho -m lerobot.onlineRL_evoRL.actor \
   --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json \
   --actor_vla_policy.enabled true \
   --actor_vla_policy.policy_path /home/yz/projects/outputs/pi05_base_smovla_v3_0720/train/checkpoints/050000/pi05_base_smovla_v3_0720_50k
@@ -113,32 +113,38 @@ Online + VLA actor 时，actor 仍连接 learner、仍发送 transitions；但 a
 
 ## Actor-only 模式
 
-Actor-only 不连接 learner，不检查 learner 是否存在。配置：
+Actor-only 不连接 learner，不检查 learner 是否存在。`actor_only.save_format`
+用于选择两种保存方式：
+
+- `transition`：保存 online RL 使用的 transition 包，同时生成 JSON、JPEG 和 HTML viewer。
+- `lerobot`：按 `scripts/RL_data.sh` 的标准 LeRobotDataset 格式保存 Parquet、视频和 metadata。
+
+### 方式一：保存 transition 包
+
+配置文件中设置：
 
 ```json
 "actor_only": {
   "enabled": true,
-  "episode_output_dir": "/home/yz/projects/outputs/piper_package_sorting_online_rl/actor_episodes",
+  "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_transition_episodes",
+  "save_format": "transition",
   "save_episode_images": true,
   "save_episode_viewer": true
 }
 ```
 
-Actor-only + VLA：
+启动命令：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_1F.json \
-  --actor_only.enabled true \
-  --actor_vla_policy.enabled true \
-  --actor_vla_policy.policy_path /home/hpc/yuzhang/outputs/pi05_base_smovla_v3_0720_RLT_30K \
-  --actor_only.episode_output_dir /home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_episodes
+cd /home/hpc/yuzhang/Evo-RL-loop-0817
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_actorOnly_transion.json
 ```
 
-保存结构：
+输出目录可以已经存在；重新启动时会从现有最大 episode 编号继续写入。保存结构：
 
 ```text
-actor_episodes/
+actor_transition_episodes/
   episode_000000/
     metadata.json
     transitions.pt
@@ -149,15 +155,100 @@ actor_episodes/
     viewer.html
 ```
 
-打开某个 episode 的 `viewer.html` 可查看：
+打开某个 episode 的 `viewer.html` 即可查看 top/wrist 图像、task、reward、
+done/truncated、action、state、介入状态和 VLA checkpoint 信息。
 
-- top/wrist 两路相机
-- task 指令
-- reward、done、truncated
-- action 和 state 摘要
-- success/failure
-- intervention 状态
-- VLA policy path 和 checkpoint fingerprint
+### 方式二：保存标准 LeRobotDataset
+
+配置文件中设置：
+
+```json
+"actor_only": {
+  "enabled": true,
+  "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_lerobot_dataset",
+  "save_format": "lerobot",
+  "save_episode_images": true,
+  "save_episode_viewer": true
+}
+```
+
+启动命令：
+
+```bash
+cd /home/hpc/yuzhang/Evo-RL-loop-0817
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_actorOnly_lerobot.json
+```
+
+`lerobot` 方式要求 `episode_output_dir` 在启动时不存在，因此每次新建数据集应使用新目录；
+不要与 `transition` 方式共用同一目录。`save_episode_images` 和 `save_episode_viewer` 仅对
+`transition` 方式生效，`lerobot` 方式固定由 LeRobotDataset 写入视频。
+
+保存结构：
+
+```text
+actor_lerobot_dataset/
+  data/
+    chunk-000/
+      file-000.parquet
+  meta/
+    episodes/
+    info.json
+    stats.json
+    tasks.parquet
+  videos/
+    observation.images.top/
+    observation.images.wrist/
+```
+
+数据集使用 `dataset.repo_id` 作为 repo id，使用 `env.fps` 作为帧率。可以用 Python 读取：
+
+```bash
+PYTHONPATH=/home/hpc/yuzhang/Evo-RL-loop-0817/src \
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python - <<'PY'
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+dataset = LeRobotDataset(
+    repo_id="local_data",
+    root="/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_lerobot_dataset",
+)
+print(dataset)
+print(dataset[0]["action"])
+PY
+```
+
+标准数据集中保存的主要字段与 `RL_data.sh` 一致：
+
+- `observation.state`
+- `observation.images.top` / `observation.images.wrist`
+- `action`：实际传入 CAN1 从臂的动作
+- `complementary_info.policy_action`
+- `complementary_info.is_intervention`
+- `complementary_info.state`
+- `complementary_info.collector_policy_id`
+- task 和 episode success/failure metadata
+
+### Actor 实时数据显示
+
+配置文件中设置：
+
+```json
+"processor": {
+  "observation": {
+    "display_cameras": true
+  }
+}
+```
+
+启用后，Actor 使用与 `scripts/RL_data.sh --display_data=true` 相同的 Rerun
+显示逻辑，实时显示处理后的摄像头图像、机械臂观测状态，以及策略或人工干预后
+选中的动作。Actor 不再为该配置调用 `cv2.imshow()`。
+
+设置为 `false` 时不启动 Rerun：
+
+```json
+"display_cameras": false
+```
 
 ## 热键和 Episode 规则
 
@@ -191,6 +282,7 @@ intervention_state
 success
 failure
 actor_policy_is_vla
+policy_action
 ```
 
 当前配置 `policy.num_discrete_actions=null` 时，`discrete_penalty` 不参与 SAC 主损失。

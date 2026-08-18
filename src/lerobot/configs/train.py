@@ -16,7 +16,7 @@ import datetime as dt
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -52,6 +52,7 @@ class ActorVLAPolicyConfig:
 class ActorOnlyConfig:
     enabled: bool = False
     episode_output_dir: str | None = None
+    save_format: Literal["transition", "lerobot"] = "transition"
     save_episode_images: bool = True
     save_episode_viewer: bool = True
 

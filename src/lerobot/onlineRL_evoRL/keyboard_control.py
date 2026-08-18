@@ -72,6 +72,9 @@ class KeyboardController:
                 state.reset_episode = True
                 state.rerecord_episode = True
                 state.exit_episode = True
+            else:
+                continue
+            logging.info("Keyboard event accepted: %s", normalized)
         return state
 
 
@@ -133,6 +136,28 @@ class TTYKeyboardListener:
 
 
 def start_keyboard_listener(controller: KeyboardController) -> object | None:
+    try:
+        from pynput import keyboard
+    except Exception as error:
+        logging.info("Global keyboard hotkeys unavailable; trying TTY: %s", error)
+    else:
+        def on_press(key):
+            if key == keyboard.Key.left:
+                controller.push("LEFT")
+            elif key == keyboard.Key.esc:
+                controller.push("ESC")
+            else:
+                controller.push(getattr(key, "char", "") or "")
+
+        try:
+            listener = keyboard.Listener(on_press=on_press)
+            listener.start()
+        except Exception as error:
+            logging.warning("Failed to start global keyboard hotkeys; trying TTY: %s", error)
+        else:
+            logging.info("Global keyboard hotkeys enabled through pynput: %s", HOTKEYS)
+            return listener
+
     if sys.stdin.isatty():
         try:
             listener = TTYKeyboardListener(controller)
@@ -143,24 +168,8 @@ def start_keyboard_listener(controller: KeyboardController) -> object | None:
             logging.info("Keyboard hotkeys enabled on current TTY: %s", HOTKEYS)
             return listener
 
-    try:
-        from pynput import keyboard
-    except ImportError as error:
-        logging.warning("Keyboard hotkeys disabled: %s", error)
-        return None
-
-    def on_press(key):
-        if key == keyboard.Key.left:
-            controller.push("LEFT")
-        elif key == keyboard.Key.esc:
-            controller.push("ESC")
-        else:
-            controller.push(getattr(key, "char", "") or "")
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    logging.info("Keyboard hotkeys enabled through pynput: %s", HOTKEYS)
-    return listener
+    logging.warning("Keyboard hotkeys disabled: neither pynput nor a usable TTY is available.")
+    return None
 
 
 def stop_keyboard_listener(listener: object | None) -> None:

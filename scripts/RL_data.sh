@@ -3,8 +3,8 @@
 
 # ```bash
 # # mkdir -p ./package_sorting_env_raw && tar -xzf ./package_sorting.tar.gz -C ./package_sorting_env_raw
-# source /home/yz/projects/env/package_sorting_env/bin/activate
-# ./home/ghr/yuzhang/代码封装/package_sorting_env/bin/conda-unpack
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
 # ```
 # 用法：
 #   ./lerobot_record.sh \
@@ -25,20 +25,41 @@
 # 打印DATASET_ROOT所在位置
 
 # 纯人工示范（不传 policy.path）
-# bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_data.sh \
-#   --dataset.root /home/yz/datasets/output_001 \
-#   --dataset.single_task "Flip the package if the barcode is not facing up. Advantage: positive" \
-#   --wrist_camera.index_or_path 10 \
-#   --top_camera.index_or_path 4
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v2/0814_right_yellow \
+#   --dataset.single_task "Grab the left cup" \
+#   --wrist_camera.index_or_path 4 \
+#   --top_camera.index_or_path 12 \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
+
+# Pick up the cup on the right
+# Take the middle cup away
+# Grab the left cup
+
+
+
 
 # 策略模型 + 人工介入
-# bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_data.sh \
-#   --dataset.root /home/yz/datasets/onineRL_test_1 \
-#   --dataset.single_task "Flip the package if the barcode is not facing up. Advantage: positive" \
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_smovla_v3_0720_RLT_30K_test_1 \
+#   --dataset.single_task "You are a parcel sorter. First, Grab the package and place it on the pallet. Then, Flip the package if the barcode is not facing up. Finally, Grab the scanned package and place it into the box." \
 #   --wrist_camera.index_or_path 4 \
-#   --top_camera.index_or_path 10 \
-#   --policy.path /home/yz/projects/outputs/pi05_base_smovla_v3_0720/train/checkpoints/050000/pi05_base_smovla_v3_0720_50k \
-#   --event.config.path /home/yz/projects/Evo-RL-loop-0810/scripts/event_config.json
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_smovla_v3_0720_RLT_30K \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_smolvla_test_right \
+#   --dataset.single_task "Pick up the cup on the right" \
+#   --wrist_camera.index_or_path 4 \
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_0813_tain0813_30K \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
+
+
 
 # 合并数据集
 # cd /home/yz/projects/Evo-RL-loop-0609/src
@@ -47,11 +68,10 @@
 #     --operation.type merge \
 #     --operation.repo_ids "['/home/yz/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/yz/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/yz/datasets/task2_grab_the_package_and_place_it_into_the_b']"
 
-# cd /home/yz/projects/Evo-RL-loop-0810/src
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/yz/datasets/cup_catch_0813/cup_catch_0813_merged \
+#     --repo_id /home/yz/datasets/v9_task2_0728/v9_task2_0728_merged \
 #     --operation.type merge \
-#     --operation.source_dir /home/yz/datasets/cup_catch_0813
+#     --operation.source_dir /home/yz/datasets/v9_task2_0728
 
 set -e
 
@@ -111,13 +131,6 @@ if [[ -n "$POLICY_PATH" ]]; then
     echo "[提示] PI05 模型加载时会忽略 checkpoint 中当前模型不需要的多余参数。"
 fi
 
-if [[ -n "$EVENT_CONFIG_PATH" ]]; then
-    if [[ ! -f "$EVENT_CONFIG_PATH" ]]; then
-        echo "[错误] --event.config.path 必须是可读取的 JSON 文件：$EVENT_CONFIG_PATH" >&2
-        exit 1
-    fi
-fi
-
 # ---------- 构建摄像头配置 ----------
 CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
 
@@ -136,23 +149,19 @@ CMD=(
     --dataset.repo_id=local_data
     "--dataset.root=${DATASET_ROOT}"
     "--dataset.single_task=${SINGLE_TASK}"
-    --dataset.num_episodes=50
-    --dataset.episode_time_s=120
+    --dataset.num_episodes=100
+    --dataset.episode_time_s=120000
     --dataset.reset_time_s=1
     --dataset.push_to_hub=False
     --display_data=true
     --resume=false
+    "--event_config_path=${EVENT_CONFIG_PATH}"
     --reset_on_timeout=false
 )
 
 # 若提供了策略模型路径则追加（启用人机协同模式）
 if [[ -n "$POLICY_PATH" ]]; then
     CMD+=("--policy.path=${POLICY_PATH}")
-fi
-
-# 若提供了事件配置路径则追加（未提供时不启用质量事件标签）
-if [[ -n "$EVENT_CONFIG_PATH" ]]; then
-    CMD+=("--event_config_path=${EVENT_CONFIG_PATH}")
 fi
 
 # ---------- 执行 ----------
