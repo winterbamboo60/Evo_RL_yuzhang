@@ -35,6 +35,7 @@ from lerobot.policies.evo1.configuration_evo1 import Evo1Config
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05_onlineRL.configuration_pi05_online_rl import PI05OnlineRLConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -104,6 +105,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_online_rl":
+        from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import PI05OnlineRLPolicy
+
+        return PI05OnlineRLPolicy
     elif name == "evo1":
         from lerobot.policies.evo1.modeling_evo1 import EVO1Policy
 
@@ -174,6 +179,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_online_rl":
+        return PI05OnlineRLConfig(**kwargs)
     elif policy_type == "evo1":
         return Evo1Config(**kwargs)
     elif policy_type == "sac":
@@ -249,6 +256,14 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        if isinstance(policy_cfg, PI05OnlineRLConfig):
+            from lerobot.policies.pi05_onlineRL.processor_pi05_online_rl import (
+                make_pi05_online_rl_pre_post_processors,
+            )
+            return make_pi05_online_rl_pre_post_processors(
+                config=policy_cfg, dataset_stats=kwargs.get("dataset_stats")
+            )
+
         if isinstance(policy_cfg, PI05Config):
             # Import for ProcessorStepRegistry side effects when loading saved PI05 pipelines.
             import lerobot.policies.pi05.processor_pi05  # noqa: F401
@@ -342,6 +357,14 @@ def make_pre_post_processors(
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05OnlineRLConfig):
+        from lerobot.policies.pi05_onlineRL.processor_pi05_online_rl import (
+            make_pi05_online_rl_pre_post_processors,
+        )
+        processors = make_pi05_online_rl_pre_post_processors(
+            config=policy_cfg, dataset_stats=kwargs.get("dataset_stats")
         )
 
     elif isinstance(policy_cfg, Evo1Config):

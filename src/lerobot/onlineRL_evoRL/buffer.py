@@ -22,6 +22,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
+from typing_extensions import NotRequired
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, REWARD
@@ -32,6 +33,10 @@ class BatchTransition(TypedDict):
     state: dict[str, torch.Tensor]
     action: torch.Tensor
     reward: torch.Tensor
+    target_action_chunk: NotRequired[torch.Tensor]
+    intervene_flags: NotRequired[torch.Tensor]
+    valid_action_mask: NotRequired[torch.Tensor]
+    next_valid_action_mask: NotRequired[torch.Tensor]
     next_state: dict[str, torch.Tensor]
     done: torch.Tensor
     truncated: torch.Tensor
@@ -133,12 +138,20 @@ class ReplayBuffer:
         self,
         state: dict[str, torch.Tensor],
         action: torch.Tensor,
+        reward: torch.Tensor | float = 0.0,
+        target_action_chunk: torch.Tensor | None = None,
+        intervene_flags: torch.Tensor | None = None,
+        valid_action_mask: torch.Tensor | None = None,
+        next_valid_action_mask: torch.Tensor | None = None,
         complementary_info: dict[str, torch.Tensor] | None = None,
     ):
         """Initialize the storage tensors based on the first transition."""
         # Determine shapes from the first transition
         state_shapes = {key: val.squeeze(0).shape for key, val in state.items()}
         action_shape = action.squeeze(0).shape
+        reward_tensor = torch.as_tensor(reward)
+        reward_shape = reward_tensor.squeeze(0).shape if reward_tensor.ndim else ()
+        self.is_chunk = target_action_chunk is not None
 
         # Pre-allocate tensors for storage
         self.states = {
@@ -146,7 +159,22 @@ class ReplayBuffer:
             for key, shape in state_shapes.items()
         }
         self.actions = torch.empty((self.capacity, *action_shape), device=self.storage_device)
-        self.rewards = torch.empty((self.capacity,), device=self.storage_device)
+        self.rewards = torch.empty((self.capacity, *reward_shape), device=self.storage_device)
+        if self.is_chunk:
+            if any(value is None for value in (intervene_flags, valid_action_mask, next_valid_action_mask)):
+                raise ValueError("All chunk mask fields are required")
+            self.target_action_chunks = torch.empty(
+                (self.capacity, *target_action_chunk.shape), device=self.storage_device
+            )
+            self.intervene_flags = torch.empty(
+                (self.capacity, *intervene_flags.shape), dtype=torch.bool, device=self.storage_device
+            )
+            self.valid_action_masks = torch.empty(
+                (self.capacity, *valid_action_mask.shape), device=self.storage_device
+            )
+            self.next_valid_action_masks = torch.empty(
+                (self.capacity, *next_valid_action_mask.shape), device=self.storage_device
+            )
 
         if not self.optimize_memory:
             # Standard approach: store states and next_states separately
@@ -191,16 +219,25 @@ class ReplayBuffer:
         self,
         state: dict[str, torch.Tensor],
         action: torch.Tensor,
-        reward: float,
+        reward: torch.Tensor | float,
         next_state: dict[str, torch.Tensor],
         done: bool,
         truncated: bool,
         complementary_info: dict[str, torch.Tensor] | None = None,
+        target_action_chunk: torch.Tensor | None = None,
+        intervene_flags: torch.Tensor | None = None,
+        valid_action_mask: torch.Tensor | None = None,
+        next_valid_action_mask: torch.Tensor | None = None,
     ):
-        """Saves a transition, ensuring tensors are stored on the designated storage device."""
+        """Save one primitive or chunk transition."""
         # Initialize storage if this is the first transition
         if not self.initialized:
-            self._initialize_storage(state=state, action=action, complementary_info=complementary_info)
+            self._initialize_storage(
+                state=state, action=action, reward=reward,
+                target_action_chunk=target_action_chunk, intervene_flags=intervene_flags,
+                valid_action_mask=valid_action_mask, next_valid_action_mask=next_valid_action_mask,
+                complementary_info=complementary_info,
+            )
 
         # Store the transition in pre-allocated tensors
         for key in self.states:
@@ -211,7 +248,12 @@ class ReplayBuffer:
                 self.next_states[key][self.position].copy_(next_state[key].squeeze(dim=0))
 
         self.actions[self.position].copy_(action.squeeze(dim=0))
-        self.rewards[self.position] = reward
+        self.rewards[self.position].copy_(torch.as_tensor(reward, device=self.storage_device))
+        if self.is_chunk:
+            self.target_action_chunks[self.position].copy_(target_action_chunk)
+            self.intervene_flags[self.position].copy_(intervene_flags)
+            self.valid_action_masks[self.position].copy_(valid_action_mask)
+            self.next_valid_action_masks[self.position].copy_(next_valid_action_mask)
         self.dones[self.position] = done
         self.truncateds[self.position] = truncated
 
@@ -293,7 +335,7 @@ class ReplayBuffer:
             for key in self.complementary_info_keys:
                 batch_complementary_info[key] = self.complementary_info[key][idx].to(self.device)
 
-        return BatchTransition(
+        batch = BatchTransition(
             state=batch_state,
             action=batch_actions,
             reward=batch_rewards,
@@ -302,6 +344,14 @@ class ReplayBuffer:
             truncated=batch_truncateds,
             complementary_info=batch_complementary_info,
         )
+        if self.is_chunk:
+            batch.update(
+                target_action_chunk=self.target_action_chunks[idx].to(self.device),
+                intervene_flags=self.intervene_flags[idx].to(self.device),
+                valid_action_mask=self.valid_action_masks[idx].to(self.device),
+                next_valid_action_mask=self.next_valid_action_masks[idx].to(self.device),
+            )
+        return batch
 
     def get_iterator(
         self,
@@ -449,6 +499,9 @@ class ReplayBuffer:
                 "The capacity of the ReplayBuffer must be greater than or equal to the length of the LeRobotDataset."
             )
 
+        if len(lerobot_dataset) and "target_action_chunk" in lerobot_dataset[0]:
+            optimize_memory = False
+
         # Create replay buffer with image augmentation and DrQ settings
         replay_buffer = cls(
             capacity=capacity,
@@ -480,7 +533,12 @@ class ReplayBuffer:
                 }
 
             replay_buffer._initialize_storage(
-                state=first_state, action=first_action, complementary_info=first_complementary_info
+                state=first_state, action=first_action, reward=first_transition["reward"],
+                target_action_chunk=first_transition.get("target_action_chunk"),
+                intervene_flags=first_transition.get("intervene_flags"),
+                valid_action_mask=first_transition.get("valid_action_mask"),
+                next_valid_action_mask=first_transition.get("next_valid_action_mask"),
+                complementary_info=first_complementary_info,
             )
 
         # Fill the buffer with all transitions
@@ -500,8 +558,12 @@ class ReplayBuffer:
                 reward=data["reward"],
                 next_state=data["next_state"],
                 done=data["done"],
-                truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
+                truncated=data["truncated"],
                 complementary_info=data.get("complementary_info", None),
+                target_action_chunk=data.get("target_action_chunk"),
+                intervene_flags=data.get("intervene_flags"),
+                valid_action_mask=data.get("valid_action_mask"),
+                next_valid_action_mask=data.get("next_valid_action_mask"),
             )
 
         return replay_buffer
@@ -534,7 +596,7 @@ class ReplayBuffer:
         features[ACTION] = act_info
 
         # Add "reward" and "done"
-        features[REWARD] = {"dtype": "float32", "shape": (1,)}
+        features[REWARD] = {"dtype": "float32", "shape": tuple(self.rewards[0].shape) or (1,)}
         features[DONE] = {"dtype": "bool", "shape": (1,)}
 
         # Add state keys
@@ -542,6 +604,23 @@ class ReplayBuffer:
             sample_val = self.states[key][0]
             f_info = guess_feature_info(t=sample_val, name=key)
             features[key] = f_info
+
+        if self.is_chunk:
+            for key in self.states:
+                features[f"chunk_next.{key}"] = guess_feature_info(
+                    self.next_states[key][0], name=f"chunk_next.{key}"
+                )
+            features["target_action_chunk"] = guess_feature_info(
+                self.target_action_chunks[0], name="target_action_chunk"
+            )
+            features["intervene_flags"] = {"dtype": "bool", "shape": tuple(self.intervene_flags[0].shape)}
+            features["valid_action_mask"] = guess_feature_info(
+                self.valid_action_masks[0], name="valid_action_mask"
+            )
+            features["next_valid_action_mask"] = guess_feature_info(
+                self.next_valid_action_masks[0], name="next_valid_action_mask"
+            )
+            features["chunk_truncated"] = {"dtype": "bool", "shape": (1,)}
 
         # Add complementary_info keys if available
         if self.has_complementary_info:
@@ -578,9 +657,18 @@ class ReplayBuffer:
 
             # Fill action, reward, done
             frame_dict[ACTION] = self.actions[actual_idx].cpu()
-            frame_dict[REWARD] = torch.tensor([self.rewards[actual_idx]], dtype=torch.float32).cpu()
+            reward = self.rewards[actual_idx].cpu()
+            frame_dict[REWARD] = reward if reward.ndim else reward.unsqueeze(0)
             frame_dict[DONE] = torch.tensor([self.dones[actual_idx]], dtype=torch.bool).cpu()
             frame_dict["task"] = task_name
+            if self.is_chunk:
+                for key in self.states:
+                    frame_dict[f"chunk_next.{key}"] = self.next_states[key][actual_idx].cpu()
+                frame_dict["target_action_chunk"] = self.target_action_chunks[actual_idx].cpu()
+                frame_dict["intervene_flags"] = self.intervene_flags[actual_idx].cpu()
+                frame_dict["valid_action_mask"] = self.valid_action_masks[actual_idx].cpu()
+                frame_dict["next_valid_action_mask"] = self.next_valid_action_masks[actual_idx].cpu()
+                frame_dict["chunk_truncated"] = self.truncateds[actual_idx].reshape(1).cpu()
 
             # Add complementary_info if available
             if self.has_complementary_info:
@@ -649,6 +737,7 @@ class ReplayBuffer:
 
         # Check if the dataset has "next.done" key
         sample = dataset[0]
+        is_chunk = "target_action_chunk" in sample
         has_done_key = DONE in sample
 
         # Check for complementary_info keys
@@ -672,7 +761,10 @@ class ReplayBuffer:
             action = current_sample[ACTION].unsqueeze(0)  # Add batch dimension
 
             # ----- 3) Reward and done -----
-            reward = float(current_sample[REWARD].item())  # ensure float
+            reward = (
+                current_sample[REWARD].float()
+                if is_chunk else float(current_sample[REWARD].item())
+            )
 
             # Determine done flag - use next.done if available, otherwise infer from episode boundaries
             if has_done_key:
@@ -688,7 +780,9 @@ class ReplayBuffer:
                         done = True
 
             # TODO: (azouitine) Handle truncation (using the same value as done for now)
-            truncated = done
+            truncated = (
+                bool(current_sample["chunk_truncated"].item()) if is_chunk else done
+            )
 
             # ----- 4) Next state -----
             # If not done and the next sample is in the same episode, we pull the next sample's state.
@@ -703,6 +797,11 @@ class ReplayBuffer:
                         val = next_sample[key]
                         next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
                     next_state = next_state_data
+
+            if is_chunk:
+                next_state = {
+                    key: current_sample[f"chunk_next.{key}"].unsqueeze(0) for key in state_keys
+                }
 
             # ----- 5) Complementary info (if available) -----
             complementary_info = None
@@ -730,6 +829,13 @@ class ReplayBuffer:
                 truncated=truncated,
                 complementary_info=complementary_info,
             )
+            if is_chunk:
+                transition.update(
+                    target_action_chunk=current_sample["target_action_chunk"],
+                    intervene_flags=current_sample["intervene_flags"].bool(),
+                    valid_action_mask=current_sample["valid_action_mask"].float(),
+                    next_valid_action_mask=current_sample["next_valid_action_mask"].float(),
+                )
             transitions.append(transition)
 
         return transitions
@@ -795,6 +901,13 @@ def concatenate_batch_transitions(
     left_batch_transitions["reward"] = torch.cat(
         [left_batch_transitions["reward"], right_batch_transition["reward"]], dim=0
     )
+    for key in (
+        "target_action_chunk", "intervene_flags", "valid_action_mask", "next_valid_action_mask"
+    ):
+        if key in left_batch_transitions:
+            left_batch_transitions[key] = torch.cat(
+                [left_batch_transitions[key], right_batch_transition[key]], dim=0
+            )
 
     # Concatenate next_state fields
     left_batch_transitions["next_state"] = {

@@ -27,7 +27,7 @@
 # 纯人工示范（不传 policy.path）
 # source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v2/0819_left_red_2 \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v2/0819_left_yellow_2 \
 #   --dataset.single_task "Grab the left cup" \
 #   --wrist_camera.index_or_path 6 \
 #   --top_camera.index_or_path 12 \
@@ -148,7 +148,7 @@ CMD=(
     --dataset.repo_id=local_data
     "--dataset.root=${DATASET_ROOT}"
     "--dataset.single_task=${SINGLE_TASK}"
-    --dataset.num_episodes=86
+    --dataset.num_episodes=56
     --dataset.episode_time_s=120000
     --dataset.reset_time_s=1
     --dataset.push_to_hub=False

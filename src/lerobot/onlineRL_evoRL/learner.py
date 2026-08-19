@@ -278,6 +278,14 @@ def add_actor_information_and_train(
         interaction_message_queue (Queue): Queue for receiving interaction messages from the actor.
         parameters_queue (Queue): Queue for sending policy parameters to the actor.
     """
+    if cfg.policy.type == "pi05_online_rl":
+        from lerobot.policies.pi05_onlineRL.learner import train_pi05_online_rl
+
+        return train_pi05_online_rl(
+            cfg, wandb_logger, shutdown_event, transition_queue,
+            interaction_message_queue, parameters_queue,
+        )
+
     # Extract all configuration variables at the beginning, it improve the speed performance
     # of 7%
     device = get_safe_torch_device(try_device=cfg.policy.device, log=True)

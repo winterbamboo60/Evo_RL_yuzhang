@@ -17,6 +17,7 @@
 from typing import TypedDict
 
 import torch
+from typing_extensions import NotRequired
 
 from lerobot.utils.constants import ACTION
 
@@ -24,7 +25,11 @@ from lerobot.utils.constants import ACTION
 class Transition(TypedDict):
     state: dict[str, torch.Tensor]
     action: torch.Tensor
-    reward: float
+    target_action_chunk: NotRequired[torch.Tensor]
+    intervene_flags: NotRequired[torch.Tensor]
+    valid_action_mask: NotRequired[torch.Tensor]
+    next_valid_action_mask: NotRequired[torch.Tensor]
+    reward: torch.Tensor | float
     next_state: dict[str, torch.Tensor]
     done: bool
     truncated: bool
@@ -42,6 +47,10 @@ def move_transition_to_device(transition: Transition, device: str = "cpu") -> Tr
 
     # Move action to device
     transition[ACTION] = transition[ACTION].to(device, non_blocking=non_blocking)
+
+    for key in ("target_action_chunk", "intervene_flags", "valid_action_mask", "next_valid_action_mask"):
+        if key in transition:
+            transition[key] = transition[key].to(device, non_blocking=non_blocking)
 
     # Move reward and done if they are tensors
     if isinstance(transition["reward"], torch.Tensor):

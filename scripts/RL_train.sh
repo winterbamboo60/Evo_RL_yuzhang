@@ -316,6 +316,8 @@ fi
 # --sft_train=true时，直接对给定数据集进行SFT训练
 POLICY_PRETRAINED_PATH="${HISTORY_PRETRAINED_PATH:-${MODELZOO_PATH}/pi05base}"
 echo "[Step 3/3] policy.pretrained_path = ${POLICY_PRETRAINED_PATH}"
+
+
 lerobot-train \
     --use_8bit_optimizer=false \
     --dataset.repo_id=local_data \
@@ -337,14 +339,44 @@ lerobot-train \
     --policy.push_to_hub=False \
     --policy.repo_id=local_policy_model \
     --sft_train=true \
-    --policy.vlm_model_name=/home/yz/modelZoo/HuggingFaceTB--SmolVLM2-500M-Video-Instruct \
+    --policy.dtype=bfloat16 \
+    # --policy.vlm_model_name=/home/yz/modelZoo/HuggingFaceTB--SmolVLM2-500M-Video-Instruct \
     # --policy.dtype=bfloat16 \
     # --policy.use_rlt=true \
     # --policy.device=cpu \
     # --resume=true \
     # --config_path=/path/to/output_dir/checkpoints/last/pretrained_model/train_config.json
     # --policy.gradient_checkpointing=true \
-echo "[Step 3/3] 策略训练完成"
 
+# 多卡训练
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
+    --multi_gpu \
+    --num_processes=4 \
+    --mixed_precision=bf16 \
+    "$(command -v lerobot-train)" \
+    --use_8bit_optimizer=false \
+    --dataset.repo_id=local_data \
+    "--dataset.root=${DATASET_ROOT}" \
+    --policy.type=${policy_type} \
+    "--policy.pretrained_path=${POLICY_PRETRAINED_PATH}" \
+    --policy.device="cuda" \
+    --policy.train_expert_only=true \
+    --batch_size=32 \
+    --gradient_accumulation_steps=1 \
+    --steps=20000 \
+    --save_freq=5000 \
+    --acp.enable=true \
+    --acp.indicator_field=complementary_info.indicator_field \
+    --acp.indicator_dropout_prob=0.3 \
+    "--output_dir=${OUTPUT_DIR}/train" \
+    --job_name=VLA_train \
+    --wandb.enable=false \
+    --policy.push_to_hub=False \
+    --policy.repo_id=local_policy_model \
+    --sft_train=true \
+    --policy.dtype=bfloat16
+
+
+echo "[Step 3/3] 策略训练完成"
 # ---------- 输出策略模型保存路径 ----------
 echo "OUTPUT_DIR: ${OUTPUT_DIR}/train/checkpoints/last/pretrained_model"
