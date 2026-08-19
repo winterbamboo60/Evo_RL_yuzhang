@@ -573,11 +573,28 @@ def test_piper_leader_gravity_comp_manual_control_uses_mit(monkeypatch):
         assert len(teleop.arm.gripper_calls) > 0
         assert teleop.arm.gripper_calls[0][2] == 0x00
 
-        teleop.set_manual_control(False)
+        control_calls = []
+        joint_ctrl = teleop.arm.JointCtrl
+        motion_ctrl = teleop.arm.MotionCtrl_2
+
+        def record_joint_ctrl(*args):
+            control_calls.append(("joint", args))
+            joint_ctrl(*args)
+
+        def record_motion_ctrl(*args):
+            if len(args) > 1 and args[1] == 0x01:
+                control_calls.append(("mode", args))
+            motion_ctrl(*args)
+
+        teleop.arm.JointCtrl = record_joint_ctrl
+        teleop.arm.MotionCtrl_2 = record_motion_ctrl
+        teleop.send_feedback({key: float(idx + 1) for idx, key in enumerate(PIPER_ACTION_KEYS)})
         calls_after_stop = len(teleop.arm.joint_mit_calls)
         time.sleep(0.03)
         assert len(teleop.arm.joint_mit_calls) == calls_after_stop
         assert teleop.arm.gripper_calls[-1][2] == 0x01
+        assert [name for name, _ in control_calls] == ["joint", "mode", "joint"]
+        assert control_calls[0][1] == control_calls[2][1]
     finally:
         teleop.disconnect()
 

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 import time
 from functools import cached_property
 from importlib import resources
@@ -245,13 +246,13 @@ class PiperLeader(Teleoperator):
         if not enabled and self._manual_control_enabled is not False:
             # 1、停掉重力补偿（MIT 反驱）线程
             self._stop_gravity_comp_loop_if_needed()
-            # 2、MotionCtrl_2(0x01,0x01,speed,...)切位置指令模式
-            self._send_command_mode()
-            # 2.5、关键修复：重力补偿期间只发 JointMitCtrl（力矩），固件里 JointCtrl 的位置目标寄存器
+            # 2、重力补偿期间只发 JointMitCtrl（力矩），固件里 JointCtrl 的位置目标寄存器
             # 仍停留在“进入接管前最后一次下发的目标”（即接管前的策略动作 P0）。切回位置跟随模式后，
             # 若不先刷新该寄存器，主臂会全速冲回 P0（0xAD 下 speed 无效），表现为“回到人工介入前的姿态”。
-            # 这里立即用当前实测关节角覆盖目标寄存器，使主臂保持在人工介入后的最新姿态、零位移交接。
+            # 先用当前实测关节角覆盖目标寄存器，再切位置模式，实现零位移交接。
             self._seed_command_target_to_current_pose()
+            # 3、MotionCtrl_2(0x01,0x01,speed,...)切位置指令模式
+            self._send_command_mode()
             if not self._wait_enable(self.config.enable_timeout_s):
                 logger.warning("Piper leader did not report enabled state before timeout.")
             if self.config.sync_gripper:
@@ -473,26 +474,60 @@ class PiperLeader(Teleoperator):
                 f"{self} is not calibrated. Run `lerobot-calibrate --teleop.type={self.config.type} --teleop.id={self.id}` first."
             )
 
-        self.set_manual_control(False)
-        self._refresh_command_mode_if_needed()
-
         joint_keys = PIPER_JOINT_ACTION_KEYS
         has_all_joints = all(key in feedback for key in joint_keys)
+        joint_commands = None
+        gripper_pos_raw = None
         if has_all_joints:
+            joint_values = [float(feedback[key]) for key in joint_keys]
+            if not all(math.isfinite(value) for value in joint_values):
+                raise ValueError("Piper leader feedback contains a non-finite joint target.")
             if self._use_uncalibrated_passthrough():
-                joint_targets = [feedback[key] for key in joint_keys]
+                joint_targets = joint_values
             else:
-                joint_targets = [self._offset_to_calibrated(key, feedback[key]) for key in joint_keys]
+                joint_targets = [
+                    self._offset_to_calibrated(key, value)
+                    for key, value in zip(joint_keys, joint_values, strict=True)
+                ]
             joint_commands = [unit_to_milli(value) for value in joint_targets]
+        elif self._manual_control_enabled is not False:
+            raise ValueError("Cannot leave Piper leader manual mode without all six joint targets.")
+
+        if self.config.sync_gripper and "gripper.pos" in feedback:
+            gripper_value = float(feedback["gripper.pos"])
+            if not math.isfinite(gripper_value):
+                raise ValueError("Piper leader feedback contains a non-finite gripper target.")
+            if self._use_uncalibrated_passthrough():
+                gripper_target = gripper_value
+            else:
+                gripper_target = self._offset_to_calibrated("gripper.pos", gripper_value)
+            gripper_pos_raw = unit_to_milli(gripper_target)
+
+        if self._manual_control_enabled is not False:
+            was_manual = self._manual_control_enabled is True
+            self._stop_gravity_comp_loop_if_needed()
+            try:
+                # Preload the same target accepted by can1 before enabling position/high-follow mode,
+                # then send it again below after the mode switch.
+                self.arm.JointCtrl(*joint_commands)
+                self._send_command_mode()
+            except Exception:
+                if was_manual:
+                    self._ensure_gravity_comp_loop().start()
+                raise
+            if not self._wait_enable(self.config.enable_timeout_s):
+                logger.warning("Piper leader did not report enabled state before timeout.")
+            if self.config.sync_gripper:
+                self._set_gripper_enabled(True)
+            self._manual_control_enabled = False
+        else:
+            self._refresh_command_mode_if_needed()
+
+        if joint_commands is not None:
             self.arm.JointCtrl(*joint_commands)
             # logging.info(f"Leader action: {joint_commands}")  # MM
 
-        if self.config.sync_gripper and "gripper.pos" in feedback:
-            if self._use_uncalibrated_passthrough():
-                gripper_target = feedback["gripper.pos"]
-            else:
-                gripper_target = self._offset_to_calibrated("gripper.pos", feedback["gripper.pos"])
-            gripper_pos_raw = unit_to_milli(gripper_target)
+        if gripper_pos_raw is not None:
             self._send_gripper_ctrl(gripper_pos_raw, enabled=True)
 
     @check_if_not_connected

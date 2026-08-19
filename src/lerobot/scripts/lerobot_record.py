@@ -161,7 +161,7 @@ _PIPER_HOME_SMOOTH_DURATION_S = 4.0
 _PIPER_HOME_SMOOTH_STEP_DT_S = 0.02
 # 用户显式按 ← 要求重录时，不立刻开始下一次记录，而是先等待这么多秒，
 # 给操作者复位/准备的时间，并在命令行做整秒倒计时提示。
-_RERECORD_DELAY_S = 5.0
+_RERECORD_DELAY_S = 2.0
 
 
 def _countdown_before_rerecord(delay_s: float, play_sounds: bool) -> None:
@@ -227,35 +227,20 @@ def _hold_piper_arm(arm, joints: list[int], gripper: int, speed: int = _PIPER_HO
     arm.GripperCtrl(gripper, 1000, 0x01, 0)
 
 
-def _hold_arms_current_pose(robot, teleop) -> None:
-    """将主臂和从臂的姿态冻结在当前位置，直到下一集开始。
-
-        不要让两个机械臂都回到默认位置，而是捕获每个机械臂的实时关节/夹爪反馈，
-
-        并重新控制，使机械臂保持僵硬的当前位置。主臂首先
-
-        从重力补偿/反向驱动模式切换到启用位置模式，使其保持不动，
-
-        而不是下垂或可拖动。下一episode的录制循环会将主臂恢复到
-
-        反向驱动模式，因此保持状态仅在两个episode之间有效。对于未
-
-        公开 Piper SDK 接口的机械臂，此过程会静默跳过。
-    """
+def _hold_arms_current_pose(robot, teleop, leader_action: dict[str, float] | None = None) -> None:
+    """Hold can0 at can1's last accepted action and lock can1 at its live pose."""
     held_any = False
 
-    # Leader first: capture its live pose, then leave gravity-comp and lock it in position mode.
+    # Reuse the exact common-coordinate action that can1 accepted. PiperLeader.send_feedback handles
+    # the calibration round-trip and safely leaves gravity-comp mode before applying this target.
     if teleop is not None and not isinstance(teleop, list):
         leader_arm = getattr(teleop, "arm", None)
         if leader_arm is not None and hasattr(leader_arm, "JointCtrl"):
-            joints, gripper = _read_arm_raw_joints(leader_arm)
-            if hasattr(teleop, "set_manual_control"):
-                try:
-                    teleop.set_manual_control(False)
-                except Exception:
-                    logging.exception("Failed to switch leader to command mode before holding pose.")
-            _hold_piper_arm(leader_arm, joints, gripper)
-            held_any = True
+            if leader_action is None:
+                logging.warning("Leader hold skipped: can1 has not accepted an action yet.")
+            else:
+                teleop.send_feedback(leader_action)
+                held_any = True
 
     follower_arm = getattr(robot, "arm", None)
     if follower_arm is not None and hasattr(follower_arm, "JointCtrl"):
@@ -706,7 +691,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 # events["toggle_intervention"] = True  # MM
                 # 主录制：逐帧add_frame写入buffer，内部超市或exit_early控制录制结束
-                record_loop(
+                last_robot_action = record_loop(
                     robot=robot,
                     events=events,
                     fps=cfg.dataset.fps,
@@ -766,15 +751,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             cfg.play_sounds,
                         )
 
-                # 每个 episode 结束（成功 s / 失败 f / 重录 ←）后，让主从臂锁定在当前位姿不动，
-                # 保持到下一 episode 开始（下一 episode 的 record_loop 会把主臂切回可拖动模式）。
+                # 每个 episode 结束（成功 s / 失败 f / 重录 ←）后，can0 复用 can1
+                # 最后成功接收的动作保持，can1 继续锁定当前位姿。
                 # 接管(按 i)不会结束 episode，因此不会触发这里。
                 # 整体停止录制(Esc)时跳过，直接进入收尾/断开流程。
                 #
-                # 超时已通过 _home_arms_to_default 归位（与 R 键/最初复位完全一致），此时绝不能再调用
-                # _hold_arms_current_pose：它会把刚以高跟随模式(0xAD)归位的主臂切到位置保持模式(0x00)
-                # 并锁死，导致主臂在下一个 episode 失去使能、无法拖动。R 键路径正是因为跳过了这步保持、
-                # 直接交给下一个 record_loop 接管才没有该问题，这里对齐同样的行为。
+                # 超时已归位时不再用上一拍动作覆盖归位结果。
                 if not events["stop_recording"] and not homed_after_timeout:
                     log_say("Hold arms in place", cfg.play_sounds)
 
@@ -783,7 +765,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         logging.info("Resetting Unitree G1 robot...")
                         robot.reset()
 
-                    _hold_arms_current_pose(robot, teleop)
+                    _hold_arms_current_pose(robot, teleop, last_robot_action)
 
                     # record_loop(  # policy preprocessor postprocessor dataset传空
                     #     robot=robot,

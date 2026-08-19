@@ -188,7 +188,7 @@ def record_loop(
     communication_retry_interval_s: float = 0.1,
     event_config: EventConfig | None = None,
     episode_events: list[dict] | None = None,
-):
+) -> RobotAction | None:
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
 
@@ -256,6 +256,7 @@ def record_loop(
     intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
+    last_robot_action_to_send: RobotAction | None = None
     teleop_fallback_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -360,8 +361,18 @@ def record_loop(
                     set_teleop_manual_control(True)
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:                                                   # 结束接管
+                    if last_robot_action_to_send is None:
+                        logging.warning(
+                            "Cannot release intervention before an action has been sent to the robot."
+                        )
+                        continue
+                    run_with_connection_retry(
+                        "teleop.send_feedback",
+                        lambda action=last_robot_action_to_send: teleop_arm_for_mode_switch.send_feedback(
+                            action
+                        ),
+                    )
                     intervention_state = INTERVENTION_STATE_RELEASE
-                    set_teleop_manual_control(False)
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         policy.reset()
                         preprocessor.reset()
@@ -516,6 +527,10 @@ def record_loop(
                 ),
             )
 
+        # Keep the exact common-coordinate action that can1 accepted. It can be reused to move
+        # can0 out of manual/MIT mode without depending on potentially stale leader feedback.
+        last_robot_action_to_send = dict(robot_action_to_send)
+
         # Write to dataset
         if dataset is not None:
             # Resolve quality events for the frame we are about to add. Its step equals the
@@ -578,3 +593,4 @@ def record_loop(
     # The loop only breaks on a keyboard event; otherwise it ended by reaching the max recording
     # time. Signal this so the caller can mark the episode as failed and reset the arms.
     events["episode_timeout"] = not ended_by_event
+    return last_robot_action_to_send
