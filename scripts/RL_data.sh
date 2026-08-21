@@ -27,8 +27,8 @@
 # 纯人工示范（不传 policy.path）
 # source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v2/0819_left_yellow_2 \
-#   --dataset.single_task "Grab the left cup" \
+#   --dataset.root /home/hpc/yuzhang/datasets/text_memory_demo/task4_block_left \
+#   --dataset.single_task "Pick up the cup covering the block and put it back in its original place" \
 #   --wrist_camera.index_or_path 6 \
 #   --top_camera.index_or_path 12 \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
@@ -49,6 +49,7 @@
 #   --policy.path /home/hpc/yuzhang/outputs/pi05_base_smovla_v3_0720_RLT_30K \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
+# pi05_base_cup_catch_0813_tain0813_30K
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
 #   --dataset.root /home/hpc/yuzhang/datasets/cup_catch/0814_right_1 \
 #   --dataset.single_task "Pick up the cup on the right" \
@@ -57,6 +58,23 @@
 #   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_0813_tain0813_30K \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
+# pi05_base_cup_catch_v2_0819_25k
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
+#   --dataset.single_task "Grab the left cup" \
+#   --wrist_camera.index_or_path 6 \
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v2_0819_25k \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
+# smovla_cup_catch_v2_0819_40k
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/smovla_cup_catch_v2_0819_40k_test1 \
+#   --dataset.single_task "Pick up the cup on the right" \
+#   --wrist_camera.index_or_path 6 \
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v2_0819_40k \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
 
 
@@ -68,9 +86,12 @@
 #     --operation.repo_ids "['/home/yz/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/yz/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/yz/datasets/task2_grab_the_package_and_place_it_into_the_b']"
 
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/yz/datasets/v9_task2_0728/v9_task2_0728_merged \
+#     --repo_id /home/hpc/yuzhang/datasets/text_memory_demo_merged \
 #     --operation.type merge \
-#     --operation.source_dir /home/yz/datasets/v9_task2_0728
+#     --operation.source_dir /home/hpc/yuzhang/datasets/text_memory_demo
+
+# cd /home/hpc/yuzhang/outputs
+# downloadyuzhang pi05_base_cup_catch_v2_0819_35k.tar
 
 set -e
 
@@ -148,9 +169,9 @@ CMD=(
     --dataset.repo_id=local_data
     "--dataset.root=${DATASET_ROOT}"
     "--dataset.single_task=${SINGLE_TASK}"
-    --dataset.num_episodes=56
+    --dataset.num_episodes=20
     --dataset.episode_time_s=120000
-    --dataset.reset_time_s=1
+    --dataset.reset_time_s=3
     --dataset.push_to_hub=False
     --display_data=true
     --resume=false

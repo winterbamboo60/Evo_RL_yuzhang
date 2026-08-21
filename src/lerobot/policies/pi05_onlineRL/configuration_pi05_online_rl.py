@@ -296,17 +296,13 @@ class PI05OnlineRLConfig(PreTrainedConfig):
     num_discrete_actions: int | None = None
     online_steps: int = 1_000_000
     online_buffer_capacity: int = 100_000
-    offline_buffer_capacity: int = 100_000
-    async_prefetch: bool = False
-    online_step_before_learning: int = 100
-    policy_update_freq: int = 1
+    online_updates_per_episode: int = 100
+    online_only_after_initialization: bool = False
+    actor_update_interval: int = 1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    utd_ratio: int = 4
     grad_clip_norm: float = 10.0
     use_torch_compile: bool = False
-    feature_extract_batch_size: int = 8
-    offline_intervention_field: str | None = "complementary_info.is_intervention"
     actor_learner_config: ActorLearnerConfig = field(default_factory=ActorLearnerConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
@@ -351,6 +347,14 @@ class PI05OnlineRLConfig(PreTrainedConfig):
             raise ValueError("critic_target_update_weight must be in (0, 1]")
         if self.use_backup_entropy:
             raise ValueError("pi05_online_rl does not support entropy backup")
+        if self.online_steps <= 0:
+            raise ValueError("online_steps must be positive")
+        if self.online_buffer_capacity <= 0:
+            raise ValueError("online_buffer_capacity must be positive")
+        if self.online_updates_per_episode <= 0:
+            raise ValueError("online_updates_per_episode must be positive")
+        if self.actor_update_interval <= 0:
+            raise ValueError("actor_update_interval must be positive")
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
@@ -403,8 +407,8 @@ class PI05OnlineRLConfig(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list:
+        return [0, self.chunk_size]
 
     @property
     def action_delta_indices(self) -> list:

@@ -209,27 +209,27 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     # Pad. Float inputs can be either [0, 1] LeRobot images or already-normalized
     # [-1, 1] OpenPI images. Preserve black padding in the current image scale;
     # _preprocess_images() will apply the final [0, 1] -> [-1, 1] conversion.
-    if images.dtype == torch.uint8:
-        constant_value = 0
-    elif torch.min(images).item() >= 0.0:
-        constant_value = 0.0
-    else:
-        constant_value = -1.0
-    padded_images = F.pad(
-        resized_images,
-        (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
-        mode="constant",
-        value=constant_value,
-    )
-
-    # # Pad
-    # constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    # if images.dtype == torch.uint8:
+    #     constant_value = 0
+    # elif torch.min(images).item() >= 0.0:
+    #     constant_value = 0.0
+    # else:
+    #     constant_value = -1.0
     # padded_images = F.pad(
     #     resized_images,
     #     (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
     #     mode="constant",
     #     value=constant_value,
     # )
+
+    # # Pad
+    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    padded_images = F.pad(
+        resized_images,
+        (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
+        mode="constant",
+        value=constant_value,
+    )
 
     # Convert back to original format if needed
     if channels_last:

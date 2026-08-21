@@ -16,7 +16,7 @@ import datetime as dt
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -52,9 +52,28 @@ class ActorVLAPolicyConfig:
 class ActorOnlyConfig:
     enabled: bool = False
     episode_output_dir: str | None = None
-    save_format: Literal["transition", "lerobot"] = "transition"
+    save_format: str = "lerobot"
     save_episode_images: bool = True
     save_episode_viewer: bool = True
+
+    def __post_init__(self):
+        if self.save_format not in {"transition", "lerobot"}:
+            raise ValueError(
+                "actor_only.save_format must be 'transition' or 'lerobot', "
+                f"got {self.save_format!r}"
+            )
+
+
+@dataclass
+class OnlineTransitionConfig:
+    enabled: bool = False
+    save_local_copy: bool = True
+    episode_output_dir: str | None = None
+    feature_batch_size: int = 8
+
+    def __post_init__(self):
+        if self.feature_batch_size <= 0:
+            raise ValueError("online_transition.feature_batch_size must be positive")
 
 
 @dataclass
@@ -264,3 +283,18 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     dataset: DatasetConfig | None = None  # type: ignore[assignment] # because the parent class has made it's type non-optional
     actor_vla_policy: ActorVLAPolicyConfig = field(default_factory=ActorVLAPolicyConfig)
     actor_only: ActorOnlyConfig = field(default_factory=ActorOnlyConfig)
+    online_transition: OnlineTransitionConfig = field(default_factory=OnlineTransitionConfig)
+
+    def validate(self) -> None:
+        super().validate()
+        if self.actor_only.enabled and self.online_transition.enabled:
+            raise ValueError("actor_only.enabled and online_transition.enabled are mutually exclusive")
+        needs_compact = (
+            self.online_transition.enabled
+            or self.actor_only.enabled
+            and self.actor_only.save_format == "transition"
+        )
+        if needs_compact and not self.actor_vla_policy.enabled:
+            raise ValueError("compact transition mode requires actor_vla_policy.enabled=true")
+        if needs_compact and not self.actor_vla_policy.policy_path:
+            raise ValueError("compact transition mode requires actor_vla_policy.policy_path")

@@ -211,27 +211,27 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     # Pad. Float inputs can be either [0, 1] LeRobot images or already-normalized
     # [-1, 1] OpenPI images. Preserve black padding in the current image scale;
     # _preprocess_images() will apply the final [0, 1] -> [-1, 1] conversion.
-    if images.dtype == torch.uint8:
-        constant_value = 0
-    elif torch.min(images).item() >= 0.0:
-        constant_value = 0.0
-    else:
-        constant_value = -1.0
-    padded_images = F.pad(
-        resized_images,
-        (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
-        mode="constant",
-        value=constant_value,
-    )
-
-    # # Pad
-    # constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    # if images.dtype == torch.uint8:
+    #     constant_value = 0
+    # elif torch.min(images).item() >= 0.0:
+    #     constant_value = 0.0
+    # else:
+    #     constant_value = -1.0
     # padded_images = F.pad(
     #     resized_images,
     #     (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
     #     mode="constant",
     #     value=constant_value,
     # )
+
+    # # Pad
+    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    padded_images = F.pad(
+        resized_images,
+        (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
+        mode="constant",
+        value=constant_value,
+    )
 
     # Convert back to original format if needed
     if channels_last:
@@ -1491,21 +1491,24 @@ class PI05OnlineRLPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]
+            if img.ndim != 4:
+                raise ValueError(f"Expected a 4D image batch for {key}, got shape {tuple(img.shape)}")
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
+            if img.shape[1] == 3:
                 img = img.permute(0, 2, 3, 1)
+            elif img.shape[-1] != 3:
+                raise ValueError(
+                    f"Expected RGB images in NCHW or NHWC format for {key}, got shape {tuple(img.shape)}"
+                )
+
+            if img.dtype == torch.uint8:
+                img = img.to(torch.float32).div_(255.0)
+            elif img.dtype != torch.float32:
+                img = img.to(torch.float32)
 
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
@@ -1513,10 +1516,7 @@ class PI05OnlineRLPolicy(PreTrainedPolicy):
 
             # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            img = img.permute(0, 3, 1, 2).contiguous()
 
             images.append(img)
             # Create mask (all ones for real images)

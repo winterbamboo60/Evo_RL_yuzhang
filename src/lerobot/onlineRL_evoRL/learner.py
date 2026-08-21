@@ -217,30 +217,32 @@ def start_learner_threads(
     )
     communication_process.start()
 
-    add_actor_information_and_train(
-        cfg=cfg,
-        wandb_logger=wandb_logger,
-        shutdown_event=shutdown_event,
-        transition_queue=transition_queue,
-        interaction_message_queue=interaction_message_queue,
-        parameters_queue=parameters_queue,
-    )
-    logging.info("[LEARNER] Training process stopped")
+    try:
+        add_actor_information_and_train(
+            cfg=cfg,
+            wandb_logger=wandb_logger,
+            shutdown_event=shutdown_event,
+            transition_queue=transition_queue,
+            interaction_message_queue=interaction_message_queue,
+            parameters_queue=parameters_queue,
+        )
+    finally:
+        logging.info("[LEARNER] Training process stopped")
+        shutdown_event.set()
+        communication_process.join(timeout=SHUTDOWN_TIMEOUT + 1)
+        if communication_process.is_alive():
+            logging.warning("[LEARNER] Communication process did not stop before timeout")
+        else:
+            logging.info("[LEARNER] Communication process joined")
 
-    logging.info("[LEARNER] Closing queues")
-    transition_queue.close()
-    interaction_message_queue.close()
-    parameters_queue.close()
-
-    communication_process.join()
-    logging.info("[LEARNER] Communication process joined")
-
-    logging.info("[LEARNER] join queues")
-    transition_queue.cancel_join_thread()
-    interaction_message_queue.cancel_join_thread()
-    parameters_queue.cancel_join_thread()
-
-    logging.info("[LEARNER] queues closed")
+        logging.info("[LEARNER] Closing queues")
+        transition_queue.close()
+        interaction_message_queue.close()
+        parameters_queue.close()
+        transition_queue.cancel_join_thread()
+        interaction_message_queue.cancel_join_thread()
+        parameters_queue.cancel_join_thread()
+        logging.info("[LEARNER] queues closed")
 
 
 # Core algorithm functions

@@ -1,10 +1,13 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from lerobot.configs.train import ActorOnlyConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.onlineRL_evoRL.actor import ActorEpisodeWriter
+from lerobot.onlineRL_evoRL.compact_transition import make_compact_episode
 from lerobot.onlineRL_evoRL.gym_manipulator import (
     RobotEnv,
     create_transition,
@@ -13,6 +16,14 @@ from lerobot.onlineRL_evoRL.gym_manipulator import (
 from lerobot.processor import TransitionKey
 from lerobot.scripts.recording_hil import PolicySyncDualArmExecutor
 from lerobot.utils.constants import ACTION, OBS_STATE
+
+
+def test_actor_only_save_format_validation():
+    assert ActorOnlyConfig().save_format == "lerobot"
+    assert ActorOnlyConfig(save_format="transition").save_format == "transition"
+    assert ActorOnlyConfig(save_format="lerobot").save_format == "lerobot"
+    with pytest.raises(ValueError, match="actor_only.save_format"):
+        ActorOnlyConfig(save_format="invalid")
 
 
 def test_single_env_sends_and_records_unbatched_policy_action():
@@ -88,6 +99,30 @@ def test_actor_episode_writer_save_formats(tmp_path: Path):
         },
     )
 
+    compact = make_compact_episode(
+        transitions=[
+            {
+                "state": {
+                    "z_rl": torch.zeros(1, 2),
+                    "proprio": action.clone(),
+                    "ref_action": action.unsqueeze(1),
+                },
+                "next_state": {
+                    "z_rl": torch.zeros(1, 2),
+                    "proprio": action.clone(),
+                    "ref_action": action.unsqueeze(1),
+                },
+                "action": action.clone(),
+                "reward": 1.0,
+                "done": True,
+                "truncated": False,
+                "complementary_info": {"is_intervention": False},
+            }
+        ],
+        metadata=metadata,
+        feature_model={"resolved_path": "/tmp/test-policy"},
+    )
+
     for save_format in ("transition", "lerobot"):
         output_dir = tmp_path / save_format
         cfg = SimpleNamespace(
@@ -103,10 +138,14 @@ def test_actor_episode_writer_save_formats(tmp_path: Path):
         )
         writer = ActorEpisodeWriter(cfg)
         writer.configure_robot(robot)
-        writer.save_episode(transitions=[transition], metadata=metadata)
+        writer.save_episode(
+            transitions=[transition],
+            metadata=metadata,
+            compact_episode=compact if save_format == "transition" else None,
+        )
         writer.finalize()
 
-    assert (tmp_path / "transition/episode_000000/transitions.pt").is_file()
+    assert (tmp_path / "transition/episode_000000/compact_episode.pt").is_file()
     assert (tmp_path / "lerobot/meta/info.json").is_file()
     assert any((tmp_path / "lerobot/data").rglob("*.parquet"))
     dataset = LeRobotDataset(repo_id="local_data", root=tmp_path / "lerobot")

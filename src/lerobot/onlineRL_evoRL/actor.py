@@ -55,22 +55,26 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty
-from typing import Any, get_args, get_type_hints
+from typing import Any
 
-import draccus
 import grpc
 import numpy as np
 import torch
-from draccus.utils import DecodingError
 from torch import nn
 from torch.multiprocessing import Event, Queue
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.train import ActorOnlyConfig, TrainRLServerPipelineConfig
+from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.onlineRL_evoRL.compact_transition import (
+    SCHEMA_NAME,
+    compact_episode_to_bytes,
+    make_compact_episode,
+    save_compact_episode,
+)
 from lerobot.onlineRL_evoRL.process import ProcessSignalHandler
 from lerobot.onlineRL_evoRL.queue import get_last_item_from_queue
 from lerobot.policies.factory import make_policy, make_pre_post_processors
@@ -124,20 +128,6 @@ from .piper_episode_control import hold_arms_current_pose, home_arms_to_default
 INTERVENTION_STATE_POLICY = 0.0
 INTERVENTION_STATE_ACTIVE = 1.0
 INTERVENTION_STATE_RELEASE = 2.0
-
-_ACTOR_SAVE_FORMAT_TYPE = get_type_hints(ActorOnlyConfig)["save_format"]
-
-
-def _decode_actor_save_format(raw_value: Any, path):
-    allowed = get_args(_ACTOR_SAVE_FORMAT_TYPE)
-    if raw_value not in allowed:
-        raise DecodingError(path, f"Expected one of {allowed}, got {raw_value!r}")
-    return raw_value
-
-
-draccus.decode.register(_ACTOR_SAVE_FORMAT_TYPE, _decode_actor_save_format)
-
-
 def _run_with_connection_retry(action_name: str, fn, timeout_s: float = 2.0, interval_s: float = 0.1):
     """Local copy of RL_data's bounded retry behavior for transient CAN failures."""
     deadline_t = time.perf_counter() + max(timeout_s, 0.0)
@@ -288,15 +278,23 @@ def _tensor_to_pil_image(value: Any):
 
 
 class ActorEpisodeWriter:
-    def __init__(self, cfg: TrainRLServerPipelineConfig):
+    def __init__(
+        self,
+        cfg: TrainRLServerPipelineConfig,
+        *,
+        save_format: str | None = None,
+        output_dir: str | None = None,
+        save_images: bool | None = None,
+        save_viewer: bool | None = None,
+    ):
         self.cfg = cfg
-        self.save_format = cfg.actor_only.save_format
-        output_dir = cfg.actor_only.episode_output_dir
+        self.save_format = save_format or cfg.actor_only.save_format
+        output_dir = output_dir or cfg.actor_only.episode_output_dir
         if output_dir is None:
             output_dir = str(Path(cfg.output_dir) / "actor_episodes")
         self.output_dir = Path(output_dir).expanduser()
-        self.save_images = cfg.actor_only.save_episode_images
-        self.save_viewer = cfg.actor_only.save_episode_viewer
+        self.save_images = cfg.actor_only.save_episode_images if save_images is None else save_images
+        self.save_viewer = cfg.actor_only.save_episode_viewer if save_viewer is None else save_viewer
         self.dataset: LeRobotDataset | None = None
         self.action_names: list[str] = []
         self.observation_features: dict[str, dict[str, Any]] = {}
@@ -330,17 +328,26 @@ class ActorEpisodeWriter:
                     continue
         return max_index + 1
 
-    def save_episode(self, *, transitions: list[Transition], metadata: dict[str, Any]) -> Path:
+    def save_episode(
+        self,
+        *,
+        transitions: list[Transition],
+        metadata: dict[str, Any],
+        compact_episode: dict[str, Any] | None = None,
+    ) -> Path:
         if self.save_format == "lerobot":
             return self._save_lerobot_episode(transitions=transitions, metadata=metadata)
+
+        if compact_episode is None:
+            raise ValueError("transition save format requires a compact episode payload")
 
         episode_dir = self.output_dir / f"episode_{self.episode_index:06d}"
         self.episode_index += 1
         episode_dir.mkdir(parents=True, exist_ok=False)
         cpu_transitions = [move_transition_to_device(transition=tr, device="cpu") for tr in transitions]
-        torch.save(cpu_transitions, episode_dir / "transitions.pt")
+        save_compact_episode(compact_episode, episode_dir / "compact_episode.pt")
         frames = self._write_frames(episode_dir, cpu_transitions)
-        payload = {**metadata, "frames": len(frames)}
+        payload = {**metadata, "frames": len(frames), "transition_schema": SCHEMA_NAME}
         (episode_dir / "metadata.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
         (episode_dir / "frames.json").write_text(json.dumps(frames, indent=2, ensure_ascii=False))
         if self.save_viewer:
@@ -607,6 +614,84 @@ class ActorVLARuntime:
             action = action.to(device)
         return action
 
+    @torch.no_grad()
+    def build_compact_episode(
+        self, transitions: list[Transition], metadata: dict[str, Any], batch_size: int
+    ) -> dict[str, Any]:
+        if self.policy is None or self.preprocessor is None or self.fingerprint is None:
+            raise RuntimeError("VLA runtime is not loaded")
+        observations = [transition["state"] for transition in transitions]
+        observations.append(transitions[-1]["next_state"])
+        actions = [transition[ACTION] for transition in transitions]
+        actions.append(transitions[-1][ACTION])
+
+        features = {key: [] for key in ("z_rl", "proprio", "ref_action")}
+        normalized_actions = []
+        for start in range(0, len(observations), batch_size):
+            items = []
+            for observation, action in zip(
+                observations[start : start + batch_size],
+                actions[start : start + batch_size],
+                strict=True,
+            ):
+                raw = {
+                    key: value.squeeze(0)
+                    if isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == 1
+                    else value
+                    for key, value in observation.items()
+                }
+                raw[ACTION] = (
+                    action.squeeze(0)
+                    if action.ndim > 1 and action.shape[0] == 1
+                    else action
+                )
+                raw["task"] = metadata["task"]
+                items.append(self.preprocessor(raw))
+
+            batch = {
+                key: torch.cat([item[key] for item in items], dim=0)
+                for key, value in items[0].items()
+                if isinstance(value, torch.Tensor)
+            }
+            outputs = self.policy.predict_action_chunk_with_rlt(batch)
+            proprio_dim = getattr(self.policy_cfg, "proprio_dim", batch[OBS_STATE].shape[-1])
+            batch_features = {
+                "z_rl": outputs["z_rl"],
+                "proprio": batch[OBS_STATE][..., :proprio_dim],
+                "ref_action": outputs["actions"],
+            }
+            normalized_actions.extend(part.detach().cpu() for part in batch[ACTION].split(1))
+            for key, value in batch_features.items():
+                features[key].extend(part.detach().cpu() for part in value.split(1))
+
+        compact_transitions = []
+        for index, transition in enumerate(transitions):
+            intervention = (transition.get("complementary_info") or {}).get(
+                "is_intervention", False
+            )
+            if isinstance(intervention, torch.Tensor):
+                intervention = bool(intervention.detach().float().max().item() > 0.5)
+            compact_transitions.append(
+                {
+                    "state": {key: features[key][index] for key in features},
+                    "next_state": {key: features[key][index + 1] for key in features},
+                    ACTION: normalized_actions[index],
+                    "reward": transition["reward"],
+                    "done": bool(transition["done"]),
+                    "truncated": bool(transition["truncated"]),
+                    "complementary_info": {"is_intervention": bool(intervention)},
+                }
+            )
+
+        compact_metadata = {**metadata, "transition_schema": SCHEMA_NAME}
+        return make_compact_episode(
+            transitions=compact_transitions,
+            metadata=compact_metadata,
+            feature_model=_as_jsonable(self.fingerprint.__dict__),
+        )
+
 
 # Main entry point
 
@@ -720,13 +805,29 @@ def run_actor_online(cfg: TrainRLServerPipelineConfig, shutdown_event: Event):  
     interactions_process.start()
     receive_policy_process.start()
 
+    online_writer = None
+    if cfg.online_transition.enabled and cfg.online_transition.save_local_copy:
+        output_dir = cfg.online_transition.episode_output_dir
+        if output_dir is None:
+            output_dir = str(Path(cfg.output_dir) / "online_transitions")
+        online_writer = ActorEpisodeWriter(
+            cfg,
+            save_format="transition",
+            output_dir=output_dir,
+            save_images=False,
+            save_viewer=False,
+        )
+
     act_with_policy(
         cfg=cfg,
         shutdown_event=shutdown_event,
         parameters_queue=parameters_queue,
         transitions_queue=transitions_queue,
         interactions_queue=interactions_queue,
+        actor_episode_writer=online_writer,
     )
+    if online_writer is not None:
+        online_writer.finalize()
     logging.info("[ACTOR] Policy process joined")
 
     logging.info("[ACTOR] Closing queues")
@@ -999,12 +1100,31 @@ def act_with_policy(
         }
 
         if should_send and len(list_transition_to_send_to_learner) > 0:
+            compact_episode = None
+            needs_compact = cfg.online_transition.enabled or (
+                actor_episode_writer is not None
+                and actor_episode_writer.save_format == "transition"
+            )
+            if needs_compact:
+                if vla_runtime is None:
+                    raise RuntimeError("compact transition mode requires a loaded VLA runtime")
+                compact_episode = vla_runtime.build_compact_episode(
+                    list_transition_to_send_to_learner,
+                    episode_metadata,
+                    cfg.online_transition.feature_batch_size,
+                )
+
             if actor_episode_writer is not None:
                 actor_episode_writer.save_episode(
                     transitions=list_transition_to_send_to_learner,
                     metadata=episode_metadata,
+                    compact_episode=compact_episode,
                 )
-            else:
+
+            if cfg.online_transition.enabled:
+                transitions_queue.put(compact_episode_to_bytes(compact_episode))
+                interactions_queue.put(python_object_to_bytes(compact_episode["metadata"]))
+            elif actor_episode_writer is None:
                 push_transitions_to_transport_queue(
                     transitions=list_transition_to_send_to_learner,
                     transitions_queue=transitions_queue,

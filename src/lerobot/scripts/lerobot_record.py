@@ -161,7 +161,7 @@ _PIPER_HOME_SMOOTH_DURATION_S = 4.0
 _PIPER_HOME_SMOOTH_STEP_DT_S = 0.02
 # 用户显式按 ← 要求重录时，不立刻开始下一次记录，而是先等待这么多秒，
 # 给操作者复位/准备的时间，并在命令行做整秒倒计时提示。
-_RERECORD_DELAY_S = 2.0
+_RERECORD_DELAY_S = 1.0
 
 
 def _countdown_before_rerecord(delay_s: float, play_sounds: bool) -> None:

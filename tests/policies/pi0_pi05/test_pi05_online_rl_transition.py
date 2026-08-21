@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 import torch
 
 from lerobot.onlineRL_evoRL.buffer import ReplayBuffer
 from lerobot.policies.pi05_onlineRL.chunk_transition import build_sliding_window_transitions
+from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import PI05OnlineRLPolicy
 from lerobot.utils.constants import ACTION
 
 
@@ -30,6 +33,21 @@ def _episode(length: int):
             }
         )
     return transitions
+
+
+def test_image_preprocessing_matches_nchw_float_and_nhwc_uint8():
+    key = "observation.images.top"
+    image = torch.randint(0, 256, (2, 3, 4, 4), dtype=torch.uint8)
+    policy = SimpleNamespace(
+        config=SimpleNamespace(image_features={key: object()}, image_resolution=(4, 4)),
+        parameters=lambda: iter((torch.empty(0),)),
+    )
+
+    nchw, _ = PI05OnlineRLPolicy._preprocess_images(policy, {key: image.float() / 255.0})
+    nhwc, _ = PI05OnlineRLPolicy._preprocess_images(policy, {key: image.permute(0, 2, 3, 1)})
+
+    assert nchw[0].shape == nhwc[0].shape == (2, 3, 4, 4)
+    assert torch.allclose(nchw[0], nhwc[0])
 
 
 def test_length_70_sliding_windows_and_bootstrap_mask():
