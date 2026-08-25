@@ -51,9 +51,11 @@ def gripper_adjust(value: float | int) -> int:
 @lru_cache(maxsize=1)
 def get_piper_sdk() -> tuple[type[Any], Any]:
     try:
-        from piper_sdk import C_PiperInterface_V2, LogLevel
-
-        return C_PiperInterface_V2, LogLevel
+        # from piper_sdk import C_PiperInterface_V2, LogLevel
+        # return C_PiperInterface_V2, LogLevel
+        
+        from piper_sdk import C_PiperInterface_V3, LogLevel
+        return C_PiperInterface_V3, LogLevel
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "Could not import `piper_sdk`. Install Evo-RL dependencies first (for example: `pip install -e .`)."

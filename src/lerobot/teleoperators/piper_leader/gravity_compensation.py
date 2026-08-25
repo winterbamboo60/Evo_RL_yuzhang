@@ -112,7 +112,8 @@ class PiperGravityCompensationLoop:
 
     def _send_mit_mode(self) -> None:
         # Use MOVE M + MIT to ensure torque pass-through mode is active.
-        self._arm.MotionCtrl_2(0x01, 0x04, self._move_speed_ratio, 0xAD)
+        # self._arm.MotionCtrl_2(0x01, 0x04, self._move_speed_ratio, 0xAD)
+        self._arm.MotionCtrl_2(0x01, 0x06, self._move_speed_ratio, 0xAD)
         self._last_mode_refresh_t = time.monotonic()
 
     def _refresh_mit_mode_if_needed(self) -> None:
@@ -122,7 +123,7 @@ class PiperGravityCompensationLoop:
         if now - self._last_mode_refresh_t >= self._mode_refresh_interval_s:
             self._send_mit_mode()
 
-    def _read_q_v(self) -> tuple[np.ndarray, np.ndarray]:
+    def _read_q_v(self) -> tuple[np.ndarray, np.ndarray, list[Any]]:
         joint_msg = self._arm.GetArmJointMsgs()
         joint_state = joint_msg.joint_state
         q_deg = np.array(
@@ -150,7 +151,11 @@ class PiperGravityCompensationLoop:
             ],
             dtype=np.float64,
         )
-        return q_rad, v_rad
+        currents = [
+            getattr(getattr(hs, f"motor_{idx}"), "motor_current", None)
+            for idx in range(1, 7)
+        ]
+        return q_rad, v_rad, currents
 
     def _compute_gravity_torque(self, q_rad: np.ndarray, v_rad: np.ndarray) -> np.ndarray:
         q_full = np.zeros(self._robot.model.nq, dtype=np.float64)
@@ -166,27 +171,96 @@ class PiperGravityCompensationLoop:
         )
         return np.asarray(tau_full[: self._nq], dtype=np.float64)
 
+    def _log_diagnostics(
+        self,
+        q_rad: np.ndarray,
+        v_rad: np.ndarray,
+        tau_model: np.ndarray,
+        tau_cmd: np.ndarray,
+        currents: list[Any],
+        loop_hz: float,
+    ) -> None:
+        status = getattr(self._arm.GetArmStatus(), "arm_status", None)
+        ctrl_mode = getattr(status, "ctrl_mode", None)
+        mode_feed = getattr(status, "mode_feed", None)
+        arm_status = getattr(status, "arm_status", None)
+        err_code = getattr(status, "err_code", None)
+
+        enabled: list[Any] = []
+        get_low_speed = getattr(self._arm, "GetArmLowSpdInfoMsgs", None)
+        if get_low_speed is not None:
+            low_speed = get_low_speed()
+            enabled = [
+                getattr(
+                    getattr(getattr(low_speed, f"motor_{idx}"), "foc_status", None),
+                    "driver_enable_status",
+                    None,
+                )
+                for idx in range(1, 7)
+            ]
+
+        logger.info(
+            "Piper MIT diagnostic: loop_hz=%.1f ctrl_mode=%s mode_feed=%s arm_status=%s "
+            "err_code=%s enabled=%s q_deg=%s v_rad_s=%s tau_model_nm=%s tau_cmd_nm=%s "
+            "current_raw=%s",
+            loop_hz,
+            ctrl_mode,
+            mode_feed,
+            arm_status,
+            err_code,
+            enabled or "unavailable",
+            np.round(np.rad2deg(q_rad), 3).tolist(),
+            np.round(v_rad, 4).tolist(),
+            np.round(tau_model, 4).tolist(),
+            np.round(tau_cmd, 4).tolist(),
+            currents,
+        )
+
     def _run(self) -> None:
-        self._send_mit_mode()
-        dt = 1.0 / self._control_hz
-        while not self._stop_event.is_set():
-            start_t = time.perf_counter()
-            self._refresh_mit_mode_if_needed()
+        cycles = 0
+        rate_start_t = time.perf_counter()
+        next_log_t = rate_start_t + 1.0
+        try:
+            self._send_mit_mode()
+            logger.info("Piper gravity compensation loop started; MOVE_M + MIT requested.")
+            dt = 1.0 / self._control_hz
+            while not self._stop_event.is_set():
+                start_t = time.perf_counter()
+                self._refresh_mit_mode_if_needed()
 
-            q_rad, v_rad = self._read_q_v()
-            tau = self._compute_gravity_torque(q_rad, v_rad)
-            tau = np.clip(self._tx_ratio * tau, -self._torque_limit, self._torque_limit)
-
-            for idx in range(6):
-                self._arm.JointMitCtrl(
-                    idx + 1,
-                    0.0,
-                    0.0,
-                    self._mit_kp,
-                    self._mit_kd,
-                    float(tau[idx]),
+                q_rad, v_rad, currents = self._read_q_v()
+                tau_model = self._compute_gravity_torque(q_rad, v_rad)
+                tau_cmd = np.clip(
+                    self._tx_ratio * tau_model, -self._torque_limit, self._torque_limit
                 )
 
-            remain = dt - (time.perf_counter() - start_t)
-            if remain > 0:
-                time.sleep(remain)
+                for idx in range(6):
+                    self._arm.JointMitCtrl(
+                        idx + 1,
+                        0.0,
+                        0.0,
+                        self._mit_kp,
+                        self._mit_kd,
+                        float(tau_cmd[idx]),
+                    )
+
+                cycles += 1
+                if start_t >= next_log_t:
+                    elapsed = start_t - rate_start_t
+                    try:
+                        self._log_diagnostics(
+                            q_rad, v_rad, tau_model, tau_cmd, currents, cycles / elapsed
+                        )
+                    except Exception:
+                        logger.exception("Failed to read Piper MIT diagnostic snapshot.")
+                    cycles = 0
+                    rate_start_t = start_t
+                    next_log_t = start_t + 1.0
+
+                remain = dt - (time.perf_counter() - start_t)
+                if remain > 0:
+                    time.sleep(remain)
+        except Exception:
+            logger.exception("Piper gravity compensation loop crashed; MIT commands stopped.")
+        finally:
+            logger.info("Piper gravity compensation loop stopped.")

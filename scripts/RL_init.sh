@@ -84,3 +84,7 @@ python ./lerobot/srclerobot/find_cameras.py opencv && ll ./lerobot/src/outputs/c
 查询摄像头index号： PYTHONPATH=. python lerobot/find_cameras.py opencv    确认top和wrist视角的index，然后在对应的命令里修改index
 
 conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_cameras.py opencv
+conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_cameras.py realsense
+
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py realsense

@@ -33,6 +33,15 @@
 #   --top_camera.index_or_path 12 \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
+#   --dataset.single_task "Grab the left cup" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 260522273666 \
+#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
+
 # Pick up the cup on the right
 # Take the middle cup away
 # Grab the left cup
@@ -62,8 +71,8 @@
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
 #   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
 #   --dataset.single_task "Grab the left cup" \
-#   --wrist_camera.index_or_path 6 \
-#   --top_camera.index_or_path 12 \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 260522273666 \
 #   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v2_0819_25k \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
@@ -75,6 +84,7 @@
 #   --top_camera.index_or_path 12 \
 #   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v2_0819_40k \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+
 
 
 
@@ -152,7 +162,10 @@ if [[ -n "$POLICY_PATH" ]]; then
 fi
 
 # ---------- 构建摄像头配置 ----------
-CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
+# CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
+
+CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: intelrealsense, serial_number_or_name: ${TOP_CAM}, width: 640, height: 480, fps:
+  30}}"
 
 # ---------- 构建命令 ----------
 CMD=(

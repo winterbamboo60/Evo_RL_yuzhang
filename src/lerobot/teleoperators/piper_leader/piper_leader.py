@@ -234,6 +234,17 @@ class PiperLeader(Teleoperator):
         if not self._is_connected:
             return
         if enabled and self._manual_control_enabled is not True:
+            logger.info(
+                "[%s] entering manual control: gravity_hz=%.1f, tx_ratio=%s, "
+                "torque_limit=%.3f, mit_kp=%.3f, mit_kd=%.3f, sync_gripper=%s",
+                self.config.port,
+                self.config.gravity_comp_control_hz,
+                self.config.gravity_comp_tx_ratio,
+                self.config.gravity_comp_torque_limit,
+                self.config.gravity_comp_mit_kp,
+                self.config.gravity_comp_mit_kd,
+                self.config.sync_gripper,
+            )
             if not self._wait_enable(self.config.enable_timeout_s):
                 logger.warning(
                     "Piper leader did not report enabled state before entering gravity compensation."
@@ -244,6 +255,7 @@ class PiperLeader(Teleoperator):
             self._manual_control_enabled = True
             return
         if not enabled and self._manual_control_enabled is not False:
+            logger.info("[%s] leaving manual control.", self.config.port)
             # 1、停掉重力补偿（MIT 反驱）线程
             self._stop_gravity_comp_loop_if_needed()
             # 2、重力补偿期间只发 JointMitCtrl（力矩），固件里 JointCtrl 的位置目标寄存器
