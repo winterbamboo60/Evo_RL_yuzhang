@@ -1,4 +1,6 @@
 {
+  "actor_mode": "vla_only",
+  "save_format": "lerobot",
   "dataset": {
     "repo_id": "local_data",
     "root": "/home/hpc/yuzhang/datasets/v9_task123_0728_merged123"

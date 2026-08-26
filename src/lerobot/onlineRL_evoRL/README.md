@@ -1,10 +1,11 @@
 # onlineRL_evoRL 使用说明
 
-`onlineRL_evoRL` 是当前 EvoRL 在线采集/训练逻辑的工作目录。当前保留原 Actor，并新增基于同一套采集/传输流程的 Actor 2，同时提供独立的 PI05 Online RL learner：
+`onlineRL_evoRL` 现在只有一个正式采集入口：`actor.py`。它合并了原 `actor.py` 的环境、人工介入、保存与 gRPC 流程，以及原 `actor_2.py` 的 PI05 Online Actor head、`B` 切换和 task 热键。`actor_2.py` 仅保留旧命令/导入兼容，不再有独立实现。
 
-- 默认 SAC actor：沿用在线 RL 的 SAC action 生成和 learner 参数同步。
-- VLA actor：沿用 `scripts/RL_data.sh --policy.path` 的 VLA checkpoint 推理方式生成动作。
-- Actor 2：直接根据 `policy.type` 加载策略，可在纯 VLA 与 VLA+训练后 Actor 之间切换，并支持按键切换 task。
+顶层 `actor_mode` 和 `save_format` 决定运行方式：
+
+- `actor_mode=vla_only`：不连接 learner；`save_format` 可选 `lerobot` 或 `transition`。
+- `actor_mode=online_actor`：连接 learner并使用训练后的 Actor head；`save_format` 必须为 `transition`。
 - PI05 Online RL learner：冻结 PI0.5/RLT，只训练完整 action chunk Actor 和 twin-Q Critic。
 
 支持以下启动模式：
@@ -34,7 +35,7 @@ source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 当前参考配置：
 
 ```bash
-src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json
+src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json
 ```
 
 关键硬件配置：
@@ -57,7 +58,7 @@ src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json
 
 PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic。推荐配置：
 
-`src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_pi05_online_rl_learner_only.json`
+`src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json`
 
 启动命令必须使用带等号的配置参数：
 
@@ -65,14 +66,14 @@ PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic�
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
 python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_pi05_online_rl_learner_only.json
+  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json
 ```
 
 配置文件是基准值；需要临时实验时，可在命令行用同名参数覆盖。参数统一使用 `--参数=值`，布尔值使用小写 `true/false`：
 
 ```bash
 python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_pi05_online_rl_learner_only.json \
+  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json \
   --steps=1000 \
   --policy.online_updates_per_episode=100 \
   --policy.online_only_after_initialization=false \
@@ -268,128 +269,44 @@ policy_postprocessor.json
 
 `reload_on_episode_boundary=true` 时，actor 会在 episode 边界按 `policy_poll_s` 检查 checkpoint 文件变化；发生变化后，下一个 episode 前重新加载 VLA。
 
-## Online 模式
+## 统一 Actor 模式
 
-与当前 cup-catch learner 匹配的 Actor 配置：
+启动入口固定为：
 
 ```bash
 python -m lerobot.onlineRL_evoRL.actor \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_online_transition_actor.json
+  --config_path=src/lerobot/onlineRL_evoRL/configs/<actor-config>.json
 ```
 
-该配置必须满足：`dataset.root` 与 learner 一致、`env.task` 精确存在于 `meta/tasks.parquet`、`actor_vla_policy.policy_path` 与 learner 的冻结基座一致、端口一致。`online_transition.enabled=true` 后，Actor 在 episode 结束时分批提取 `z_rl/proprio/ref_action`，发送一个原子 compact episode；learner 不再为该在线 episode 解码图像或重复运行 RLT。
+配置矩阵：
 
-```json
-"online_transition": {
-  "enabled": true,
-  "save_local_copy": true,
-  "episode_output_dir": ".../actor_transitions",
-  "feature_batch_size": 8
-}
-```
+| `actor_mode` | `save_format` | learner 连接 | 动作来源 |
+| --- | --- | --- | --- |
+| `vla_only` | `lerobot` | 否 | VLA |
+| `vla_only` | `transition` | 否 | VLA |
+| `online_actor` | `transition` | 是 | PI05/RLT Online Actor；`B` 可临时切回 VLA |
 
-`save_local_copy` 只控制在线 compact episode 的本地备份，不影响发送。Actor 权重回传尚未启用；Actor 继续使用冻结 VLA 和人工介入动作。旧 SAC raw-transition 在线路径仍兼容。
+`online_actor + lerobot` 会在启动前直接报错。内部的 `actor_only.enabled`、`actor_only.save_format` 和 `online_transition.enabled` 由上述两个顶层字段统一设置，不应再作为模式开关。`transition` 使用标准拼写；现有文件名中的 `transion` 只为兼容旧文件名保留。
 
-## Actor 2：VLA / VLA+Actor 与多任务切换
-
-Actor 2 保留原 `actor.py` 的环境、人工介入、episode 保存、compact transition 和 gRPC 逻辑，仅替换模型加载与键盘控制。原 Actor 及其配置仍可继续使用。
-
-参考配置：
-
-```text
-src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_online_transition_actor_2.json
-```
-
-启动：
+在线模式参考配置：
 
 ```bash
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
+src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_onlineRL_transition.json
+
+
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-python -m lerobot.onlineRL_evoRL.actor_2 \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_online_transition_actor_2.json
+cd /home/hpc/yuzhang/Evo-RL-loop-0817
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_onlineRL_transition.json
 ```
 
-### 模型与 Actor 权重
+它还需要：`policy.type=pi05_online_rl`、与 learner 相同的 `policy.pretrained_path` 和 `dataset.root`、有效的 `actor_checkpoint_path`，以及一致的 learner host/port。Actor checkpoint 可指向 learner 输出根目录、checkpoint 目录或具体的 `actor_critic.pt`/`model.safetensors`。
 
-Actor 2 不再额外硬编码一个 SAC policy。主配置中的 `policy.type` 决定模型类型，当前参考配置使用：
-
-```json
-"policy": {
-  "type": "pi05_online_rl",
-  "pretrained_path": "/path/to/pi05_vla_rlt_base",
-  "device": "cuda"
-}
-```
-
-加载方式与 learner 对齐：使用 `dataset.root` 的 metadata/stats 调用 `make_policy(cfg.policy, ds_meta=...)`，因此 `dataset.root` 必须与 learner 使用的数据集兼容。`policy.pretrained_path` 提供冻结的 VLA/RLT 权重，`actor_checkpoint_path` 提供 learner 训练后的 Actor 权重：
-
-```json
-"actor_checkpoint_path": "/path/to/learner_output"
-```
-
-必须对齐的配置：
-
-- `policy.type=pi05_online_rl`：启用当前 VLA/RLT+chunk Actor 接口。
-- `policy.pretrained_path`：与 learner 的冻结基座相同。
-- `actor_checkpoint_path`：learner 输出根目录、某个 checkpoint 目录或具体权重文件。
-- `actor_vla_policy.enabled=true`：原 Actor 流程创建 VLA runtime 所必需；`actor_vla_policy.policy_path` 应与 `policy.pretrained_path` 保持一致。
-- `dataset.root`：提供与 learner 一致的 features、normalization stats 和合法 task。
-- `policy.actor_learner_config`：host/port 必须与 learner 一致。
-- `task_hotkeys_path`：独立任务热键 JSON 的路径。
-
-Actor 权重按以下顺序发现：
-
-1. `<path>/actor_critic.pt`
-2. `<path>/checkpoints/last/actor_critic.pt`
-3. 兼容旧 checkpoint 的 `<path>/pretrained_model/model.safetensors`
-4. 兼容旧 checkpoint 的 `<path>/checkpoints/last/pretrained_model/model.safetensors`
-
-精简 checkpoint 只读取 `actor_critic.pt` 中的 `actor`，不会加载 Critic；旧 `model.safetensors` 也只读取 `actor.*` tensor。加载精简 checkpoint 时还会校验 `manifest.json` 中的基座路径、`chunk_size`、`z_dim` 和 `proprio_dim`，不匹配会拒绝启动 Actor 模式。
-
-若启动时 Actor 权重尚不存在，程序正常使用纯 VLA 推理；此时按 `B` 只记录错误，不切换模式。设置 `actor_vla_policy.reload_on_episode_boundary=true` 后，每个 episode 边界都会按 `policy_poll_s` 重新查找 checkpoint，learner 后续生成 Actor 权重后即可被发现。
-
-### `B`：切换动作生成模式
-
-- 默认：纯 VLA 生成动作。
-- 第一次按 `B`：切换为 VLA+Actor。VLA/RLT 生成 `z_rl/proprio/ref_action`，训练后的 Actor 输出 action chunk。
-- 再次按 `B`：恢复纯 VLA。
-- 每次成功切换都会清空 VLA action queue、Actor action queue 和动作平滑缓存，当前控制周期重新推理并发送新动作。
-- Actor 权重不存在或当前 `policy.type` 不提供兼容的 RLT Actor 接口时，`B` 不生效，机械臂继续由纯 VLA 控制。
-
-### 数字键切换 task
-
-Actor 2 不再要求在主配置中固定单一 `env.task`，而是从独立配置读取按键和 task：
-
-```text
-src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_task_hotkeys.json
-```
-
-```json
-{
-  "default_key": "3",
-  "tasks": {
-    "1": "Pick up the cup on the right",
-    "2": "Take the middle cup away",
-    "3": "Grab the left cup"
-  }
-}
-```
-
-主配置通过 `task_hotkeys_path` 指向该文件。启动时使用 `default_key` 对应的 task，并检查所有 task 必须精确存在于 `dataset.root/meta/tasks.parquet`。
-
-运行中按 `1/2/3` 时：
-
-1. 当前 episode 标记为重录并丢弃，不发送给 learner，也不保存为有效 episode。
-2. 执行与 `R` 相同的双臂归位和 episode reset。
-3. 下一个 episode 使用新 task；当前纯 VLA/VLA+Actor 模式保持不变。
-
-任务热键必须是单个字符，且不能占用 `B/I/S/F/R`。
-
-当前 Actor 2 未包含先前讨论的 Actor/Learner GPU 租约与空闲显存释放机制；同时启动两个进程时仍需按实际显存容量安排模型驻留。
+`task_hotkeys_path` 可用于两种模式；按 task 键会丢弃当前 episode、切换 `env.task` 并复位。`B` 仅在已加载 Actor head 时切换 Online Actor/VLA，并清空 action chunk 与平滑缓存。
 
 ## Actor-only 模式
 
-Actor-only 不连接 learner，不检查 learner 是否存在。`actor_only.save_format` 用于选择两种保存方式，默认是 `lerobot`：
+`actor_mode=vla_only` 不连接 learner，不检查 learner 是否存在。顶层 `save_format` 选择两种保存方式，默认是 `lerobot`；`actor_only` 仅保留输出目录、图片和 viewer 细节：
 
 - `transition`：保存与在线发送完全相同的 compact episode，同时可生成 JSON、JPEG 和 HTML viewer；要求启用 PI05+RLT VLA。
 - `lerobot`：沿用原有 LeRobotDataset 保存逻辑，保存 Parquet、视频和 metadata。
@@ -399,10 +316,10 @@ Actor-only 不连接 learner，不检查 learner 是否存在。`actor_only.save
 配置文件中设置：
 
 ```json
+"actor_mode": "vla_only",
+"save_format": "transition",
 "actor_only": {
-  "enabled": true,
   "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_transition_episodes",
-  "save_format": "transition",
   "save_episode_images": true,
   "save_episode_viewer": true
 }
@@ -413,7 +330,7 @@ Actor-only 不连接 learner，不检查 learner 是否存在。`actor_only.save
 ```bash
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
 /home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_actorOnly_transion.json
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_actorOnly_transition.json
 ```
 
 输出目录可以已经存在；重新启动时会从现有最大 episode 编号继续写入。保存结构：
@@ -438,10 +355,10 @@ done/truncated、action、state、介入状态和 VLA checkpoint 信息。
 配置文件中设置：
 
 ```json
+"actor_mode": "vla_only",
+"save_format": "lerobot",
 "actor_only": {
-  "enabled": true,
   "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_lerobot_dataset",
-  "save_format": "lerobot",
   "save_episode_images": true,
   "save_episode_viewer": true
 }
@@ -452,7 +369,7 @@ done/truncated、action、state、介入状态和 VLA checkpoint 信息。
 ```bash
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
 /home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl_actorOnly_lerobot.json
+  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_actorOnly_lerobot.json
 ```
 
 `lerobot` 方式要求 `episode_output_dir` 在启动时不存在，因此每次新建数据集应使用新目录；
@@ -536,7 +453,7 @@ PY
 - `R`：放弃当前 episode，双臂回默认初始位后重录，不发送、不保存为有效 episode。
 - `Esc`：停止 actor。
 
-仅 `actor_2.py` 额外支持：
+统一 `actor.py` 在配置 `task_hotkeys_path` 或 `actor_mode=online_actor` 时还支持：
 
 - `B`：在纯 VLA 和 VLA+Actor 之间切换；Actor 权重不存在时保持纯 VLA。
 - task 配置中的按键（参考配置为 `1/2/3`）：切换 task，放弃当前 episode 并按 `R` 的流程归位。

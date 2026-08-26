@@ -10,6 +10,13 @@ Step1. 切换环境
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
 
+# 适配固件版本：PIPER合并固件_MC(S-V1.9-0)_DRV(V2.0.7 ).bin
+# 卸载当前 0.6.1
+python -m pip uninstall -y piper_sdk
+# 安装 1_0_0_b1 分支
+python -m pip install --no-cache-dir \
+"git+https://github.com/agilexrobotics/piper_sdk.git@1_0_0_b1"
+
 # 修改lerobot库路径
 pip install -e . --no-deps --no-build-isolation
 ```

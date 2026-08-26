@@ -186,6 +186,7 @@ class RealSenseCamera(Camera):
             ) from e
 
         self._configure_capture_settings()
+        self._configure_sensor_controls()
         self._start_read_thread()
 
         # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
@@ -318,6 +319,114 @@ class RealSenseCamera(Camera):
             else:
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
+
+    @staticmethod
+    def _set_sensor_option(sensor: Any, option: Any, value: float, name: str) -> float:
+        """Set a supported sensor option, validate its range, and verify the readback."""
+        if not sensor.supports(option):
+            raise RuntimeError(f"RealSense sensor does not support option {name}.")
+
+        option_range = sensor.get_option_range(option)
+        requested = float(value)
+        if requested < option_range.min or requested > option_range.max:
+            raise ValueError(
+                f"RealSense option {name}={value} is outside [{option_range.min}, {option_range.max}]."
+            )
+
+        sensor.set_option(option, requested)
+        actual = float(sensor.get_option(option))
+        tolerance = max(float(option_range.step) / 2, 1e-6)
+        if abs(actual - requested) > tolerance:
+            raise RuntimeError(f"RealSense option {name} requested={requested}, but readback={actual}.")
+
+        logger.info("RealSense control %s requested=%s actual=%s", name, requested, actual)
+        return actual
+
+    @check_if_not_connected
+    def _configure_sensor_controls(self) -> None:
+        """Apply the exposure mode and fixed control values from the camera config."""
+        if self.rs_profile is None:
+            raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
+
+        mode = self.config.exposure_mode
+        if mode == "device_default":
+            logger.info("%s using device-default exposure controls.", self)
+            return
+
+        sensor = next(
+            (
+                candidate
+                for candidate in self.rs_profile.get_device().query_sensors()
+                if any(
+                    profile.stream_type() == rs.stream.color for profile in candidate.get_stream_profiles()
+                )
+            ),
+            None,
+        )
+        if sensor is None:
+            raise RuntimeError(f"{self} has no sensor providing a color stream.")
+
+        if mode == "manual":
+            self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 0, "enable_auto_exposure")
+            self._set_sensor_option(sensor, rs.option.exposure, self.config.manual_exposure_us, "exposure_us")
+            self._set_sensor_option(sensor, rs.option.gain, self.config.manual_gain, "gain")
+        elif mode == "auto":
+            self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 1, "enable_auto_exposure")
+            self._set_sensor_option(
+                sensor,
+                rs.option.auto_exposure_limit,
+                self.config.auto_exposure_limit_us,
+                "auto_exposure_limit_us",
+            )
+            self._set_sensor_option(
+                sensor,
+                rs.option.auto_exposure_limit_toggle,
+                1,
+                "auto_exposure_limit_toggle",
+            )
+            self._set_sensor_option(
+                sensor,
+                rs.option.auto_gain_limit,
+                self.config.auto_gain_limit,
+                "auto_gain_limit",
+            )
+            self._set_sensor_option(
+                sensor,
+                rs.option.auto_gain_limit_toggle,
+                1,
+                "auto_gain_limit_toggle",
+            )
+
+            if self.config.auto_exposure_roi is not None:
+                min_x, min_y, max_x, max_y = self.config.auto_exposure_roi
+                roi = rs.region_of_interest()
+                roi.min_x, roi.min_y = min_x, min_y
+                roi.max_x, roi.max_y = max_x, max_y
+                try:
+                    roi_sensor = sensor.as_roi_sensor()
+                    roi_sensor.set_region_of_interest(roi)
+                    actual = roi_sensor.get_region_of_interest()
+                except RuntimeError as exc:
+                    raise RuntimeError(f"{self} does not support the requested exposure ROI.") from exc
+
+                requested_roi = (min_x, min_y, max_x, max_y)
+                actual_roi = (actual.min_x, actual.min_y, actual.max_x, actual.max_y)
+                if actual_roi != requested_roi:
+                    raise RuntimeError(
+                        f"{self} exposure ROI requested={requested_roi}, but readback={actual_roi}."
+                    )
+                logger.info("%s exposure ROI requested=%s actual=%s", self, requested_roi, actual_roi)
+
+        if self.config.white_balance_kelvin is not None:
+            self._set_sensor_option(
+                sensor, rs.option.enable_auto_white_balance, 0, "enable_auto_white_balance"
+            )
+            self._set_sensor_option(
+                sensor,
+                rs.option.white_balance,
+                self.config.white_balance_kelvin,
+                "white_balance_kelvin",
+            )
 
     @check_if_not_connected
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:

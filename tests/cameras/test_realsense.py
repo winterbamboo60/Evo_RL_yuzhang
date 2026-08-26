@@ -20,7 +20,7 @@
 # ```
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -28,9 +28,9 @@ import pytest
 from lerobot.cameras.configs import Cv2Rotation
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-pytest.importorskip("pyrealsense2")
+rs = pytest.importorskip("pyrealsense2")
 
-from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
+from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig  # noqa: E402
 
 TEST_ARTIFACTS_DIR = Path(__file__).parent.parent / "artifacts" / "cameras"
 BAG_FILE_PATH = TEST_ARTIFACTS_DIR / "test_rs.bag"
@@ -59,6 +59,47 @@ def test_abc_implementation():
     """Instantiation should raise an error if the class doesn't implement abstract methods/properties."""
     config = RealSenseCameraConfig(serial_number_or_name="042")
     _ = RealSenseCamera(config)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "manual",
+            [
+                (rs.option.enable_auto_exposure, 0, "enable_auto_exposure"),
+                (rs.option.exposure, 5000, "exposure_us"),
+                (rs.option.gain, 16, "gain"),
+            ],
+        ),
+        (
+            "auto",
+            [
+                (rs.option.enable_auto_exposure, 1, "enable_auto_exposure"),
+                (rs.option.auto_exposure_limit, 10000, "auto_exposure_limit_us"),
+                (rs.option.auto_exposure_limit_toggle, 1, "auto_exposure_limit_toggle"),
+                (rs.option.auto_gain_limit, 32, "auto_gain_limit"),
+                (rs.option.auto_gain_limit_toggle, 1, "auto_gain_limit_toggle"),
+            ],
+        ),
+        ("device_default", []),
+    ],
+)
+def test_exposure_modes(mode, expected):
+    config = RealSenseCameraConfig(serial_number_or_name="042", exposure_mode=mode)
+    camera = RealSenseCamera(config)
+    sensor = Mock()
+    stream_profile = Mock()
+    stream_profile.stream_type.return_value = rs.stream.color
+    sensor.get_stream_profiles.return_value = [stream_profile]
+    camera.rs_pipeline = Mock()
+    camera.rs_profile = Mock()
+    camera.rs_profile.get_device.return_value.query_sensors.return_value = [sensor]
+
+    with patch.object(camera, "_set_sensor_option") as set_option:
+        camera._configure_sensor_controls()
+
+    assert [call.args[1:] for call in set_option.call_args_list] == expected
 
 
 def test_connect():
