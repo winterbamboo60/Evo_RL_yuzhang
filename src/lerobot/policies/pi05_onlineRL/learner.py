@@ -144,7 +144,7 @@ def _add_compact_episode(
         )
 
     primitive = [
-        move_transition_to_device(transition, device=policy.config.device)
+        move_transition_to_device(transition, device=replay.storage_device)
         for transition in payload["transitions"]
     ]
     episodes = split_episodes(primitive)
@@ -298,6 +298,16 @@ def _training_phase(learner_step: int, offline_steps: int, online_budget: int) -
     return "online" if online_budget > 0 else None
 
 
+def _move_training_state(policy, optimizers: dict, device: torch.device | str) -> None:
+    device = torch.device(device)
+    policy.to(device)
+    for optimizer in optimizers.values():
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if key != "step" and isinstance(value, torch.Tensor):
+                    state[key] = value.to(device)
+
+
 _ACTOR_CRITIC_FILE = "actor_critic.pt"
 
 
@@ -426,6 +436,8 @@ def train_pi05_online_rl(
         "actor": torch.optim.Adam(policy.actor.parameters(), lr=cfg.policy.actor_lr),
         "critic": torch.optim.Adam(policy.critic_ensemble.parameters(), lr=cfg.policy.critic_lr),
     }
+    training_device = next(policy.parameters()).device
+    learner_offloaded = False
     learner_step = load_training_state(resume_dir, optimizers, None)[0] if resume_dir else 0
     interaction_step = 0
     pending_online_episodes = deque()
@@ -468,6 +480,14 @@ def train_pi05_online_rl(
                     cfg.policy.online_updates_per_episode,
                 )
 
+        if pending_online_episodes and pending_online_tasks and learner_offloaded:
+            _move_training_state(policy, optimizers, training_device)
+            learner_offloaded = False
+            logging.info(
+                "Received legacy raw episode; restored learner training state to %s",
+                training_device,
+            )
+
         while pending_online_episodes and pending_online_tasks:
             primitive = [
                 move_transition_to_device(transition, device=device)
@@ -502,11 +522,34 @@ def train_pi05_online_rl(
             )
             initialization_complete_logged = True
         if training_phase is None:
+            if (
+                cfg.policy.offload_to_cpu_while_waiting
+                and training_device.type == "cuda"
+                and not learner_offloaded
+            ):
+                for optimizer in optimizers.values():
+                    optimizer.zero_grad(set_to_none=True)
+                batch = critic_output = actor_output = offline_batch = None
+                _move_training_state(policy, optimizers, "cpu")
+                torch.cuda.empty_cache()
+                learner_offloaded = True
+                logging.info(
+                    "No pending online updates; offloaded learner training state from %s to CPU",
+                    training_device,
+                )
             if shutdown_event is not None:
                 shutdown_event.wait(0.05)
             else:
                 time.sleep(0.05)
             continue
+
+        if learner_offloaded:
+            _move_training_state(policy, optimizers, training_device)
+            learner_offloaded = False
+            logging.info(
+                "Online updates available; restored learner training state to %s",
+                training_device,
+            )
 
         if training_phase == "offline_initialization":
             raw_offline = next(offline_iterator)

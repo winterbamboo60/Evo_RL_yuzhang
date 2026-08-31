@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Fast similar-frame cleaner for LeRobot v3 datasets.
+
+The source dataset is never modified. Without ``--apply`` this only writes a report;
+with ``--apply`` it creates ``DATASET_cleaned`` unless ``--output`` is provided.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import tempfile
+from collections import defaultdict
+from fractions import Fraction
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+STATE_KEY = "observation.state"
+STAT_NAMES = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+VIDEO_ENCODERS = {"av1": "libsvtav1", "h264": "h264", "h265": "hevc", "hevc": "hevc"}
+
+
+def read_tables(root: Path, relative_dir: str, columns: list[str] | None = None) -> pa.Table:
+    files = sorted((root / relative_dir).rglob("file-*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"no parquet files under {root / relative_dir}")
+    return pa.concat_tables([pq.read_table(path, columns=columns) for path in files])
+
+
+def set_column(table: pa.Table, name: str, values) -> pa.Table:
+    position = table.schema.get_field_index(name)
+    if position < 0:
+        return table
+    field = table.schema.field(position)
+    values = [value.tolist() if isinstance(value, np.ndarray) else value for value in values]
+    return table.set_column(position, field, pa.array(values, type=field.type))
+
+
+def similar_runs(states: np.ndarray, threshold: float) -> list[tuple[int, int]]:
+    """Return inclusive runs whose frames stay close to the run's first frame."""
+    runs = []
+    start = 0
+    while start < len(states):
+        end = start
+        while end + 1 < len(states) and np.max(np.abs(states[end + 1] - states[start])) <= threshold:
+            end += 1
+        if end > start:
+            runs.append((start, end))
+        start = end + 1
+    return runs
+
+
+def scan_episode(
+    episode: int, states: np.ndarray, threshold: float, trim_tail: bool
+) -> tuple[dict | None, np.ndarray]:
+    runs = similar_runs(states, threshold)
+    remove = np.zeros(len(states), dtype=bool)
+    if not runs:
+        return None, remove
+
+    items = []
+    for start, end in runs:
+        is_tail = end == len(states) - 1
+        should_remove = not is_tail or trim_tail
+        if should_remove:
+            remove[start:end] = True
+        items.append(
+            {
+                "start_frame": start + 1,
+                "end_frame": end + 1,
+                "length": end - start + 1,
+                "is_tail": is_tail,
+                "planned_remove_range": [start + 1, end] if should_remove else None,
+                "planned_remove_frames": end - start if should_remove else 0,
+                "kept_original_frame": end + 1 if should_remove else None,
+            }
+        )
+    return (
+        {
+            "episode_index": episode,
+            "length": len(states),
+            "similar_runs": items,
+            "planned_remove_frames": int(remove.sum()),
+        },
+        remove,
+    )
+
+
+def scan_dataset(
+    data: pa.Table, threshold: float, trim_tail: bool
+) -> tuple[list[dict], list[tuple[int, int, int, np.ndarray]]]:
+    if not data.num_rows:
+        raise ValueError("dataset has no frames")
+    episodes = np.asarray(data["episode_index"])
+    frame_indices = np.asarray(data["frame_index"])
+    indices = np.asarray(data["index"])
+    if not np.array_equal(indices, np.arange(data.num_rows)):
+        raise ValueError("global index is not continuous from zero")
+
+    states = np.asarray(data[STATE_KEY].to_pylist(), dtype=np.float64)
+    if states.ndim == 1:
+        states = states[:, None]
+    if states.ndim != 2 or not np.isfinite(states).all():
+        raise ValueError(f"{STATE_KEY} must be a finite 2-D numeric column")
+
+    bounds = np.r_[0, np.flatnonzero(episodes[1:] != episodes[:-1]) + 1, data.num_rows]
+    reports = []
+    groups = []
+    for expected_episode, (start, end) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+        episode = int(episodes[start])
+        if episode != expected_episode:
+            raise ValueError("episode_index must be continuous from zero")
+        if not np.array_equal(episodes[start:end], np.full(end - start, episode)):
+            raise ValueError(f"episode {episode}: rows are not contiguous")
+        if not np.array_equal(frame_indices[start:end], np.arange(end - start)):
+            raise ValueError(f"episode {episode}: frame_index is not continuous from zero")
+        report, remove = scan_episode(episode, states[start:end], threshold, trim_tail)
+        groups.append((episode, int(start), int(end), remove))
+        if report:
+            reports.append(report)
+    return reports, groups
+
+
+def write_report(path: Path, payload: dict, dataset: Path) -> None:
+    protected = tuple(dataset / name for name in ("meta", "data", "videos", "images"))
+    if any(path == directory or directory in path.parents for directory in protected):
+        raise ValueError("--report must not overwrite dataset data, metadata, images, or videos")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def jsonable(value):
+    if isinstance(value, dict):
+        return {key: jsonable(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def episode_stats(table: pa.Table, features: dict, old_row: dict) -> dict:
+    from lerobot.datasets.compute_stats import compute_episode_stats
+
+    values = {
+        key: np.asarray(table[key].to_pylist())
+        for key, feature in features.items()
+        if key in table.column_names and feature["dtype"] not in ("string", "image", "video")
+    }
+    stats = compute_episode_stats(values, features)
+    # ponytail: visual stats stay sampled from the source; recompute pixels only if exact visual stats matter.
+    for key, feature in features.items():
+        names = [f"stats/{key}/{stat}" for stat in STAT_NAMES]
+        if feature["dtype"] in ("image", "video") and all(name in old_row for name in names):
+            stats[key] = {stat: np.asarray(old_row[name]) for stat, name in zip(STAT_NAMES, names, strict=True)}
+    return stats
+
+
+def rewrite_tables(
+    data: pa.Table,
+    meta: pa.Table,
+    groups: list[tuple[int, int, int, np.ndarray]],
+    info: dict,
+) -> tuple[pa.Table, pa.Table, list[dict], list[int]]:
+    rows = meta.to_pylist()
+    if len(rows) != len(groups):
+        raise ValueError("episode metadata count does not match data")
+
+    fps = float(info["fps"])
+    features = info["features"]
+    parts, stats, lengths, starts, ends = [], [], [], [], []
+    global_index = 0
+    for row_number, ((episode, start, end, remove), old_row) in enumerate(
+        zip(groups, rows, strict=True)
+    ):
+        if int(old_row["episode_index"]) != episode:
+            raise ValueError(f"episode order mismatch at row {row_number}")
+        part = data.slice(start, end - start).filter(pa.array(~remove))
+        length = part.num_rows
+        if length < 1:
+            raise ValueError(f"episode {episode}: cleaning would remove every frame")
+        part = set_column(part, "frame_index", np.arange(length))
+        part = set_column(part, "timestamp", np.arange(length, dtype=np.float64) / fps)
+        part = set_column(part, "index", np.arange(global_index, global_index + length))
+        parts.append(part)
+        lengths.append(length)
+        starts.append(global_index)
+        global_index += length
+        ends.append(global_index)
+        stats.append(episode_stats(part, features, old_row))
+
+    # ponytail: one parquet is the same fast path as check_episode_start_states.py; split only for huge tables.
+    new_data = pa.concat_tables(parts)
+    new_meta = set_column(meta, "length", lengths)
+    new_meta = set_column(new_meta, "dataset_from_index", starts)
+    new_meta = set_column(new_meta, "dataset_to_index", ends)
+    for name in ("data/chunk_index", "data/file_index", "meta/episodes/chunk_index", "meta/episodes/file_index"):
+        new_meta = set_column(new_meta, name, [0] * len(lengths))
+
+    for column in new_meta.column_names:
+        if not column.startswith("stats/"):
+            continue
+        feature, stat = column[len("stats/") :].rsplit("/", 1)
+        if stat in STAT_NAMES and all(feature in item and stat in item[feature] for item in stats):
+            new_meta = set_column(new_meta, column, [item[feature][stat] for item in stats])
+    return new_data, new_meta, stats, lengths
+
+
+def video_path(root: Path, info: dict, key: str, chunk: int, file_index: int) -> Path:
+    pattern = info.get("video_path")
+    if not pattern:
+        raise ValueError("dataset has video features but no video_path")
+    return root / pattern.format(video_key=key, chunk_index=chunk, file_index=file_index)
+
+
+def source_encoder(feature: dict) -> str:
+    codec = str(feature.get("info", {}).get("video.codec", "")).lower()
+    try:
+        return VIDEO_ENCODERS[codec]
+    except KeyError as error:
+        raise ValueError(f"unsupported source video codec: {codec or 'missing'}") from error
+
+
+def filter_video(
+    source: Path,
+    output: Path,
+    targets: np.ndarray,
+    fps: float,
+    encoder: str,
+    pix_fmt: str,
+) -> None:
+    import av
+
+    if not len(targets):
+        raise ValueError(f"no video frames requested from {source}")
+    tolerance = min(1e-4, 0.25 / fps)
+    if np.any(np.diff(targets) <= tolerance):
+        raise ValueError(f"requested video timestamps are not strictly increasing in {source}")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rate = Fraction(fps).limit_denominator(1000)
+    time_base = Fraction(1, 1) / rate
+    options = {"g": "2", "crf": "30"}
+    if encoder == "libsvtav1":
+        options["preset"] = "12"
+    elif encoder in ("h264", "hevc"):
+        options["preset"] = "veryfast"
+
+    with av.open(str(source), "r") as input_container:
+        if not input_container.streams.video:
+            raise ValueError(f"no video stream in {source}")
+        if input_container.streams.audio:
+            raise ValueError(f"audio video is not supported: {source}")
+        input_stream = input_container.streams.video[0]
+        with av.open(str(output), "w") as output_container:
+            output_stream = output_container.add_stream(encoder, rate=rate, options=options)
+            output_stream.width = input_stream.codec_context.width
+            output_stream.height = input_stream.codec_context.height
+            output_stream.pix_fmt = pix_fmt
+            output_stream.time_base = time_base
+            output_container.start_encoding()
+
+            target_index = 0
+            written = 0
+            for frame in input_container.decode(input_stream):
+                if frame.pts is None or frame.time_base is None:
+                    raise ValueError(f"video frame has no timestamp in {source}")
+                frame_time = float(frame.pts * frame.time_base)
+                if targets[target_index] < frame_time - tolerance:
+                    raise ValueError(
+                        f"missed video frame at {targets[target_index]:.9f}s in {source}; "
+                        f"next decoded frame is {frame_time:.9f}s"
+                    )
+                if abs(targets[target_index] - frame_time) <= tolerance:
+                    new_frame = frame.reformat(
+                        width=output_stream.width,
+                        height=output_stream.height,
+                        format=output_stream.pix_fmt,
+                    )
+                    new_frame.pts = written
+                    new_frame.time_base = time_base
+                    for packet in output_stream.encode(new_frame):
+                        output_container.mux(packet)
+                    target_index += 1
+                    written += 1
+                    if target_index == len(targets):
+                        break
+
+            if target_index != len(targets):
+                raise ValueError(f"matched {target_index}/{len(targets)} requested frames in {source}")
+            for packet in output_stream.encode():
+                output_container.mux(packet)
+
+    if written != len(targets) or not output.is_file():
+        raise RuntimeError(f"failed to write all requested frames to {output}")
+
+
+def rewrite_videos(
+    source_root: Path,
+    output_root: Path,
+    data: pa.Table,
+    old_meta: pa.Table,
+    new_meta: pa.Table,
+    groups: list[tuple[int, int, int, np.ndarray]],
+    info: dict,
+    requested_codec: str,
+) -> pa.Table:
+    from lerobot.datasets.video_utils import get_video_info
+
+    rows = old_meta.to_pylist()
+    fps = float(info["fps"])
+    for key, feature in info["features"].items():
+        if feature.get("dtype") != "video":
+            continue
+        prefix = f"videos/{key}"
+        required = [
+            f"{prefix}/chunk_index",
+            f"{prefix}/file_index",
+            f"{prefix}/from_timestamp",
+            f"{prefix}/to_timestamp",
+        ]
+        missing = [name for name in required if name not in old_meta.column_names]
+        if missing:
+            raise ValueError(f"missing video metadata columns: {missing}")
+
+        encoder = source_encoder(feature) if requested_codec == "source" else requested_codec
+        pix_fmt = str(feature.get("info", {}).get("video.pix_fmt", "yuv420p"))
+        if encoder in ("libsvtav1", "hevc") and pix_fmt == "yuv444p":
+            pix_fmt = "yuv420p"
+        force_reencode = requested_codec != "source"
+        from_values = np.asarray(old_meta[f"{prefix}/from_timestamp"], dtype=np.float64).tolist()
+        to_values = np.asarray(old_meta[f"{prefix}/to_timestamp"], dtype=np.float64).tolist()
+        files: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for position, row in enumerate(rows):
+            files[(int(row[f"{prefix}/chunk_index"]), int(row[f"{prefix}/file_index"]))].append(position)
+
+        first_output = None
+        for file_number, ((chunk, file_index), positions) in enumerate(sorted(files.items()), 1):
+            source_path = video_path(source_root, info, key, chunk, file_index)
+            output_path = video_path(output_root, info, key, chunk, file_index)
+            if not source_path.is_file():
+                raise FileNotFoundError(source_path)
+            changed = force_reencode or any(groups[position][3].any() for position in positions)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if not changed:
+                shutil.copy2(source_path, output_path)
+                action = "copied"
+            else:
+                positions.sort(key=lambda position: float(rows[position][f"{prefix}/from_timestamp"]))
+                target_parts = []
+                cursor = 0
+                for position in positions:
+                    _, start, end, remove = groups[position]
+                    timestamps = np.asarray(
+                        data.slice(start, end - start)["timestamp"].to_pylist(), dtype=np.float64
+                    )
+                    kept = timestamps[~remove] + float(rows[position][f"{prefix}/from_timestamp"])
+                    target_parts.append(kept)
+                    from_values[position] = cursor / fps
+                    cursor += len(kept)
+                    to_values[position] = cursor / fps
+                targets = np.concatenate(target_parts)
+                filter_video(source_path, output_path, targets, fps, encoder, pix_fmt)
+                action = f"reencoded frames={len(targets)}"
+            first_output = first_output or output_path
+            print(f"video={key} file={file_number}/{len(files)} {action}", flush=True)
+
+        if first_output is None:
+            raise ValueError(f"no video files referenced by {key}")
+        new_meta = set_column(new_meta, f"{prefix}/from_timestamp", from_values)
+        new_meta = set_column(new_meta, f"{prefix}/to_timestamp", to_values)
+        feature["info"] = get_video_info(first_output)
+    return new_meta
+
+
+def verify(root: Path, expected_lengths: list[int], info: dict) -> None:
+    output_info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+    data = read_tables(root, "data")
+    meta = read_tables(root, "meta/episodes")
+    lengths = np.asarray(meta["length"], dtype=np.int64)
+    if not np.array_equal(lengths, expected_lengths):
+        raise RuntimeError("output episode lengths are wrong")
+    if output_info["total_frames"] != data.num_rows or data.num_rows != int(lengths.sum()):
+        raise RuntimeError("output total_frames is wrong")
+    if output_info["total_episodes"] != len(lengths):
+        raise RuntimeError("output total_episodes is wrong")
+    if not np.array_equal(np.asarray(data["index"]), np.arange(data.num_rows)):
+        raise RuntimeError("output global index is not continuous")
+    if not np.array_equal(np.asarray(data["episode_index"]), np.repeat(np.arange(len(lengths)), lengths)):
+        raise RuntimeError("output episode_index is wrong")
+
+    starts = np.r_[0, np.cumsum(lengths)[:-1]]
+    ends = np.cumsum(lengths)
+    if not np.array_equal(np.asarray(meta["dataset_from_index"]), starts):
+        raise RuntimeError("output dataset_from_index is wrong")
+    if not np.array_equal(np.asarray(meta["dataset_to_index"]), ends):
+        raise RuntimeError("output dataset_to_index is wrong")
+    fps = float(output_info["fps"])
+    frame_indices = np.asarray(data["frame_index"])
+    timestamps = np.asarray(data["timestamp"])
+    for episode, (start, end, length) in enumerate(zip(starts, ends, lengths, strict=True)):
+        if not np.array_equal(frame_indices[start:end], np.arange(length)):
+            raise RuntimeError(f"output episode {episode} frame_index is wrong")
+        if not np.allclose(timestamps[start:end], np.arange(length) / fps, atol=1e-5):
+            raise RuntimeError(f"output episode {episode} timestamp is wrong")
+
+    rows = meta.to_pylist()
+    for key, feature in output_info["features"].items():
+        if feature.get("dtype") != "video":
+            continue
+        for row, length in zip(rows, lengths, strict=True):
+            prefix = f"videos/{key}"
+            path = video_path(
+                root,
+                output_info,
+                key,
+                int(row[f"{prefix}/chunk_index"]),
+                int(row[f"{prefix}/file_index"]),
+            )
+            if not path.is_file():
+                raise RuntimeError(f"missing output video: {path}")
+            span = float(row[f"{prefix}/to_timestamp"]) - float(row[f"{prefix}/from_timestamp"])
+            if span + 1e-4 < int(length) / fps:
+                raise RuntimeError(f"output video range is too short for episode {row['episode_index']}: {key}")
+
+
+def copy_metadata_tree(source: Path, output: Path) -> None:
+    source_meta = source / "meta"
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        path = Path(directory)
+        if path == source:
+            return set(names) & {"data", "videos", "images"}
+        if path == source_meta:
+            return set(names) & {"episodes"}
+        return set()
+
+    shutil.copytree(source, output, ignore=ignore)
+
+
+def apply_cleaning(
+    source: Path,
+    output: Path,
+    data: pa.Table,
+    meta: pa.Table,
+    groups: list[tuple[int, int, int, np.ndarray]],
+    info: dict,
+    codec: str,
+) -> None:
+    from lerobot.datasets.compute_stats import aggregate_stats
+
+    if output.exists():
+        raise FileExistsError(f"output already exists: {output}")
+    if output == source or source in output.parents:
+        raise ValueError("--output must be a separate sibling directory")
+    if not output.parent.is_dir():
+        raise FileNotFoundError(f"output parent does not exist: {output.parent}")
+    if any(feature.get("dtype") == "image" for feature in info["features"].values()):
+        raise ValueError("image-file datasets are not supported; video datasets are supported")
+    if any(
+        feature.get("dtype") == "video" and feature.get("info", {}).get("has_audio")
+        for feature in info["features"].values()
+    ):
+        raise ValueError("videos with audio are not supported")
+
+    source_bytes = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+    if shutil.disk_usage(output.parent).free < source_bytes:
+        raise OSError(f"not enough free space to create roughly {source_bytes / 2**30:.2f} GiB")
+    if data.num_rows != sum(end - start for _, start, end, _ in groups):
+        raise ValueError("dataset rows do not match the scan")
+
+    new_data, new_meta, all_stats, lengths = rewrite_tables(data, meta, groups, info)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
+    temporary = stage / output.name
+    try:
+        copy_metadata_tree(source, temporary)
+        data_path = temporary / info.get(
+            "data_path", "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+        ).format(chunk_index=0, file_index=0)
+        episodes_path = temporary / "meta/episodes/chunk-000/file-000.parquet"
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        episodes_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(new_data, data_path)
+        new_meta = rewrite_videos(source, temporary, data, meta, new_meta, groups, info, codec)
+        pq.write_table(new_meta, episodes_path)
+
+        info["total_frames"] = new_data.num_rows
+        (temporary / "meta/info.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=4) + "\n", encoding="utf-8"
+        )
+        (temporary / "meta/stats.json").write_text(
+            json.dumps(jsonable(aggregate_stats(all_stats)), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        verify(temporary, lengths, info)
+        temporary.rename(output)
+        stage.rmdir()
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset", type=Path)
+    parser.add_argument(
+        "--threshold", type=float, default=0.01, help="max absolute per-joint delta (default: 0.01)"
+    )
+    parser.add_argument(
+        "--trim-tail",
+        action="store_true",
+        help="include the final similar run in the removal plan (default: preserve it)",
+    )
+    parser.add_argument("--report", type=Path, help="JSON report path")
+    parser.add_argument("--apply", action="store_true", help="create a cleaned copy; omitted means scan only")
+    parser.add_argument("--output", type=Path, help="cleaned dataset path (default: DATASET_cleaned)")
+    parser.add_argument(
+        "--vcodec",
+        choices=("source", "h264", "hevc", "libsvtav1"),
+        default="source",
+        help="output codec; source preserves the original codec, h264 is faster (default: source)",
+    )
+    args = parser.parse_args()
+
+    if args.output and not args.apply:
+        parser.error("--output requires --apply")
+    if args.vcodec != "source" and not args.apply:
+        parser.error("--vcodec requires --apply")
+    if not np.isfinite(args.threshold) or args.threshold < 0:
+        parser.error("--threshold must be finite and non-negative")
+    source = args.dataset.resolve()
+    info_path = source / "meta/info.json"
+    if not info_path.is_file():
+        parser.error(f"not a LeRobot dataset: missing {info_path}")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if STATE_KEY not in info.get("features", {}):
+        parser.error(f"dataset has no {STATE_KEY}")
+
+    scan_data = read_tables(source, "data", ["episode_index", "frame_index", "index", STATE_KEY])
+    reports, groups = scan_dataset(scan_data, args.threshold, args.trim_tail)
+    total_remove = sum(item["planned_remove_frames"] for item in reports)
+    payload = {
+        "dataset": str(source),
+        "state_key": STATE_KEY,
+        "metric": "max(abs(frame_state - run_first_state)) <= threshold",
+        "scope": "contiguous similar-state runs only",
+        "threshold": args.threshold,
+        "trim_tail": args.trim_tail,
+        "total_episodes": len(groups),
+        "episodes_with_similar_runs": len(reports),
+        "episodes_with_planned_removals": sum(item["planned_remove_frames"] > 0 for item in reports),
+        "planned_remove_frames": total_remove,
+        "episodes": reports,
+    }
+    suffix = "trim_tail" if args.trim_tail else "keep_tail"
+    report = (args.report or source.with_name(f"{source.name}_similar_frames_{suffix}.json")).resolve()
+    try:
+        write_report(report, payload, source)
+    except ValueError as error:
+        parser.error(str(error))
+    print(
+        f"episodes={len(groups)} similar={len(reports)} planned_remove_frames={total_remove} "
+        f"trim_tail={args.trim_tail}"
+    )
+    print(f"threshold={args.threshold:g} metric=L_inf state={STATE_KEY}")
+    print(f"report={report}")
+
+    if args.apply:
+        output = (args.output or source.with_name(source.name + "_cleaned")).resolve()
+        full_data = read_tables(source, "data")
+        meta = read_tables(source, "meta/episodes")
+        try:
+            apply_cleaning(source, output, full_data, meta, groups, info, args.vcodec)
+        except (FileExistsError, FileNotFoundError, ValueError, OSError) as error:
+            parser.error(str(error))
+        print(f"cleaned_dataset={output}")
+
+
+if __name__ == "__main__":
+    sample = np.array([[0.0], [0.0], [1.0], [1.0], [1.0], [2.0], [2.0]])
+    assert similar_runs(sample, 0) == [(0, 1), (2, 4), (5, 6)]
+    _, removed = scan_episode(0, sample, 0, False)
+    assert removed.tolist() == [True, False, True, True, False, False, False]
+    _, removed = scan_episode(0, sample, 0, True)
+    assert removed.tolist() == [True, False, True, True, False, True, False]
+    main()

@@ -27,24 +27,29 @@
 # 纯人工示范（不传 policy.path）
 # source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/text_memory_demo/task4_block_left \
-#   --dataset.single_task "Pick up the cup covering the block and put it back in its original place" \
-#   --wrist_camera.index_or_path 6 \
-#   --top_camera.index_or_path 12 \
-#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
-
-# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_left_row3 \
 #   --dataset.single_task "Grab the left cup" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 260522273666 \
-#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
+#   --top_camera.index_or_path 12
 
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_mid_row3_add1 \
+#   --dataset.single_task "Take the middle cup away" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 4
+
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_right_row3 \
+#   --dataset.single_task "Pick up the cup on the right" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 4
 
 # Pick up the cup on the right
 # Take the middle cup away
-# Grab the left cup
+# Grab the left cupc
+# clean 0828_left_row1: 28   0828_left_row3: 102 101c
+# 0828_mid_row2:74   0828_mid_row3:53
+
 
 
 
@@ -72,7 +77,7 @@
 #   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
 #   --dataset.single_task "Grab the left cup" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 260522273666 \
+#   --top_camera.index_or_path 12 \
 #   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v2_0819_25k \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
@@ -85,7 +90,26 @@
 #   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v2_0819_40k \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
+# pi05_base_cup_catch_v4_merged_train0829_30k
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# cd /home/hpc/yuzhang/Evo-RL-loop-0817
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v4_merged_train0829_30k_test_needDelete \
+#   --dataset.single_task "Pick up the cup on the right" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v4_merged_train0829_30k
 
+
+# smovla_cup_catch_v4_merged_train0829_40k
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# cd /home/hpc/yuzhang/Evo-RL-loop-0817
+# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
+#   --dataset.root /home/hpc/yuzhang/datasets/smovla_cup_catch_v4_merged_train0829_40k_test_needDelete \
+#   --dataset.single_task "Pick up the cup on the right" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 12 \
+#   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v4_merged_train0829_40k
 
 
 # 合并数据集
@@ -95,10 +119,12 @@
 #     --operation.type merge \
 #     --operation.repo_ids "['/home/yz/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/yz/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/yz/datasets/task2_grab_the_package_and_place_it_into_the_b']"
 
+# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+# cd /home/hpc/yuzhang/Evo-RL-loop-0817/src
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/hpc/yuzhang/datasets/text_memory_demo_merged \
+#     --repo_id /home/hpc/yuzhang/datasets/cup_catch_v4_merged \
 #     --operation.type merge \
-#     --operation.source_dir /home/hpc/yuzhang/datasets/text_memory_demo
+#     --operation.source_dir /home/hpc/yuzhang/datasets/cup_catch_v4
 
 # cd /home/hpc/yuzhang/outputs
 # downloadyuzhang pi05_base_cup_catch_v2_0819_35k.tar
@@ -108,7 +134,7 @@ set -e
 # ---------- 解析参数 ----------
 DATASET_ROOT=""
 SINGLE_TASK=""
-WRIST_CAM=""
+WRIST_CAM=""100
 TOP_CAM=""
 POLICY_PATH=""
 EVENT_CONFIG_PATH=""
@@ -164,7 +190,7 @@ fi
 # ---------- 构建摄像头配置 ----------
 # CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
 
-CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: intelrealsense, serial_number_or_name: ${TOP_CAM}, width: 640, height: 480, fps:
+CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps:
   30}}"
 
 # ---------- 构建命令 ----------
@@ -182,15 +208,19 @@ CMD=(
     --dataset.repo_id=local_data
     "--dataset.root=${DATASET_ROOT}"
     "--dataset.single_task=${SINGLE_TASK}"
-    --dataset.num_episodes=20
+    --dataset.num_episodes=110
     --dataset.episode_time_s=120000
     --dataset.reset_time_s=3
     --dataset.push_to_hub=False
     --display_data=true
     --resume=false
-    "--event_config_path=${EVENT_CONFIG_PATH}"
     --reset_on_timeout=false
 )
+
+# 若提供了事件配置路径则追加
+if [[ -n "$EVENT_CONFIG_PATH" ]]; then
+    CMD+=("--event_config_path=${EVENT_CONFIG_PATH}")
+fi
 
 # 若提供了策略模型路径则追加（启用人机协同模式）
 if [[ -n "$POLICY_PATH" ]]; then

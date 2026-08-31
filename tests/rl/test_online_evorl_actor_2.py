@@ -4,9 +4,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from lerobot.onlineRL_evoRL.actor_2 import (
-    Actor2Control,
-    Actor2KeyboardController,
+from lerobot.onlineRL_evoRL.actor_new import (
+    ActorControl,
+    ActorKeyboardController,
     TaskHotkeys,
     _find_actor_checkpoint,
     _log_unhandled_exception,
@@ -37,7 +37,7 @@ def _control():
             "3": "Grab the left cup",
         },
     )
-    control = Actor2Control(cfg=cfg, task_hotkeys=tasks, dataset_meta=SimpleNamespace())
+    control = ActorControl(cfg=cfg, task_hotkeys=tasks, dataset_meta=SimpleNamespace())
     control.runtime = _Resettable()
     control.smoother = _Resettable()
     return control
@@ -45,7 +45,7 @@ def _control():
 
 def test_b_switch_requires_actor_and_clears_cached_actions():
     control = _control()
-    controller = Actor2KeyboardController(control)
+    controller = ActorKeyboardController(control)
     state = KeyboardState()
 
     controller.push("b")
@@ -70,7 +70,7 @@ def test_task_hotkey_uses_rerecord_home_semantics_without_changing_action_mode()
     control = _control()
     control.actor_available = True
     control.use_actor = True
-    controller = Actor2KeyboardController(control)
+    controller = ActorKeyboardController(control)
     state = KeyboardState()
 
     controller.push("1")

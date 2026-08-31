@@ -199,22 +199,22 @@ class PiperGravityCompensationLoop:
                 for idx in range(1, 7)
             ]
 
-        logger.info(
-            "Piper MIT diagnostic: loop_hz=%.1f ctrl_mode=%s mode_feed=%s arm_status=%s "
-            "err_code=%s enabled=%s q_deg=%s v_rad_s=%s tau_model_nm=%s tau_cmd_nm=%s "
-            "current_raw=%s",
-            loop_hz,
-            ctrl_mode,
-            mode_feed,
-            arm_status,
-            err_code,
-            enabled or "unavailable",
-            np.round(np.rad2deg(q_rad), 3).tolist(),
-            np.round(v_rad, 4).tolist(),
-            np.round(tau_model, 4).tolist(),
-            np.round(tau_cmd, 4).tolist(),
-            currents,
-        )
+        # logger.info(
+        #     "Piper MIT diagnostic: loop_hz=%.1f ctrl_mode=%s mode_feed=%s arm_status=%s "
+        #     "err_code=%s enabled=%s q_deg=%s v_rad_s=%s tau_model_nm=%s tau_cmd_nm=%s "
+        #     "current_raw=%s",
+        #     loop_hz,
+        #     ctrl_mode,
+        #     mode_feed,
+        #     arm_status,
+        #     err_code,
+        #     enabled or "unavailable",
+        #     np.round(np.rad2deg(q_rad), 3).tolist(),
+        #     np.round(v_rad, 4).tolist(),
+        #     np.round(tau_model, 4).tolist(),
+        #     np.round(tau_cmd, 4).tolist(),
+        #     currents,
+        # )
 
     def _run(self) -> None:
         cycles = 0

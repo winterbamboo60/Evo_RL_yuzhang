@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Scan contiguous similar-state runs and optionally create a cleaned dataset."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+
+STATE_KEY = "observation.state"
+
+# 保留 episode 末尾相似帧
+#   python3 /home/hpc/yuzhang/datasets/check_episode_similar_frames.py /home/hpc/yuzhang/datasets/cup_catch_v4/0828_left_merged --threshold 0 --report /home/hpc/yuzhang/datasets/cup_catch_v4/0828_left_merged/similar_frames_report.json
+# 将末尾相似帧也列入剔除计划
+#   python3 check_episode_similar_frames.py cup_catch_v2_merged_checked --threshold 0.01 --trim-tail
+# 确认报告后创建 DATASET_cleaned（源数据不变）
+#   python3 check_episode_similar_frames.py DATASET --threshold 0.01 --apply
+# 指定输出目录
+#   python3 check_episode_similar_frames.py DATASET --threshold 0.01 --apply --output OUTPUT
+
+def similar_runs(states: np.ndarray, threshold: float) -> list[tuple[int, int]]:
+    """Return inclusive runs whose frames stay within threshold of the run's first frame."""
+    runs = []
+    start = 0
+    while start < len(states):
+        end = start
+        while end + 1 < len(states) and np.max(np.abs(states[end + 1] - states[start])) <= threshold:
+            end += 1
+        if end > start:
+            runs.append((start, end))
+        start = end + 1
+    return runs
+
+
+def scan_episode(
+    episode: int, states: np.ndarray, threshold: float, trim_tail: bool
+) -> tuple[dict | None, np.ndarray]:
+    runs = similar_runs(states, threshold)
+    remove_mask = np.zeros(len(states), dtype=bool)
+    if not runs:
+        return None, remove_mask
+    items = []
+    for start, end in runs:
+        is_tail = end == len(states) - 1
+        remove = not is_tail or trim_tail
+        if remove:
+            remove_mask[start:end] = True
+        items.append(
+            {
+                "start_frame": start + 1,
+                "end_frame": end + 1,
+                "length": end - start + 1,
+                "is_tail": is_tail,
+                "planned_remove_range": [start + 1, end] if remove else None,
+                "planned_remove_frames": end - start if remove else 0,
+                "kept_original_frame": end + 1 if remove else None,
+            }
+        )
+    return (
+        {
+            "episode_index": episode,
+            "length": len(states),
+            "similar_runs": items,
+            "planned_remove_frames": int(remove_mask.sum()),
+        },
+        remove_mask,
+    )
+
+
+
+def episode_extras(root: Path) -> dict[int, dict]:
+    files = sorted((root / "meta/episodes").rglob("file-*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"no episode metadata under {root / 'meta/episodes'}")
+    table = pq.read_table(files)
+    fixed = {"episode_index", "tasks", "length", "dataset_from_index", "dataset_to_index"}
+    prefixes = ("data/", "videos/", "stats/", "meta/episodes/", "__index_level_")
+    names = [
+        name for name in table.column_names if name not in fixed and not name.startswith(prefixes)
+    ]
+    return {
+        int(row["episode_index"]): {name: row.get(name) for name in names}
+        for row in table.to_pylist()
+    }
+
+
+def writable_frame(item: dict, features: dict, automatic_features: set[str]) -> dict:
+    frame = {"task": item["task"]}
+    for name, feature in features.items():
+        if name in automatic_features:
+            continue
+        value = item[name]
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        shape = tuple(feature["shape"])
+        if feature["dtype"] in ("image", "video"):
+            if isinstance(value, np.ndarray) and value.shape != shape:
+                channel_last = np.moveaxis(value, 0, -1)
+                if channel_last.shape == shape:
+                    value = channel_last
+        elif feature["dtype"] != "string":
+            value = np.asarray(value, dtype=feature["dtype"]).reshape(shape)
+        frame[name] = value
+    return frame
+
+
+def verify_cleaned(
+    root: Path,
+    repo_id: str,
+    expected_lengths: list[int],
+    expected_features: dict,
+    expected_tasks,
+    expected_extras: dict[int, dict],
+) -> None:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(repo_id=repo_id, root=root)
+    expected_frames = sum(expected_lengths)
+    if dataset.meta.total_episodes != len(expected_lengths) or len(dataset) != expected_frames:
+        raise RuntimeError("cleaned dataset totals are wrong")
+    if set(dataset.meta.features) != set(expected_features):
+        raise RuntimeError("cleaned dataset features changed")
+    for name, feature in expected_features.items():
+        actual = dataset.meta.features[name]
+        if actual["dtype"] != feature["dtype"] or tuple(actual["shape"]) != tuple(feature["shape"]):
+            raise RuntimeError(f"cleaned feature changed: {name}")
+    if expected_tasks is not None and not dataset.meta.tasks.equals(expected_tasks):
+        raise RuntimeError("cleaned dataset tasks changed")
+    if [int(row["length"]) for row in dataset.meta.episodes] != expected_lengths:
+        raise RuntimeError("cleaned episode lengths are wrong")
+
+    files = sorted((root / "data").rglob("file-*.parquet"))
+    data = pq.read_table(files, columns=["episode_index", "frame_index", "timestamp", "index"])
+    if not np.array_equal(np.asarray(data["index"]), np.arange(expected_frames)):
+        raise RuntimeError("cleaned global index is not continuous")
+    episodes = np.asarray(data["episode_index"])
+    bounds = np.r_[0, np.flatnonzero(episodes[1:] != episodes[:-1]) + 1, len(data)]
+    if len(bounds) - 1 != len(expected_lengths):
+        raise RuntimeError("cleaned episode count is wrong")
+    fps = float(dataset.meta.fps)
+    frames = np.asarray(data["frame_index"])
+    timestamps = np.asarray(data["timestamp"])
+    for episode, (start, end, length) in enumerate(
+        zip(bounds[:-1], bounds[1:], expected_lengths, strict=True)
+    ):
+        if end - start != length or not np.array_equal(frames[start:end], np.arange(length)):
+            raise RuntimeError(f"cleaned episode {episode} frame_index is wrong")
+        if not np.allclose(timestamps[start:end], np.arange(length) / fps, atol=1e-5):
+            raise RuntimeError(f"cleaned episode {episode} timestamp is wrong")
+
+    meta_files = sorted((root / "meta/episodes").rglob("file-*.parquet"))
+    meta_rows = pq.read_table(meta_files).to_pylist()
+    for row in meta_rows:
+        episode = int(row["episode_index"])
+        if any(row.get(name) != value for name, value in expected_extras[episode].items()):
+            raise RuntimeError(f"cleaned episode {episode} metadata changed")
+    if expected_frames and dataset.meta.video_keys:
+        for index in {0, expected_frames - 1}:
+            item = dataset[index]
+            if any(key not in item for key in dataset.meta.video_keys):
+                raise RuntimeError(f"cleaned videos cannot be decoded at frame {index}")
+
+
+def apply_cleaning(
+    src: Path,
+    dst: Path,
+    groups: list[tuple[int, int, int, np.ndarray]],
+) -> None:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.utils import DEFAULT_FEATURES, write_tasks
+
+    if dst.exists():
+        raise FileExistsError(f"output already exists: {dst}")
+    if dst == src or src in dst.parents:
+        raise ValueError("--output must not be the source dataset or a directory inside it")
+    if not dst.parent.is_dir():
+        raise FileNotFoundError(f"output parent does not exist: {dst.parent}")
+    src_bytes = sum(path.stat().st_size for path in src.rglob("*") if path.is_file())
+    if shutil.disk_usage(dst.parent).free < src_bytes:
+        raise OSError(f"not enough free space to create roughly {src_bytes / 2**30:.2f} GiB")
+
+    source = LeRobotDataset(repo_id=src.name, root=src)
+    if len(source) != sum(end - start for _, start, end, _ in groups):
+        raise ValueError("dataset rows do not match the scan")
+    extras = episode_extras(src)
+    if set(extras) != {episode for episode, _, _, _ in groups}:
+        raise ValueError("episode metadata does not match the data")
+
+    features = copy.deepcopy(source.meta.features)
+    video_features = [features[key] for key in source.meta.video_keys]
+    if any(feature.get("info", {}).get("has_audio") for feature in video_features):
+        raise ValueError("cleaning datasets with video audio is not supported")
+    codec = next(
+        (feature.get("info", {}).get("video.codec") for feature in video_features if feature.get("info")),
+        "av1",
+    )
+    vcodec = {"av1": "libsvtav1", "h264": "h264", "h265": "hevc", "hevc": "hevc"}.get(
+        str(codec).lower(), "libsvtav1"
+    )
+    for feature in video_features:
+        feature.pop("info", None)
+
+    expected_lengths = [end - start - int(remove.sum()) for _, start, end, remove in groups]
+    automatic_features = set(DEFAULT_FEATURES)
+    stage = Path(tempfile.mkdtemp(prefix=f".{dst.name}.tmp-", dir=dst.parent))
+    tmp = stage / dst.name
+    try:
+        cleaned = LeRobotDataset.create(
+            repo_id=dst.name,
+            fps=source.meta.fps,
+            features=features,
+            root=tmp,
+            robot_type=source.meta.robot_type,
+            use_videos=bool(source.meta.video_keys),
+            vcodec=vcodec,
+        )
+        cleaned.meta.update_chunk_settings(**source.meta.get_chunk_settings())
+        if source.meta.tasks is not None:
+            cleaned.meta.tasks = source.meta.tasks.copy()
+            write_tasks(cleaned.meta.tasks, cleaned.root)
+        subtasks = src / "meta/subtasks.parquet"
+        if subtasks.is_file():
+            shutil.copy2(subtasks, cleaned.root / "meta/subtasks.parquet")
+
+        for position, (episode, start, end, remove) in enumerate(groups, 1):
+            if episode != position - 1:
+                raise ValueError("episode_index must be continuous from zero")
+            for index in np.arange(start, end)[~remove]:
+                item = source[int(index)]
+                if int(item["episode_index"].item()) != episode:
+                    raise ValueError(f"episode order mismatch at frame {index}")
+                cleaned.add_frame(writable_frame(item, cleaned.meta.features, automatic_features))
+            cleaned.save_episode(extra_episode_metadata=extras[episode] or None)
+            print(f"cleaned_episode={position}/{len(groups)}", end="\r", flush=True)
+        print()
+        cleaned.finalize()
+        verify_cleaned(
+            tmp,
+            dst.name,
+            expected_lengths,
+            source.meta.features,
+            source.meta.tasks,
+            extras,
+        )
+        tmp.rename(dst)
+        stage.rmdir()
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset", type=Path)
+    parser.add_argument("--threshold", type=float, default=0.01, help="max absolute per-joint delta (default: 0.01)")
+    parser.add_argument(
+        "--trim-tail",
+        action="store_true",
+        help="include the final similar run in the removal plan (default: preserve it)",
+    )
+    parser.add_argument("--report", type=Path, help="JSON report path")
+    parser.add_argument("--apply", action="store_true", help="create a cleaned copy; omitted means scan only")
+    parser.add_argument("--output", type=Path, help="cleaned dataset path (default: DATASET_cleaned)")
+    args = parser.parse_args()
+
+    if args.output and not args.apply:
+        parser.error("--output requires --apply")
+    if not np.isfinite(args.threshold) or args.threshold < 0:
+        parser.error("--threshold must be finite and non-negative")
+    root = args.dataset.resolve()
+    info_path = root / "meta/info.json"
+    if not info_path.is_file():
+        parser.error(f"not a LeRobot dataset: missing {info_path}")
+    files = sorted((root / "data").rglob("file-*.parquet"))
+    if not files:
+        parser.error(f"no data parquet files under {root / 'data'}")
+    data = pq.read_table(files, columns=["episode_index", "frame_index", "index", STATE_KEY])
+    if not len(data):
+        parser.error("dataset has no frames")
+    episode_indices = np.asarray(data["episode_index"])
+    frame_indices = np.asarray(data["frame_index"])
+    if not np.array_equal(np.asarray(data["index"]), np.arange(len(data))):
+        raise ValueError("global index is not continuous from zero")
+    states = np.asarray(data[STATE_KEY].to_pylist(), dtype=np.float64)
+    if states.ndim != 2 or not np.isfinite(states).all():
+        parser.error(f"{STATE_KEY} must be a finite 2-D numeric column")
+
+    bounds = np.r_[0, np.flatnonzero(episode_indices[1:] != episode_indices[:-1]) + 1, len(data)]
+    episodes = []
+    groups = []
+    for start, end in zip(bounds[:-1], bounds[1:], strict=True):
+        episode = int(episode_indices[start])
+        if not np.array_equal(frame_indices[start:end], np.arange(end - start)):
+            raise ValueError(f"episode {episode}: frame_index is not continuous from zero")
+        result, remove = scan_episode(episode, states[start:end], args.threshold, args.trim_tail)
+        groups.append((episode, int(start), int(end), remove))
+        if result:
+            episodes.append(result)
+
+    total_remove = sum(item["planned_remove_frames"] for item in episodes)
+    payload = {
+        "dataset": str(root),
+        "state_key": STATE_KEY,
+        "metric": "max(abs(frame_state - run_first_state)) <= threshold",
+        "scope": "contiguous similar-state runs only",
+        "threshold": args.threshold,
+        "trim_tail": args.trim_tail,
+        "total_episodes": len(bounds) - 1,
+        "episodes_with_similar_runs": len(episodes),
+        "episodes_with_planned_removals": sum(item["planned_remove_frames"] > 0 for item in episodes),
+        "planned_remove_frames": total_remove,
+        "episodes": episodes,
+    }
+    suffix = "trim_tail" if args.trim_tail else "keep_tail"
+    report = args.report or root.with_name(f"{root.name}_similar_frames_{suffix}.json")
+    report.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"episodes={payload['total_episodes']} similar={len(episodes)} "
+        f"planned_remove_frames={total_remove} trim_tail={args.trim_tail}"
+    )
+    print(f"threshold={args.threshold:g} metric=L_inf state={STATE_KEY}")
+    print(f"report={report}")
+    if args.apply:
+        output = (args.output or root.with_name(root.name + "_cleaned")).resolve()
+        apply_cleaning(root, output, groups)
+        print(f"cleaned_dataset={output}")
+
+
+if __name__ == "__main__":
+    sample = np.array([[0.0], [0.0], [1.0], [1.0], [1.0], [2.0], [2.0]])
+    assert similar_runs(sample, 0) == [(0, 1), (2, 4), (5, 6)]
+    result, removed = scan_episode(0, sample, 0, False)
+    assert removed.tolist() == [True, False, True, True, False, False, False]
+    assert result["planned_remove_frames"] == int(removed.sum()) == 3
+    result, removed = scan_episode(0, sample, 0, True)
+    assert removed.tolist() == [True, False, True, True, False, True, False]
+    assert result["planned_remove_frames"] == int(removed.sum()) == 4
+    main()

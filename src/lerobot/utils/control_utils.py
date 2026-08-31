@@ -303,12 +303,20 @@ def init_keyboard_listener(
                 if key == keyboard.Key.right:
                     print("Right arrow key pressed. Exiting loop...")
                     events["exit_early"] = True
-                elif key == keyboard.Key.left:
-                    print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                # elif key == keyboard.Key.left:
+                #     print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                #     events["rerecord_episode"] = True
+                #     events["exit_early"] = True
+                # elif key == keyboard.Key.esc:
+                #     print("Escape key pressed. Stopping data recording...")
+                #     events["stop_recording"] = True
+                #     events["exit_early"] = True
+                elif (getattr(key, "char", None) or "").lower() == "a":
+                    print("'A' key pressed. Exiting loop and rerecord the last episode...")
                     events["rerecord_episode"] = True
                     events["exit_early"] = True
-                elif key == keyboard.Key.esc:
-                    print("Escape key pressed. Stopping data recording...")
+                elif (getattr(key, "char", None) or "").lower() == "c":
+                    print("'C' key pressed. Stopping data recording...")
                     events["stop_recording"] = True
                     events["exit_early"] = True
                 elif hasattr(key, "char") and key.char and key.char.lower() == intervention_toggle_key.lower():

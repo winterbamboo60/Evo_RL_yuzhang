@@ -188,6 +188,7 @@ def record_loop(
     communication_retry_interval_s: float = 0.1,
     event_config: EventConfig | None = None,
     episode_events: list[dict] | None = None,
+    dataset_features: dict[str, dict] | None = None,
 ) -> RobotAction | None:
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -239,10 +240,11 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    if dataset is None and policy is not None:
-        raise ValueError("Policy-driven recording requires a dataset for feature mapping.")
+    feature_mapping = dataset.features if dataset is not None else dataset_features
+    if feature_mapping is None and policy is not None:
+        raise ValueError("Policy execution requires a dataset or `dataset_features` for feature mapping.")
 
-    action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
+    action_feature_names = feature_mapping[ACTION]["names"] if feature_mapping is not None else None
     if action_feature_names is None:
         if hasattr(robot.action_features, "keys"):
             action_feature_names = list(robot.action_features.keys())
@@ -393,8 +395,11 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        observation_frame = (
+            build_dataset_frame(feature_mapping, obs_processed, prefix=OBS_STR)
+            if feature_mapping is not None
+            else {}
+        )
 
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
@@ -419,7 +424,7 @@ def record_loop(
                 cond_runtime_state=cond_policy_runtime_state,
                 uncond_runtime_state=uncond_policy_runtime_state,
             )
-            act_processed_policy = make_robot_action(policy_action, dataset.features)
+            act_processed_policy = make_robot_action(policy_action, feature_mapping)
             # logging.info("policy_action: %s \n act_processed_policy: %s", policy_action, act_processed_policy)
 
 

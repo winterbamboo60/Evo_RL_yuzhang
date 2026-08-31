@@ -6,7 +6,7 @@ import torch
 
 from lerobot.configs.train import ActorOnlyConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.onlineRL_evoRL.actor import ActorEpisodeWriter
+from lerobot.onlineRL_evoRL.actor_new import ActorEpisodeWriter
 from lerobot.onlineRL_evoRL.compact_transition import make_compact_episode
 from lerobot.onlineRL_evoRL.gym_manipulator import (
     RobotEnv,

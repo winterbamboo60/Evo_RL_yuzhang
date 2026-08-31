@@ -1,4 +1,6 @@
 {
+  "actor_mode": "online_actor",
+  "save_format": "transition",
   "dataset": {
     "repo_id": "local_data",
     "root": "/home/hpc/yuzhang/datasets/cup_catch_v2_merged_checked"
@@ -37,8 +39,8 @@
           "fps": 30
         },
         "top": {
-          "type": "opencv",
-          "index_or_path": "12",
+          "type": "intelrealsense",
+          "serial_number_or_name": "260522273666",
           "width": 640,
           "height": 480,
           "fps": 30
@@ -121,8 +123,8 @@
     "push_to_hub": false,
     "repo_id": "local_policy_model"
   },
-  "output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_transition/ouput",
-  "job_name": "pi05_base_cup_catch_v2_0819_25k_actor_actorOnly_transition",
+  "output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_onlineRL_transition/ouput",
+  "job_name": "pi05_base_cup_catch_v2_0819_25k_actor_onlineRL_transition",
   "resume": false,
   "seed": 1000,
   "batch_size": 32,

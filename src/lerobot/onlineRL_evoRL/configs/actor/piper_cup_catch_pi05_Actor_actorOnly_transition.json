@@ -1,4 +1,6 @@
 {
+  "actor_mode": "vla_only",
+  "save_format": "transition",
   "dataset": {
     "repo_id": "local_data",
     "root": "/home/hpc/yuzhang/datasets/cup_catch_v2_merged_checked"
@@ -141,14 +143,14 @@
     "reload_on_episode_boundary": true
   },
   "actor_only": {
-    "enabled": false,
+    "enabled": true,
     "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_transition/episodes",
     "save_episode_images": true,
     "save_episode_viewer": true,
     "save_format": "transition"
   },
   "online_transition": {
-    "enabled": true,
+    "enabled": false,
     "save_local_copy": true,
     "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_onlineRL_transition/episodes",
     "feature_batch_size": 8

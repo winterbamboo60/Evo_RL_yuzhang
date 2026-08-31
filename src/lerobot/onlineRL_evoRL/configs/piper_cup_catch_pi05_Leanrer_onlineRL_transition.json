@@ -11,6 +11,7 @@
     "tokenizer_name": "/home/hpc/models/paligemma-3b-pt-224",
     "device": "cuda",
     "storage_device": "cpu",
+    "offload_to_cpu_while_waiting": true,
     "dtype": "bfloat16",
     "use_rlt": true,
     "chunk_size": 50,

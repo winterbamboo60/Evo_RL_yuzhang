@@ -298,6 +298,7 @@ class PI05OnlineRLConfig(PreTrainedConfig):
     online_buffer_capacity: int = 100_000
     online_updates_per_episode: int = 100
     online_only_after_initialization: bool = False
+    offload_to_cpu_while_waiting: bool = False
     actor_update_interval: int = 1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4

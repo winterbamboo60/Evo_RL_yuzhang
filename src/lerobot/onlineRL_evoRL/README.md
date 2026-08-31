@@ -1,6 +1,6 @@
 # onlineRL_evoRL 使用说明
 
-`onlineRL_evoRL` 现在只有一个正式采集入口：`actor.py`。它合并了原 `actor.py` 的环境、人工介入、保存与 gRPC 流程，以及原 `actor_2.py` 的 PI05 Online Actor head、`B` 切换和 task 热键。`actor_2.py` 仅保留旧命令/导入兼容，不再有独立实现。
+`onlineRL_evoRL` 的新正式采集入口是 `actor_new.py`，它直接包含环境、人工介入、保存、gRPC、PI05 Online Actor head、`B` 切换和 task 热键；`actor.py` 与 `actor_old.py` 保持不变。
 
 顶层 `actor_mode` 和 `save_format` 决定运行方式：
 
@@ -68,6 +68,16 @@ cd /home/hpc/yuzhang/Evo-RL-loop-0817
 python -m lerobot.onlineRL_evoRL.learner \
   --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json
 ```
+
+断点重启
+```bash
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+cd /home/hpc/yuzhang/Evo-RL-loop-0817
+python -m lerobot.onlineRL_evoRL.learner \
+  --config_path=/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/learner_output/checkpoints/last/pretrained_model/train_config.json \
+  --resume=true
+```
+
 
 配置文件是基准值；需要临时实验时，可在命令行用同名参数覆盖。参数统一使用 `--参数=值`，布尔值使用小写 `true/false`：
 
@@ -195,6 +205,7 @@ PI0.5/RLT 骨干在本 learner 中被冻结；日志里的 `bc_loss` 下降表�
 | --- | ---: | --- |
 | `policy.device` | `cuda` | 冻结骨干、Actor/Critic 和计算 batch 所在设备。 |
 | `policy.storage_device` | `cpu` | online replay 特征的存储设备。保持 `cpu` 可避免 replay 长期占用显存。 |
+| `policy.offload_to_cpu_while_waiting` | `true`（默认 `false`） | 为 `true` 时，没有待执行的在线更新会将模型和 Adam 动量迁到 CPU，并在收到新数据后恢复到 `policy.device`。这会增加 CPU 内存占用和恢复训练延迟；CUDA context 仍可能保留少量显存。 |
 | `policy.dtype` | `bfloat16` | 骨干计算精度；当前只接受 `bfloat16` 或 `float32`，不能写 `float16`。 |
 | `dataset.streaming` | `false` | 当前 PI05 learner 强制要求 `false`。 |
 | `policy.tokenizer_name` | 本地目录 | PaliGemma tokenizer 资产路径；离线机器必须提前准备本地文件。 |
@@ -274,8 +285,8 @@ policy_postprocessor.json
 启动入口固定为：
 
 ```bash
-python -m lerobot.onlineRL_evoRL.actor \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/<actor-config>.json
+python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path=src/lerobot/onlineRL_evoRL/configs/actor/<actor-config>.json
 ```
 
 配置矩阵：
@@ -291,13 +302,13 @@ python -m lerobot.onlineRL_evoRL.actor \
 在线模式参考配置：
 
 ```bash
-src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_onlineRL_transition.json
+src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_onlineRL_transition.json
 
 
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_onlineRL_transition.json
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_onlineRL_transition.json
 ```
 
 它还需要：`policy.type=pi05_online_rl`、与 learner 相同的 `policy.pretrained_path` 和 `dataset.root`、有效的 `actor_checkpoint_path`，以及一致的 learner host/port。Actor checkpoint 可指向 learner 输出根目录、checkpoint 目录或具体的 `actor_critic.pt`/`model.safetensors`。
@@ -329,8 +340,8 @@ cd /home/hpc/yuzhang/Evo-RL-loop-0817
 
 ```bash
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_actorOnly_transition.json
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_actorOnly_transition.json
 ```
 
 输出目录可以已经存在；重新启动时会从现有最大 episode 编号继续写入。保存结构：
@@ -368,8 +379,8 @@ done/truncated、action、state、介入状态和 VLA checkpoint 信息。
 
 ```bash
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor \
-  --config_path src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Actor_actorOnly_lerobot.json
+/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_actorOnly_lerobot.json
 ```
 
 `lerobot` 方式要求 `episode_output_dir` 在启动时不存在，因此每次新建数据集应使用新目录；
@@ -533,7 +544,7 @@ raw robot observation + env.task -> VLA predict_action -> action processor -> en
 
 ```bash
 /home/yz/projects/env/package_sorting_env/bin/python - <<'PY'
-from lerobot.onlineRL_evoRL import actor  # noqa: F401
+from lerobot.onlineRL_evoRL import actor_new  # noqa: F401
 from lerobot.configs.train import TrainRLServerPipelineConfig
 cfg = TrainRLServerPipelineConfig.from_pretrained(
     '/home/yz/projects/Evo-RL-loop-0810/src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json'

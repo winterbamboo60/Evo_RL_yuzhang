@@ -15,6 +15,7 @@ from lerobot.policies.pi05_onlineRL.configuration_pi05_online_rl import PI05Onli
 from lerobot.policies.pi05_onlineRL.learner import (
     _add_compact_episode,
     _build_offline_batch,
+    _move_training_state,
     _offline_annotations,
     _online_batch_sizes,
     _training_phase,
@@ -96,6 +97,8 @@ def test_offline_batch_builds_reward_intervention_and_masks():
 
 def test_compact_episode_round_trip_and_replay_insert(tmp_path):
     class Replay:
+        storage_device = "cpu"
+
         def __init__(self):
             self.items = []
 
@@ -105,7 +108,7 @@ def test_compact_episode_round_trip_and_replay_insert(tmp_path):
     policy = SimpleNamespace(
         config=SimpleNamespace(
             pretrained_path="/tmp/base",
-            device="cpu",
+            device="cuda",
             z_dim=2,
             proprio_dim=7,
             chunk_size=2,
@@ -156,6 +159,9 @@ def test_pi05_online_rl_step_parameters_are_unambiguous():
     assert config.online_steps == 1_000_000
     assert config.online_updates_per_episode == 100
     assert config.online_only_after_initialization is False
+    assert config.offload_to_cpu_while_waiting is False
+    enabled = PI05OnlineRLConfig(offload_to_cpu_while_waiting=True)
+    assert enabled.offload_to_cpu_while_waiting is True
     assert config.actor_update_interval == 1
     assert not hasattr(config, "max_actor_interaction_steps")
     assert not hasattr(config, "offline_buffer_capacity")
@@ -166,6 +172,27 @@ def test_two_stage_training_schedule():
     assert _training_phase(199, offline_steps=200, online_budget=0) == "offline_initialization"
     assert _training_phase(200, offline_steps=200, online_budget=0) is None
     assert _training_phase(200, offline_steps=200, online_budget=100) == "online"
+
+
+def test_training_state_device_round_trip():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy = torch.nn.Linear(2, 1).to(device)
+    optimizer = torch.optim.Adam(policy.parameters())
+    policy(torch.ones(1, 2, device=device)).sum().backward()
+    optimizer.step()
+    step_device = optimizer.state[policy.weight]["step"].device
+
+    _move_training_state(policy, {"actor": optimizer}, "cpu")
+    assert policy.weight.device.type == "cpu"
+    assert optimizer.state[policy.weight]["exp_avg"].device.type == "cpu"
+    assert optimizer.state[policy.weight]["step"].device == step_device
+
+    _move_training_state(policy, {"actor": optimizer}, device)
+    optimizer.zero_grad()
+    policy(torch.ones(1, 2, device=device)).sum().backward()
+    optimizer.step()
+    assert policy.weight.device == device
+    assert optimizer.state[policy.weight]["exp_avg"].device == device
 
 
 def test_online_phase_batch_composition():

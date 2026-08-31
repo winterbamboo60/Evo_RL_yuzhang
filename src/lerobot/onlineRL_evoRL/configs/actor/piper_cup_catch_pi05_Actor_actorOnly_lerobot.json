@@ -1,4 +1,6 @@
 {
+  "actor_mode": "vla_only",
+  "save_format": "lerobot",
   "dataset": {
     "repo_id": "local_data",
     "root": "/home/hpc/yuzhang/datasets/cup_catch_v2_merged_checked"
@@ -37,8 +39,8 @@
           "fps": 30
         },
         "top": {
-          "type": "opencv",
-          "index_or_path": "12",
+          "type": "intelrealsense",
+          "serial_number_or_name": "260522273666",
           "width": 640,
           "height": 480,
           "fps": 30
@@ -121,8 +123,8 @@
     "push_to_hub": false,
     "repo_id": "local_policy_model"
   },
-  "output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_transition/ouput",
-  "job_name": "pi05_base_cup_catch_v2_0819_25k_actor_actorOnly_transition",
+  "output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_lerobot/ouput",
+  "job_name": "pi05_base_cup_catch_v2_0819_25k_actor_actorOnly_lerobot",
   "resume": false,
   "seed": 1000,
   "batch_size": 32,
@@ -141,14 +143,14 @@
     "reload_on_episode_boundary": true
   },
   "actor_only": {
-    "enabled": false,
-    "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_transition/episodes",
+    "enabled": true,
+    "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_actorOnly_lerobot/episodes",
     "save_episode_images": true,
     "save_episode_viewer": true,
-    "save_format": "transition"
+    "save_format": "lerobot"
   },
   "online_transition": {
-    "enabled": true,
+    "enabled": false,
     "save_local_copy": true,
     "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/actor_onlineRL_transition/episodes",
     "feature_batch_size": 8

@@ -147,10 +147,10 @@ from lerobot.utils.visualization_utils import init_rerun
 
 
 # Default home pose for piper arms, mirroring src/lerobot/reset.py: all six joints at 0 via raw
-# JointCtrl (bypassing calibration), gripper opened, so leader + follower land on the same
+# JointCtrl (bypassing calibration), gripper closed, so leader + follower land on the same
 # hardware home regardless of their individual calibration.
 _PIPER_HOME_JOINTS = (0, 0, 0, 0, 0, 0)
-_PIPER_HOME_GRIPPER = 70000
+_PIPER_HOME_GRIPPER = 0
 _PIPER_HOME_SPEED = 50
 # 第一个 episode 启动归位用更低的 MotionCtrl 速率（百分比），现场可能无人值守，慢速更安全。
 _PIPER_HOME_SLOW_SPEED = 20
@@ -161,7 +161,7 @@ _PIPER_HOME_SMOOTH_DURATION_S = 4.0
 _PIPER_HOME_SMOOTH_STEP_DT_S = 0.02
 # 用户显式按 ← 要求重录时，不立刻开始下一次记录，而是先等待这么多秒，
 # 给操作者复位/准备的时间，并在命令行做整秒倒计时提示。
-_RERECORD_DELAY_S = 1.0
+_RERECORD_DELAY_S = 2.0
 
 
 def _countdown_before_rerecord(delay_s: float, play_sounds: bool) -> None:
@@ -177,8 +177,8 @@ def _countdown_before_rerecord(delay_s: float, play_sounds: bool) -> None:
 def _home_piper_arm(arm, speed: int = _PIPER_HOME_SPEED) -> None:
     # Position-velocity mode (mit_mode=0x00) + raw zero joints, exactly like reset.py.
     arm.MotionCtrl_2(0x01, 0x01, speed, 0x00)
-    arm.JointCtrl(*_PIPER_HOME_JOINTS)
     arm.GripperCtrl(_PIPER_HOME_GRIPPER, 1000, 0x01, 0)
+    arm.JointCtrl(*_PIPER_HOME_JOINTS)
 
 
 def _home_leader_arm_smooth(
@@ -195,6 +195,7 @@ def _home_leader_arm_smooth(
     的平滑慢速归位；整体时长由 duration_s 决定，与模式无关。函数阻塞约 duration_s 秒后返回。
     """
     goal = list(_PIPER_HOME_JOINTS)
+    arm.GripperCtrl(_PIPER_HOME_GRIPPER, 1000, 0x01, 0)
     start, _ = _read_arm_raw_joints(arm)
     steps = max(int(duration_s / step_dt_s), 1)
     for s in range(1, steps + 1):
@@ -380,7 +381,8 @@ class RecordConfig:
     # Whether to capture episode-level success/failure labels from keyboard.
     enable_episode_outcome_labeling: bool = False
     # Keyboard key to mark the current episode as success and end it.
-    episode_success_key: str = "s"
+    # episode_success_key: str = "s"
+    episode_success_key: str = "b"
     # Keyboard key to mark the current episode as failure and end it.
     episode_failure_key: str = "f"
     # Optional keyboard key that aborts the current episode, drives the arms back to the stored
