@@ -15,18 +15,26 @@
 """Core recording loop used by `lerobot_record.py`."""
 
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from copy import deepcopy
 from typing import Any, TypeVar
 
 import numpy as np
+import torch
 
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import build_dataset_frame
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import make_robot_action
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.latency_tracker import LatencyTracker
+from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -156,6 +164,143 @@ def _postprocess_policy_action(
     return action
 
 
+class _RTCActionChunkRunner:
+    """Generate RTC chunks on one worker while the main loop consumes the current chunk."""
+
+    def __init__(
+        self,
+        *,
+        policy: PreTrainedPolicy,
+        preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+        postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+        rtc: RTCConfig,
+        fps: int,
+        queue_threshold: int,
+        task: str | None,
+        robot_type: str | None,
+    ) -> None:
+        self.policy = policy
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+        self.rtc = rtc
+        self.fps = fps
+        self.queue_threshold = queue_threshold
+        self.task = task
+        self.robot_type = robot_type
+        self.device = get_safe_torch_device(policy.config.device)
+        self.action_queue = ActionQueue(rtc)
+        self.latency_tracker = LatencyTracker()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-inference")
+        self.future: Future[tuple[torch.Tensor, torch.Tensor, float]] | None = None
+        self.future_generation = 0
+        self.action_index_before_inference = 0
+        self.generation = 0
+        self.closed = False
+
+    def _infer_chunk(
+        self,
+        observation_frame: dict[str, np.ndarray],
+        inference_delay: int,
+        previous_actions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        started_at = time.perf_counter()
+        amp_context = (
+            torch.autocast(device_type=self.device.type)
+            if self.device.type == "cuda" and self.policy.config.use_amp
+            else nullcontext()
+        )
+        with torch.no_grad(), amp_context:
+            observation = prepare_observation_for_inference(
+                observation_frame, self.device, self.task, self.robot_type
+            )
+            observation = self.preprocessor(observation)
+            actions = self.policy.predict_action_chunk(
+                observation,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=previous_actions,
+            )
+            original_actions = actions.squeeze(0).detach().clone()
+            processed_actions = self.postprocessor(actions).squeeze(0).detach().clone()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        return original_actions, processed_actions, time.perf_counter() - started_at
+
+    def _start_inference(self, observation_frame: dict[str, np.ndarray]) -> None:
+        previous_actions = self.action_queue.get_left_over()
+        if previous_actions is not None:
+            previous_actions = previous_actions.detach().clone()
+        inference_delay = math.ceil((self.latency_tracker.max() or 0.0) * self.fps)
+        self.future_generation = self.generation
+        self.action_index_before_inference = self.action_queue.get_action_index()
+        self.future = self.executor.submit(
+            self._infer_chunk,
+            deepcopy(observation_frame),
+            inference_delay,
+            previous_actions,
+        )
+
+    def _collect_inference(self, *, wait: bool = False) -> None:
+        future = self.future
+        if future is None or (not wait and not future.done()):
+            return
+
+        generation = self.future_generation
+        action_index_before_inference = self.action_index_before_inference
+        try:
+            original_actions, processed_actions, latency = future.result()
+        except Exception:
+            self.future = None
+            if generation != self.generation:
+                logging.warning("Discarding a failed stale RTC inference.", exc_info=True)
+                return
+            raise
+        self.future = None
+
+        if generation != self.generation:
+            return
+
+        real_delay = self.action_queue.get_action_index() - action_index_before_inference
+        self.action_queue.merge(
+            original_actions,
+            processed_actions,
+            real_delay,
+            action_index_before_inference,
+        )
+        self.latency_tracker.add(latency)
+
+    def get_action(self, observation_frame: dict[str, np.ndarray]) -> torch.Tensor:
+        self._collect_inference()
+        if self.action_queue.qsize() <= self.queue_threshold and self.future is None:
+            self._start_inference(observation_frame)
+
+        action = self.action_queue.get()
+        if action is None:
+            self._collect_inference(wait=True)
+            action = self.action_queue.get()
+        if action is None:
+            raise RuntimeError(
+                "RTC action queue is empty after inference; increase the queue threshold or chunk size."
+            )
+        return action.unsqueeze(0)
+
+    def invalidate(self) -> None:
+        """Drop queued/stale results without touching a possibly running policy inference."""
+        self.generation += 1
+        self.action_queue = ActionQueue(self.rtc)
+        self.latency_tracker.reset()
+
+    def wait_for_idle(self) -> None:
+        self._collect_inference(wait=True)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.invalidate()
+        self.wait_for_idle()
+        self.executor.shutdown(wait=True)
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -184,6 +329,8 @@ def record_loop(
     collector_policy_id_policy: str = "policy",
     collector_policy_id_human: str = "human",
     acp_inference: ACPInferenceConfig | None = None,
+    rtc: RTCConfig | None = None,
+    rtc_action_queue_threshold: int = 32,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
     event_config: EventConfig | None = None,
@@ -192,6 +339,16 @@ def record_loop(
 ) -> RobotAction | None:
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
+    rtc_enabled = rtc is not None and rtc.enabled
+    if rtc_enabled:
+        if policy is None or preprocessor is None or postprocessor is None:
+            raise ValueError("`rtc.enabled=true` requires a policy and its processors.")
+        if acp_inference.enable:
+            raise ValueError("RTC and ACP inference cannot be enabled at the same time.")
+        if rtc.execution_horizon <= 0:
+            raise ValueError("`rtc.execution_horizon` must be > 0.")
+        if rtc_action_queue_threshold < 0:
+            raise ValueError("`rtc_action_queue_threshold` must be >= 0.")
 
     # Per-episode quality events, each shaped {"step": <frame_index>, "event": <event_name>}.
     # The set of events and their hotkeys is described by `event_config` (loaded from a JSON file).
@@ -290,6 +447,21 @@ def record_loop(
         postprocessor.reset()
         policy_action_smoother.reset()
 
+    rtc_runner = (
+        _RTCActionChunkRunner(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            rtc=rtc,
+            fps=fps,
+            queue_threshold=rtc_action_queue_threshold,
+            task=single_task,
+            robot_type=robot.robot_type,
+        )
+        if rtc_enabled
+        else None
+    )
+
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
     if policy is not None and acp_inference.enable and acp_inference.use_cfg:
@@ -347,253 +519,267 @@ def record_loop(
     ended_by_event = False
     # 录制时长由调用方传入的 control_time_s（即 --dataset.episode_time_s）决定；为 None 时不限时长，
     # 仅靠键盘事件结束。达到 control_time_s 后正常退出循环 -> 下方标记为 episode_timeout。
-    while control_time_s is None or timespent < control_time_s:
-        start_loop_t = time.perf_counter()
+    try:
+        while control_time_s is None or timespent < control_time_s:
+            start_loop_t = time.perf_counter()
 
-        if events["exit_early"]:
-            events["exit_early"] = False
-            ended_by_event = True
-            break
+            if events["exit_early"]:
+                events["exit_early"] = False
+                ended_by_event = True
+                break
 
-        if events.get("toggle_intervention", False):
-            events["toggle_intervention"] = False
-            if intervention_enabled:
-                if intervention_state == INTERVENTION_STATE_POLICY:     # 开始接管
-                    intervention_state = INTERVENTION_STATE_ACTIVE
-                    set_teleop_manual_control(True)
-                    logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
-                else:                                                   # 结束接管
-                    if last_robot_action_to_send is None:
-                        logging.warning(
-                            "Cannot release intervention before an action has been sent to the robot."
+            if events.get("toggle_intervention", False):
+                events["toggle_intervention"] = False
+                if intervention_enabled:
+                    if intervention_state == INTERVENTION_STATE_POLICY:     # 开始接管
+                        intervention_state = INTERVENTION_STATE_ACTIVE
+                        if rtc_runner is not None:
+                            rtc_runner.invalidate()
+                        set_teleop_manual_control(True)
+                        logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
+                    else:                                                   # 结束接管
+                        if last_robot_action_to_send is None:
+                            logging.warning(
+                                "Cannot release intervention before an action has been sent to the robot."
+                            )
+                            continue
+                        run_with_connection_retry(
+                            "teleop.send_feedback",
+                            lambda action=last_robot_action_to_send: teleop_arm_for_mode_switch.send_feedback(
+                                action
+                            ),
                         )
-                        continue
-                    run_with_connection_retry(
-                        "teleop.send_feedback",
-                        lambda action=last_robot_action_to_send: teleop_arm_for_mode_switch.send_feedback(
-                            action
-                        ),
+                        intervention_state = INTERVENTION_STATE_RELEASE
+                        if rtc_runner is not None:
+                            rtc_runner.wait_for_idle()
+                        if policy is not None and preprocessor is not None and postprocessor is not None:
+                            policy.reset()
+                            preprocessor.reset()
+                            postprocessor.reset()
+                            policy_action_smoother.reset()
+                            if acp_inference.enable and acp_inference.use_cfg:
+                                cond_policy_runtime_state = _capture_policy_runtime_state(policy)
+                                uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
+                        if rtc_runner is not None:
+                            rtc_runner.invalidate()
+                        if policy is not None and preprocessor is not None and postprocessor is not None:
+                            logging.info("Policy cache reset on release: next policy action is recomputed.")
+                        logging.info("Intervention release requested (S2): returning control to policy.")
+                else:
+                    logging.info("Intervention toggle ignored because policy+teleop are not both active.")
+
+            # Get robot observation
+            obs = robot.get_observation()
+
+            # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+            obs_processed = robot_observation_processor(obs)
+
+            observation_frame = (
+                build_dataset_frame(feature_mapping, obs_processed, prefix=OBS_STR)
+                if feature_mapping is not None
+                else {}
+            )
+
+            # Get action from policy and/or teleop
+            act_processed_policy: RobotAction | None = None
+            act_processed_teleop: RobotAction | None = None
+            # logging.info(f"Loop start: intervention_state={intervention_state}, policy={'on' if policy else 'off'}, teleop={'on' if teleop else 'off'}")
+            if (
+                policy is not None
+                and preprocessor is not None
+                and postprocessor is not None
+                and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 没接管
+            ):
+                if rtc_runner is None:
+                    policy_action = _predict_policy_action_with_acp_inference(
+                        observation_frame=observation_frame,
+                        policy=policy,
+                        device=get_safe_torch_device(policy.config.device),
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        use_amp=policy.config.use_amp,
+                        task=single_task,
+                        robot_type=robot.robot_type,
+                        acp_inference=acp_inference,
+                        cond_runtime_state=cond_policy_runtime_state,
+                        uncond_runtime_state=uncond_policy_runtime_state,
                     )
-                    intervention_state = INTERVENTION_STATE_RELEASE
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
-                        policy.reset()
-                        preprocessor.reset()
-                        postprocessor.reset()
-                        policy_action_smoother.reset()
-                        if acp_inference.enable and acp_inference.use_cfg:
-                            cond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                            uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
-                        logging.info("Policy cache reset on release: next policy action is recomputed.")
-                    logging.info("Intervention release requested (S2): returning control to policy.")
-            else:
-                logging.info("Intervention toggle ignored because policy+teleop are not both active.")
-
-        # Get robot observation
-        obs = robot.get_observation()
-
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-        obs_processed = robot_observation_processor(obs)
-
-        observation_frame = (
-            build_dataset_frame(feature_mapping, obs_processed, prefix=OBS_STR)
-            if feature_mapping is not None
-            else {}
-        )
-
-        # Get action from policy and/or teleop
-        act_processed_policy: RobotAction | None = None
-        act_processed_teleop: RobotAction | None = None
-        # logging.info(f"Loop start: intervention_state={intervention_state}, policy={'on' if policy else 'off'}, teleop={'on' if teleop else 'off'}")
-        if (
-            policy is not None
-            and preprocessor is not None
-            and postprocessor is not None
-            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 没接管
-        ):
-            policy_action = _predict_policy_action_with_acp_inference(
-                observation_frame=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-                acp_inference=acp_inference,
-                cond_runtime_state=cond_policy_runtime_state,
-                uncond_runtime_state=uncond_policy_runtime_state,
-            )
-            act_processed_policy = make_robot_action(policy_action, feature_mapping)
-            # logging.info("policy_action: %s \n act_processed_policy: %s", policy_action, act_processed_policy)
+                else:
+                    policy_action = rtc_runner.get_action(observation_frame)
+                act_processed_policy = make_robot_action(policy_action, feature_mapping)
+                # logging.info("policy_action: %s \n act_processed_policy: %s", policy_action, act_processed_policy)
 
 
 
-        if isinstance(teleop, Teleoperator):
-            act = run_with_connection_retry("teleop.get_action", teleop.get_action)
+            if isinstance(teleop, Teleoperator):
+                act = run_with_connection_retry("teleop.get_action", teleop.get_action)
 
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
+                # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+                act_processed_teleop = teleop_action_processor((act, obs))
 
-        elif isinstance(teleop, list):
-            arm_action = run_with_connection_retry("teleop_arm.get_action", teleop_arm.get_action)
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
+            elif isinstance(teleop, list):
+                arm_action = run_with_connection_retry("teleop_arm.get_action", teleop_arm.get_action)
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
 
-        if act_processed_policy is None and act_processed_teleop is None:
-            logging.info(
-                "No policy or teleoperator provided, skipping action generation."
-                "This is likely to happen when resetting the environment without a teleop device."
-                "The robot won't be at its rest position at the start of the next episode."
-            )
-            continue
-
-        if act_processed_teleop is not None:
-            last_teleop_action = act_processed_teleop
-            teleop_fallback_warned = False
-
-        policy_action_for_storage = (
-            act_processed_policy if act_processed_policy is not None else zero_policy_action
-        )
-
-        is_intervention = 0.0
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:  # 接管状态用主臂动作
-            is_intervention = 1.0
-            if act_processed_teleop is not None:
-                action_values = act_processed_teleop
-            elif last_teleop_action is not None:
-                action_values = last_teleop_action
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but no fresh teleop action is available; reusing last teleop action."
-                    )
-                    teleop_fallback_warned = True
-            elif act_processed_policy is not None:
-                action_values = act_processed_policy
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but teleop action is unavailable; falling back to policy action."
-                    )
-                    teleop_fallback_warned = True
-            else:
-                action_values = zero_policy_action
-                if not teleop_fallback_warned:
-                    logging.warning(
-                        "Intervention is active but no teleop/policy action is available; sending zero action."
-                    )
-                    teleop_fallback_warned = True
-        else:  # 未接管用推理动作
-            action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
-
-        # Applies a pipeline to the action, default is IdentityProcessor
-        # robot_action_to_send = robot_action_processor((action_values, obs))
-        # logging.info(f"robot_action_to_send: {robot_action_to_send}")
-
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
-        if policy_sync_executor is not None and selected_from_policy:  # 推理动作发给主臂和从臂
-            # 对 VLA 生成的动作做质量后处理（滑窗平滑 + 可选限位 + 夹爪非线性衰减），提高数据质量。
-            # 覆盖 action_values：既影响实际下发，也让数据集 action_frame 记录后处理后的动作。
-            # 夹爪非线性衰减在此处理（与 inference 一致）；send_action 不再二次衰减。
-            action_values = _postprocess_policy_action(
-                action_values,
-                policy_action_smoother,
-            )
-
-            # 按需求：VLA 生成动作时不再单独保留原始动作，complementary_info.policy_action
-            # 也记录平滑后的动作（训练直接用平滑后的动作作为目标）。
-            policy_action_for_storage = action_values
-
-            # Applies a pipeline to the action, default is IdentityProcessor
-            robot_action_to_send = robot_action_processor((action_values, obs))
-            # 需要在send_action中添加偏置【已完成】
-            # logging.info(f"将动作发给主臂+从臂")
-            _sent_action = run_with_connection_retry(
-                "policy_sync_executor.send_action",
-                lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
-                    robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
-                ),
-            )
-        else:  # 接管动作只发给从臂，一般由接管状态下主臂由teleop控制，不添加偏置
-            # Applies a pipeline to the action, default is IdentityProcessor
-            robot_action_to_send = robot_action_processor((action_values, obs))
-
-            # logging.info(f"将动作发给从臂")
-            _sent_action = run_with_connection_retry(
-                "robot.send_action",
-                lambda robot_action_to_send=robot_action_to_send: robot.send_action(
-                    robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
-                ),
-            )
-
-        # Keep the exact common-coordinate action that can1 accepted. It can be reused to move
-        # can0 out of manual/MIT mode without depending on potentially stale leader feedback.
-        last_robot_action_to_send = dict(robot_action_to_send)
-
-        # Write to dataset
-        if dataset is not None:
-            # Resolve quality events for the frame we are about to add. Its step equals the
-            # frame_index add_frame() will assign (the current episode buffer size).
-            active_events: set[str] = set()
-            if event_config is not None:
-                current_step = dataset.episode_buffer["size"] if dataset.episode_buffer is not None else 0
-                active_events = set(preseeded_events_by_step.get(current_step, set()))
-                # Consume the momentary hotkey markers and attribute them to this frame.
-                for event_name, marker_key in event_config.marker_keys.items():
-                    if events.get(marker_key, False):
-                        events[marker_key] = False
-                        active_events.add(event_name)
-                for event_name in active_events:
-                    pair = (current_step, event_name)
-                    if pair not in recorded_event_pairs:
-                        recorded_event_pairs.add(pair)
-                        episode_events.append({"step": current_step, "event": event_name})
-
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            policy_action_frame = build_dataset_frame(
-                dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
-            )
-            frame = {**observation_frame, **action_frame, **policy_action_frame, "task": single_task}
-
-            if "complementary_info.is_intervention" in dataset.features:
-                frame["complementary_info.is_intervention"] = np.array([is_intervention], dtype=np.float32)
-            if "complementary_info.state" in dataset.features:
-                frame["complementary_info.state"] = np.array([intervention_state], dtype=np.float32)
-            if "complementary_info.collector_policy_id" in dataset.features:
-                frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
-                    intervention_enabled=intervention_enabled,
-                    is_intervention=bool(is_intervention),
-                    selected_from_policy=selected_from_policy,
-                    policy_id=collector_policy_id_policy,
-                    human_id=collector_policy_id_human,
+            if act_processed_policy is None and act_processed_teleop is None:
+                logging.info(
+                    "No policy or teleoperator provided, skipping action generation."
+                    "This is likely to happen when resetting the environment without a teleop device."
+                    "The robot won't be at its rest position at the start of the next episode."
                 )
-            if event_features_present:
-                # Per-frame quality-event flags (0.0/1.0), always present so the frame stays
-                # schema-consistent for add_frame validation.
-                for feature, flag in event_config.flags(active_events).items():
-                    if feature in dataset.features:
-                        frame[feature] = flag
-            dataset.add_frame(frame)
+                continue
 
-        if display_data:
-            log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+            if act_processed_teleop is not None:
+                last_teleop_action = act_processed_teleop
+                teleop_fallback_warned = False
+
+            policy_action_for_storage = (
+                act_processed_policy if act_processed_policy is not None else zero_policy_action
             )
 
-        if intervention_state == INTERVENTION_STATE_RELEASE:
-            intervention_state = INTERVENTION_STATE_POLICY
+            is_intervention = 0.0
+            if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:  # 接管状态用主臂动作
+                is_intervention = 1.0
+                if act_processed_teleop is not None:
+                    action_values = act_processed_teleop
+                elif last_teleop_action is not None:
+                    action_values = last_teleop_action
+                    if not teleop_fallback_warned:
+                        logging.warning(
+                            "Intervention is active but no fresh teleop action is available; reusing last teleop action."
+                        )
+                        teleop_fallback_warned = True
+                elif act_processed_policy is not None:
+                    action_values = act_processed_policy
+                    if not teleop_fallback_warned:
+                        logging.warning(
+                            "Intervention is active but teleop action is unavailable; falling back to policy action."
+                        )
+                        teleop_fallback_warned = True
+                else:
+                    action_values = zero_policy_action
+                    if not teleop_fallback_warned:
+                        logging.warning(
+                            "Intervention is active but no teleop/policy action is available; sending zero action."
+                        )
+                        teleop_fallback_warned = True
+            else:  # 未接管用推理动作
+                action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
-        dt_s = time.perf_counter() - start_loop_t
-        precise_sleep(max(1 / fps - dt_s, 0.0))
-        # precise_sleep(max(1 / 20 - dt_s, 0.0))  # MM
+            # Applies a pipeline to the action, default is IdentityProcessor
+            # robot_action_to_send = robot_action_processor((action_values, obs))
+            # logging.info(f"robot_action_to_send: {robot_action_to_send}")
 
-        timespent = time.perf_counter() - start_episode_t
+            # Send action to robot
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+            # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+            selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
+            if policy_sync_executor is not None and selected_from_policy:  # 推理动作发给主臂和从臂
+                # 对 VLA 生成的动作做质量后处理（滑窗平滑 + 可选限位 + 夹爪非线性衰减），提高数据质量。
+                # 覆盖 action_values：既影响实际下发，也让数据集 action_frame 记录后处理后的动作。
+                # 夹爪非线性衰减在此处理（与 inference 一致）；send_action 不再二次衰减。
+                action_values = _postprocess_policy_action(
+                    action_values,
+                    policy_action_smoother,
+                )
+
+                # 按需求：VLA 生成动作时不再单独保留原始动作，complementary_info.policy_action
+                # 也记录平滑后的动作（训练直接用平滑后的动作作为目标）。
+                policy_action_for_storage = action_values
+
+                # Applies a pipeline to the action, default is IdentityProcessor
+                robot_action_to_send = robot_action_processor((action_values, obs))
+                # 需要在send_action中添加偏置【已完成】
+                # logging.info(f"将动作发给主臂+从臂")
+                _sent_action = run_with_connection_retry(
+                    "policy_sync_executor.send_action",
+                    lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
+                        robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                    ),
+                )
+            else:  # 接管动作只发给从臂，一般由接管状态下主臂由teleop控制，不添加偏置
+                # Applies a pipeline to the action, default is IdentityProcessor
+                robot_action_to_send = robot_action_processor((action_values, obs))
+
+                # logging.info(f"将动作发给从臂")
+                _sent_action = run_with_connection_retry(
+                    "robot.send_action",
+                    lambda robot_action_to_send=robot_action_to_send: robot.send_action(
+                        robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                    ),
+                )
+
+            # Keep the exact common-coordinate action that can1 accepted. It can be reused to move
+            # can0 out of manual/MIT mode without depending on potentially stale leader feedback.
+            last_robot_action_to_send = dict(robot_action_to_send)
+
+            # Write to dataset
+            if dataset is not None:
+                # Resolve quality events for the frame we are about to add. Its step equals the
+                # frame_index add_frame() will assign (the current episode buffer size).
+                active_events: set[str] = set()
+                if event_config is not None:
+                    current_step = dataset.episode_buffer["size"] if dataset.episode_buffer is not None else 0
+                    active_events = set(preseeded_events_by_step.get(current_step, set()))
+                    # Consume the momentary hotkey markers and attribute them to this frame.
+                    for event_name, marker_key in event_config.marker_keys.items():
+                        if events.get(marker_key, False):
+                            events[marker_key] = False
+                            active_events.add(event_name)
+                    for event_name in active_events:
+                        pair = (current_step, event_name)
+                        if pair not in recorded_event_pairs:
+                            recorded_event_pairs.add(pair)
+                            episode_events.append({"step": current_step, "event": event_name})
+
+                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                policy_action_frame = build_dataset_frame(
+                    dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
+                )
+                frame = {**observation_frame, **action_frame, **policy_action_frame, "task": single_task}
+
+                if "complementary_info.is_intervention" in dataset.features:
+                    frame["complementary_info.is_intervention"] = np.array([is_intervention], dtype=np.float32)
+                if "complementary_info.state" in dataset.features:
+                    frame["complementary_info.state"] = np.array([intervention_state], dtype=np.float32)
+                if "complementary_info.collector_policy_id" in dataset.features:
+                    frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
+                        intervention_enabled=intervention_enabled,
+                        is_intervention=bool(is_intervention),
+                        selected_from_policy=selected_from_policy,
+                        policy_id=collector_policy_id_policy,
+                        human_id=collector_policy_id_human,
+                    )
+                if event_features_present:
+                    # Per-frame quality-event flags (0.0/1.0), always present so the frame stays
+                    # schema-consistent for add_frame validation.
+                    for feature, flag in event_config.flags(active_events).items():
+                        if feature in dataset.features:
+                            frame[feature] = flag
+                dataset.add_frame(frame)
+
+            if display_data:
+                log_rerun_data(
+                    observation=obs_processed, action=action_values, compress_images=display_compressed_images
+                )
+
+            if intervention_state == INTERVENTION_STATE_RELEASE:
+                intervention_state = INTERVENTION_STATE_POLICY
+
+            dt_s = time.perf_counter() - start_loop_t
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+            # precise_sleep(max(1 / 20 - dt_s, 0.0))  # MM
+
+            timespent = time.perf_counter() - start_episode_t
+
+    finally:
+        if rtc_runner is not None:
+            rtc_runner.close()
 
     # The loop only breaks on a keyboard event; otherwise it ended by reaching the max recording
     # time. Signal this so the caller can mark the episode as failed and reset the arms.

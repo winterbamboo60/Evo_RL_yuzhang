@@ -68,7 +68,7 @@ class RealSenseCameraConfig(CameraConfig):
     warmup_s: int = 1
 
     # Change these defaults to tune all D405 cameras without changing launch commands.
-    exposure_mode: Literal["device_default", "auto", "manual"] = "manual"
+    exposure_mode: Literal["device_default", "auto", "manual"] = "device_default"
     manual_exposure_us: int = 20000
     manual_gain: int = 16
     auto_exposure_limit_us: int = 10000

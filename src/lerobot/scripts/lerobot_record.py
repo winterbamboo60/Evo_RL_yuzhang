@@ -83,6 +83,7 @@ from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_featur
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import make_default_processors
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
@@ -150,7 +151,7 @@ from lerobot.utils.visualization_utils import init_rerun
 # JointCtrl (bypassing calibration), gripper closed, so leader + follower land on the same
 # hardware home regardless of their individual calibration.
 _PIPER_HOME_JOINTS = (0, 0, 0, 0, 0, 0)
-_PIPER_HOME_GRIPPER = 0
+_PIPER_HOME_GRIPPER = 100000
 _PIPER_HOME_SPEED = 50
 # 第一个 episode 启动归位用更低的 MotionCtrl 速率（百分比），现场可能无人值守，慢速更安全。
 _PIPER_HOME_SLOW_SPEED = 20
@@ -358,6 +359,10 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
+    # Real-Time Chunking is opt-in; disabled keeps the original synchronous policy path.
+    rtc: RTCConfig = field(default_factory=lambda: RTCConfig(enabled=False, execution_horizon=25))
+    # Start the next background chunk inference when this many queued actions remain.
+    rtc_action_queue_threshold: int = 32
     # Display all cameras on screen
     display_data: bool = False
     # Display data on a remote Rerun server
@@ -459,6 +464,15 @@ class RecordConfig:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
         if self.acp_inference.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
+        if self.rtc.enabled:
+            if self.policy is None:
+                raise ValueError("`rtc.enabled=true` requires `policy` to be set.")
+            if self.acp_inference.enable:
+                raise ValueError("RTC and ACP inference cannot be enabled at the same time.")
+            if self.rtc.execution_horizon <= 0:
+                raise ValueError("`rtc.execution_horizon` must be > 0.")
+            if self.rtc_action_queue_threshold < 0:
+                raise ValueError("`rtc_action_queue_threshold` must be >= 0.")
         if self.communication_retry_timeout_s < 0:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
@@ -626,6 +640,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if cfg.acp_inference.enable and cfg.policy is None:
             raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
         if cfg.policy is not None:
+            if cfg.rtc.enabled:
+                supported_rtc_policies = {"smolvla", "pi0", "pi05", "pi05_online_rl"}
+                if cfg.policy.type not in supported_rtc_policies:
+                    raise ValueError(
+                        f"Policy type {cfg.policy.type!r} does not implement RTC guidance; "
+                        f"supported types: {sorted(supported_rtc_policies)}."
+                    )
+                init_rtc_processor = getattr(policy, "init_rtc_processor", None)
+                if not callable(init_rtc_processor):
+                    raise ValueError(f"Policy {getattr(policy, 'name', '<unknown>')} does not support RTC.")
+                policy.config.rtc_config = cfg.rtc
+                init_rtc_processor()
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
@@ -714,6 +740,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     collector_policy_id_policy=collector_policy_id_policy,
                     collector_policy_id_human=collector_policy_id_human,
                     acp_inference=cfg.acp_inference,
+                    rtc=cfg.rtc,
+                    rtc_action_queue_threshold=cfg.rtc_action_queue_threshold,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     event_config=event_config,

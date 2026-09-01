@@ -30,19 +30,19 @@
 #   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_left_row3 \
 #   --dataset.single_task "Grab the left cup" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 12
+#   --top_camera.index_or_path 10
 
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
 #   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_mid_row3_add1 \
 #   --dataset.single_task "Take the middle cup away" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 4
+#   --top_camera.index_or_path 10
 
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_right_row3 \
+#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0831_testNeedDelete \
 #   --dataset.single_task "Pick up the cup on the right" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 4
+#   --top_camera.index_or_path 10
 
 # Pick up the cup on the right
 # Take the middle cup away
@@ -94,11 +94,12 @@
 # source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 # cd /home/hpc/yuzhang/Evo-RL-loop-0817
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v4_merged_train0829_30k_test_needDelete \
+#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_sft_cup_catch_v4_merged_train0831_30k_test_needDelete \
 #   --dataset.single_task "Pick up the cup on the right" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 12 \
-#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v4_merged_train0829_30k
+#   --top_camera.index_or_path 261822305080 \
+#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_sft_cup_catch_v4_merged_train0831_30k \
+#   --rtc.enabled true
 
 
 # smovla_cup_catch_v4_merged_train0829_40k
@@ -134,10 +135,13 @@ set -e
 # ---------- 解析参数 ----------
 DATASET_ROOT=""
 SINGLE_TASK=""
-WRIST_CAM=""100
+WRIST_CAM=""
 TOP_CAM=""
 POLICY_PATH=""
 EVENT_CONFIG_PATH=""
+RTC_ENABLED="false"
+RTC_EXECUTION_HORIZON="25"
+RTC_ACTION_QUEUE_THRESHOLD="32"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dataset.root)
@@ -152,6 +156,12 @@ while [[ $# -gt 0 ]]; do
             POLICY_PATH="$2"; shift 2 ;;
         --event.config.path)
             EVENT_CONFIG_PATH="$2"; shift 2 ;;
+        --rtc.enabled)
+            RTC_ENABLED="$2"; shift 2 ;;
+        --rtc.execution_horizon)
+            RTC_EXECUTION_HORIZON="$2"; shift 2 ;;
+        --rtc_action_queue_threshold)
+            RTC_ACTION_QUEUE_THRESHOLD="$2"; shift 2 ;;
         *)
             echo "[错误] 未知参数：$1" >&2
             exit 1 ;;
@@ -167,6 +177,15 @@ MISSING=()
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "[错误] 缺少必填参数：${MISSING[*]}" >&2
+    exit 1
+fi
+
+if [[ "$RTC_ENABLED" != "true" && "$RTC_ENABLED" != "false" ]]; then
+    echo "[错误] --rtc.enabled 只能是 true 或 false：$RTC_ENABLED" >&2
+    exit 1
+fi
+if [[ "$RTC_ENABLED" == "true" && -z "$POLICY_PATH" ]]; then
+    echo "[错误] --rtc.enabled=true 必须同时提供 --policy.path" >&2
     exit 1
 fi
 
@@ -190,8 +209,12 @@ fi
 # ---------- 构建摄像头配置 ----------
 # CAMERAS="{wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}}"
 
-CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps:
+# CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps:
+#   30}}"
+
+CAMERAS="{wrist: {type: intelrealsense, serial_number_or_name: \"${WRIST_CAM}\", width: 640, height: 480, fps: 30, use_depth: false}, top: {type: intelrealsense, serial_number_or_name: ${TOP_CAM}, width: 640, height: 480, fps:
   30}}"
+
 
 # ---------- 构建命令 ----------
 CMD=(
@@ -225,6 +248,15 @@ fi
 # 若提供了策略模型路径则追加（启用人机协同模式）
 if [[ -n "$POLICY_PATH" ]]; then
     CMD+=("--policy.path=${POLICY_PATH}")
+fi
+
+# RTC 默认关闭；关闭时不向 Python 入口追加任何 RTC 参数，完整保留原执行路径。
+if [[ "$RTC_ENABLED" == "true" ]]; then
+    CMD+=(
+        --rtc.enabled=true
+        "--rtc.execution_horizon=${RTC_EXECUTION_HORIZON}"
+        "--rtc_action_queue_threshold=${RTC_ACTION_QUEUE_THRESHOLD}"
+    )
 fi
 
 # ---------- 执行 ----------
