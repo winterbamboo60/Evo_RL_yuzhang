@@ -103,6 +103,28 @@ from lerobot.utils.utils import (
 from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 
 
+def _safe_queue_size(queue: Queue) -> int:
+    try:
+        return queue.qsize()
+    except Exception:
+        return -1
+
+
+def _log_cuda_snapshot(prefix: str) -> None:
+    if not torch.cuda.is_available():
+        logging.info("[LEARNER][MEM] %s cuda unavailable", prefix)
+        return
+    logging.info(
+        "[LEARNER][MEM] %s allocated_mb=%.2f reserved_mb=%.2f max_allocated_mb=%.2f max_reserved_mb=%.2f",
+        prefix,
+        torch.cuda.memory_allocated() / (1024 * 1024),
+        torch.cuda.memory_reserved() / (1024 * 1024),
+        torch.cuda.max_memory_allocated() / (1024 * 1024),
+        torch.cuda.max_memory_reserved() / (1024 * 1024),
+    )
+
+
+
 @parser.wrap()
 def train_cli(cfg: TrainRLServerPipelineConfig):
     if not use_threads(cfg):
@@ -168,11 +190,15 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     is_threaded = use_threads(cfg)
     shutdown_event = ProcessSignalHandler(is_threaded, display_pid=display_pid).shutdown_event
 
-    start_learner_threads(
-        cfg=cfg,
-        wandb_logger=wandb_logger,
-        shutdown_event=shutdown_event,
-    )
+    try:
+        start_learner_threads(
+            cfg=cfg,
+            wandb_logger=wandb_logger,
+            shutdown_event=shutdown_event,
+        )
+    except Exception:
+        logging.exception("[LEARNER] Training run failed in train().")
+        raise
 
 
 def start_learner_threads(
@@ -216,6 +242,7 @@ def start_learner_threads(
         daemon=True,
     )
     communication_process.start()
+    exit_reason = "clean"
 
     try:
         add_actor_information_and_train(
@@ -226,14 +253,32 @@ def start_learner_threads(
             interaction_message_queue=interaction_message_queue,
             parameters_queue=parameters_queue,
         )
+        exit_reason = "training_complete"
+    except Exception:
+        exit_reason = "training_exception"
+        _log_cuda_snapshot("training_loop_exception")
+        logging.exception("[LEARNER] Training process crashed")
+        shutdown_event.set()
+        raise
     finally:
-        logging.info("[LEARNER] Training process stopped")
+        logging.info(
+            "[LEARNER] Training process stopped (reason=%s, shutdown_set=%s)",
+            exit_reason,
+            bool(shutdown_event.is_set()),
+        )
+        _log_cuda_snapshot("training_exit")
+        logging.info(
+            "[LEARNER] Queue sizes before close: transition=%s interaction=%s parameters=%s",
+            _safe_queue_size(transition_queue),
+            _safe_queue_size(interaction_message_queue),
+            _safe_queue_size(parameters_queue),
+        )
         shutdown_event.set()
         communication_process.join(timeout=SHUTDOWN_TIMEOUT + 1)
         if communication_process.is_alive():
             logging.warning("[LEARNER] Communication process did not stop before timeout")
         else:
-            logging.info("[LEARNER] Communication process joined")
+            logging.info("[LEARNER] Communication process joined (exitcode=%s)", communication_process.exitcode)
 
         logging.info("[LEARNER] Closing queues")
         transition_queue.close()
@@ -283,10 +328,18 @@ def add_actor_information_and_train(
     if cfg.policy.type == "pi05_online_rl":
         from lerobot.policies.pi05_onlineRL.learner import train_pi05_online_rl
 
-        return train_pi05_online_rl(
-            cfg, wandb_logger, shutdown_event, transition_queue,
-            interaction_message_queue, parameters_queue,
-        )
+        try:
+            return train_pi05_online_rl(
+                cfg,
+                wandb_logger,
+                shutdown_event,
+                transition_queue,
+                interaction_message_queue,
+                parameters_queue,
+            )
+        except Exception:
+            logging.exception("[LEARNER] pi05 online-RL training task failed.")
+            raise
 
     # Extract all configuration variables at the beginning, it improve the speed performance
     # of 7%
@@ -670,13 +723,20 @@ def start_learner(
     port = cfg.policy.actor_learner_config.learner_port
 
     server.add_insecure_port(f"{host}:{port}")
-    server.start()
-    logging.info("[LEARNER] gRPC server started")
-
-    shutdown_event.wait()
-    logging.info("[LEARNER] Stopping gRPC server...")
-    server.stop(SHUTDOWN_TIMEOUT)
-    logging.info("[LEARNER] gRPC server stopped")
+    stop_reason = "running"
+    try:
+        server.start()
+        logging.info("[LEARNER] gRPC server started")
+        shutdown_event.wait()
+        stop_reason = "shutdown_event"
+    except Exception:
+        stop_reason = "exception"
+        logging.exception("[LEARNER] gRPC server runtime error")
+        raise
+    finally:
+        logging.info("[LEARNER] Stopping gRPC server... (reason=%s)", stop_reason)
+        server.stop(SHUTDOWN_TIMEOUT)
+        logging.info("[LEARNER] gRPC server stopped")
 
 
 def save_training_checkpoint(

@@ -1132,48 +1132,94 @@ def compute_chunk_td_target(
     return chunk_return + bootstrap * (discount ** horizon) * next_q
 
 
+RLT_ACTOR_ARCHITECTURE = "rlinf_tanh_v1"
+RLT_ACTOR_INPUT_ORDER = ("ref_action", "z_rl", "proprio")
+RLT_ACTOR_NOISE_MODE = "pre_tanh_fixed_gaussian"
+
+
 class RLTChunkActor(nn.Module):
     def __init__(self, z_dim, proprio_dim, horizon, action_dim, hidden_dims, fixed_std, dropout):
         super().__init__()
         dims = [z_dim + proprio_dim + horizon * action_dim, *hidden_dims, horizon * action_dim]
         layers = []
-        for left, right in zip(dims, dims[1:], strict=False):
-            layers.append(nn.Linear(left, right))
-            if right != dims[-1]:
-                layers.append(nn.ReLU())
+        for index, (left, right) in enumerate(zip(dims, dims[1:], strict=False)):
+            linear = nn.Linear(left, right)
+            gain = 0.01 * math.sqrt(2) if index == len(dims) - 2 else math.sqrt(2)
+            nn.init.orthogonal_(linear.weight, gain)
+            nn.init.zeros_(linear.bias)
+            layers.append(linear)
+            if index != len(dims) - 2:
+                layers.append(nn.Tanh())
         self.net = nn.Sequential(*layers)
         self.horizon, self.action_dim = horizon, action_dim
         self.fixed_std, self.dropout = fixed_std, dropout
 
-    def mean(self, z_rl, proprio, ref_action):
-        if self.training and self.dropout:
-            keep = torch.rand((ref_action.shape[0], 1, 1), device=ref_action.device) >= self.dropout
+    def raw_mean(self, z_rl, proprio, ref_action, *, apply_reference_dropout=False):
+        if apply_reference_dropout and self.dropout:
+            keep = (
+                torch.rand((ref_action.shape[0], 1, 1), device=ref_action.device) >= self.dropout
+            )
             ref_action = ref_action * keep
-        flat = torch.cat((z_rl.flatten(1), proprio.flatten(1), ref_action.flatten(1)), dim=-1)
-        return torch.tanh(self.net(flat)).view(-1, self.horizon, self.action_dim)
+        flat = torch.cat(
+            (ref_action.flatten(1), z_rl.flatten(1), proprio.flatten(1)), dim=-1
+        )
+        return self.net(flat).view(-1, self.horizon, self.action_dim)
 
-    def forward(self, z_rl, proprio, ref_action, deterministic=False):
-        mean = self.mean(z_rl, proprio, ref_action)
-        if deterministic:
-            return mean
-        return (mean + torch.randn_like(mean) * self.fixed_std).clamp(-1, 1)
+    def mean(self, z_rl, proprio, ref_action, *, apply_reference_dropout=False):
+        raw_mean = self.raw_mean(
+            z_rl,
+            proprio,
+            ref_action,
+            apply_reference_dropout=apply_reference_dropout,
+        )
+        return torch.tanh(raw_mean)
+
+    def forward(
+        self,
+        z_rl,
+        proprio,
+        ref_action,
+        deterministic=False,
+        *,
+        apply_reference_dropout=False,
+    ):
+        raw_mean = self.raw_mean(
+            z_rl,
+            proprio,
+            ref_action,
+            apply_reference_dropout=apply_reference_dropout,
+        )
+        if not deterministic:
+            raw_mean = raw_mean + torch.randn_like(raw_mean) * self.fixed_std
+        return torch.tanh(raw_mean)
 
 
 class RLTChunkCriticEnsemble(nn.Module):
     def __init__(self, z_dim, proprio_dim, horizon, action_dim, hidden_dims, count):
         super().__init__()
-        in_dim = z_dim + proprio_dim + horizon * action_dim + horizon
+        in_dim = z_dim + proprio_dim + horizon * action_dim
+
         def make_net():
             dims = [in_dim, *hidden_dims, 1]
             layers = []
-            for left, right in zip(dims, dims[1:], strict=False):
-                layers.extend((nn.Linear(left, right), nn.ReLU()) if right != 1 else (nn.Linear(left, right),))
+            for index, (left, right) in enumerate(zip(dims, dims[1:], strict=False)):
+                linear = nn.Linear(left, right)
+                if index == len(dims) - 2:
+                    nn.init.normal_(linear.weight, mean=0.0, std=0.02)
+                else:
+                    nn.init.xavier_uniform_(linear.weight, gain=nn.init.calculate_gain("tanh"))
+                nn.init.zeros_(linear.bias)
+                layers.append(linear)
+                if index != len(dims) - 2:
+                    layers.extend((nn.LayerNorm(right), nn.Tanh()))
             return nn.Sequential(*layers)
         self.critics = nn.ModuleList(make_net() for _ in range(count))
 
     def forward(self, z_rl, proprio, action_chunk, valid_action_mask):
         masked_action = action_chunk * valid_action_mask.unsqueeze(-1)
-        x = torch.cat((z_rl.flatten(1), proprio.flatten(1), masked_action.flatten(1), valid_action_mask), dim=-1)
+        x = torch.cat(
+            (z_rl.flatten(1), proprio.flatten(1), masked_action.flatten(1)), dim=-1
+        )
         return torch.stack([critic(x).squeeze(-1) for critic in self.critics])
 
 
@@ -1696,7 +1742,11 @@ class PI05OnlineRLPolicy(PreTrainedPolicy):
             q_values = self.critic_ensemble(state["z_rl"], state["proprio"], action, mask)
             with torch.no_grad():
                 next_action = self.actor(
-                    next_state["z_rl"], next_state["proprio"], next_state["ref_action"], deterministic=True
+                    next_state["z_rl"],
+                    next_state["proprio"],
+                    next_state["ref_action"],
+                    deterministic=False,
+                    apply_reference_dropout=False,
                 )
                 next_q = self.critic_target(
                     next_state["z_rl"], next_state["proprio"], next_action, next_mask
@@ -1712,7 +1762,13 @@ class PI05OnlineRLPolicy(PreTrainedPolicy):
             }
 
         if model == "actor":
-            predicted = self.actor.mean(state["z_rl"], state["proprio"], state["ref_action"])
+            predicted = self.actor(
+                state["z_rl"],
+                state["proprio"],
+                state["ref_action"],
+                deterministic=False,
+                apply_reference_dropout=True,
+            )
             actor_q = self.critic_ensemble(
                 state["z_rl"], state["proprio"], predicted, mask
             )[0].mean()

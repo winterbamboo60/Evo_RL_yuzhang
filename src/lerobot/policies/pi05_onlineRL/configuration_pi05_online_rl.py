@@ -31,6 +31,8 @@ class ActorLearnerConfig:
     learner_port: int = 50051
     policy_parameters_push_frequency: int = 4
     queue_get_timeout: float = 2.0
+    online_episode_batch_size: int = 20
+    parameter_sync_wait_timeout_s: float = 120.0
 
 
 @dataclass
@@ -299,6 +301,7 @@ class PI05OnlineRLConfig(PreTrainedConfig):
     online_updates_per_episode: int = 100
     online_only_after_initialization: bool = False
     offload_to_cpu_while_waiting: bool = False
+    actor_rollout_deterministic: bool = False
     actor_update_interval: int = 1
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4

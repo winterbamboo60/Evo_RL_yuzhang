@@ -1,0 +1,62 @@
+{
+  "dataset": {
+    "repo_id": "local_data",
+    "root": "/home/lenovo/datasets/cup_catch_v4_merged_checked",
+    "streaming": false
+  },
+  "policy": {
+    "type": "pi05_online_rl",
+    "pretrained_path": "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k",
+    "base_policy_path": "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k",
+    "tokenizer_name": "/home/lenovo/modelZoo/paligemma-3b-pt-224",
+    "device": "cuda",
+    "storage_device": "cpu",
+    "offload_to_cpu_while_waiting": true,
+    "dtype": "bfloat16",
+    "use_rlt": true,
+    "chunk_size": 50,
+    "n_action_steps": 50,
+    "z_dim": 2048,
+    "proprio_dim": 7,
+    "actor_hidden_dims": [256, 256, 256],
+    "critic_hidden_dims": [256, 256, 256],
+    "num_critics": 2,
+    "fixed_std": 0.002,
+    "reference_dropout_prob": 0.5,
+    "q_weight": 0.1,
+    "bc_weight": 5.0,
+    "discount": 0.96,
+    "critic_target_update_weight": 0.005,
+    "use_backup_entropy": false,
+    "online_buffer_capacity": 100000,
+    "online_updates_per_episode": 4,
+    "online_only_after_initialization": false,
+    "actor_update_interval": 4,
+    "critic_lr": 0.0003,
+    "actor_lr": 0.0003,
+    "grad_clip_norm": 10.0,
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "queue_get_timeout": 2.0,
+      "online_episode_batch_size": 2,
+      "parameter_sync_wait_timeout_s": 120.0
+    },
+    "push_to_hub": false,
+    "repo_id": "local_policy_model"
+  },
+  "output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output",
+  "job_name": "pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_learner_output",
+  "resume": false,
+  "seed": 1000,
+  "batch_size": 16,
+  "gradient_accumulation_steps": 16,
+  "num_workers": 4,
+  "steps": 4000,
+  "log_freq": 5,
+  "save_checkpoint": true,
+  "save_freq": 2000,
+  "wandb": {
+    "enable": false
+  }
+}

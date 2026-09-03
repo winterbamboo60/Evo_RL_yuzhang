@@ -66,7 +66,7 @@ PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic�
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 cd /home/hpc/yuzhang/Evo-RL-loop-0817
 python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json
+  --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
 ```
 
 断点重启
@@ -76,6 +76,12 @@ cd /home/hpc/yuzhang/Evo-RL-loop-0817
 python -m lerobot.onlineRL_evoRL.learner \
   --config_path=/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/learner_output/checkpoints/last/pretrained_model/train_config.json \
   --resume=true
+
+# 接续离线rl训练
+python -m lerobot.onlineRL_evoRL.learner \
+    --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_cup_catch_v2_0819_35k/learner_output/checkpoints/last/pretrained_model/train_config.json \
+    --resume=true \
+    --steps=3000
 ```
 
 
@@ -85,9 +91,11 @@ python -m lerobot.onlineRL_evoRL.learner \
 python -m lerobot.onlineRL_evoRL.learner \
   --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json \
   --steps=1000 \
-  --policy.online_updates_per_episode=100 \
+  --policy.online_updates_per_episode=4 \
+  --policy.actor_update_interval=4 \
   --policy.online_only_after_initialization=false \
-  --batch_size=8 \
+  --batch_size=16 \
+  --gradient_accumulation_steps=16 \
   --num_workers=2
 ```
 
@@ -155,21 +163,25 @@ complementary_info.collector_policy_id == "human"
 | 参数 | 当前示例 | 用法与精确含义 |
 | --- | ---: | --- |
 | `steps` | `200` | **仅表示离线初始化更新次数，不是总训练步数，也不是退出条件。** 达到该值后 learner 保持运行，等待在线 episode。 |
-| `policy.online_updates_per_episode` | `100` | 每接收并成功转换一个完整在线 episode，增加多少次在线更新额度；多个 episode 的额度会累加。 |
-| `policy.online_only_after_initialization` | `false` | `false`：在线阶段每个 batch 混合 online/offline；`true`：离线初始化结束后只采样 online replay。该参数不会跳过最初的 `steps` 次离线初始化。 |
-| `batch_size` | `16` | 每次 learner update 的目标样本数。混合模式取 `max(1, batch_size // 2)` 个 online 样本，其余来自 offline；在线 replay 样本不足时实际 batch 可能更小。 |
-| `num_workers` | `4` | 离线 DataLoader worker 数。显存或主存紧张时先减 `batch_size`，再减为 `2` 或 `0`；`0` 表示主进程加载。 |
+| `policy.online_updates_per_episode` | `4` | 每接收一个完整在线 episode 增加 4 次有效 optimizer update；当前每 2 个 episode 同步一次，因此一批执行 8 次 Critic 更新。 |
+| `policy.online_only_after_initialization` | `false` | `false`：在线阶段每个 micro batch 混合 online/offline；`true`：离线初始化结束后只采样 online replay。该参数不会跳过最初的 `steps` 次初始化。 |
+| `batch_size` | `16` | 单次前后向的 micro batch。混合模式每个 micro batch 为 8 个 online 和 8 个 offline 样本。 |
+| `gradient_accumulation_steps` | `16` | 累计 16 个 micro batch 后执行一次 optimizer step；单卡 effective batch 为 `16 × 16 = 256`。 |
+| `num_workers` | `4` | 离线 DataLoader worker 数。显存或主存紧张时先减 `batch_size`，并相应增加累计次数以维持 effective batch。 |
 | `policy.online_buffer_capacity` | `100000` | online compact feature replay 最多保存的 sliding-window transition 数，不是 episode 数。增大它主要增加 CPU 内存和 checkpoint 体积。 |
-| `policy.actor_update_interval` | `1` | 每隔多少个累计 `learner_step` 更新一次 Actor；Critic 每一步都会更新。 |
+| `policy.actor_update_interval` | `4` | Critic 每次有效 step 都更新，Actor 每 4 次 Critic step 更新一次。 |
 | `log_freq` / `save_freq` | `5 / 100` | 每多少个累计 `learner_step` 记录日志/保存 checkpoint；`save_freq` 仅在 `save_checkpoint=true` 时生效。 |
 
-如果目标是“先离线初始化 1000 步，之后每个新 episode 训练 100 步”，设置：
+如果目标是对齐 RLinf 的每轮 8 次 Critic 更新，且保持当前每 2 个 episode 同步一次，设置：
 
 ```json
 {
   "steps": 1000,
+  "batch_size": 16,
+  "gradient_accumulation_steps": 16,
   "policy": {
-    "online_updates_per_episode": 100,
+    "online_updates_per_episode": 4,
+    "actor_update_interval": 4,
     "online_only_after_initialization": false
   }
 }
@@ -187,9 +199,10 @@ complementary_info.collector_policy_id == "human"
 | `policy.chunk_size` / `policy.n_action_steps` | `50 / 50` | Actor 输出的完整 action chunk 长度和训练 horizon；当前实现要求二者严格相等。 |
 | `policy.z_dim` | `2048` | 冻结 RLT 输出特征维度，必须与所加载 checkpoint 一致。 |
 | `policy.proprio_dim` | `7` | 本体状态维度，必须与数据集和 checkpoint 一致。 |
-| `policy.actor_hidden_dims` / `policy.critic_hidden_dims` | `[256,256,256]` | 新训练的 Actor/Critic MLP 隐藏层宽度；增大后显存、计算量和 checkpoint 都会增加。 |
+| `policy.actor_hidden_dims` / `policy.critic_hidden_dims` | `[256,256,256]` | Actor 使用 Tanh 隐藏层；Critic 使用 Linear→LayerNorm→Tanh，均与 RLinf Stage 2 对齐。 |
 | `policy.num_critics` | `2` | Q 网络数量；当前实现至少需要 2 个。 |
-| `policy.fixed_std` | `0.002` | Actor 非确定性调用时的固定高斯噪声标准差，必须大于 0；当前 learner 的 loss 路径使用 mean/deterministic action，因此该值暂不改变训练 loss。 |
+| `policy.fixed_std` | `0.002` | 固定高斯噪声加在 raw mean 上，再经过 Tanh；Actor loss、TD target 和非确定性在线 rollout 都实际使用。 |
+| `policy.actor_rollout_deterministic` | `false` | `false` 用于在线训练采集并加入固定噪声；纯评估时设为 `true`。两种模式都不使用 reference dropout。 |
 | `policy.reference_dropout_prob` | `0.5` | Actor 训练时丢弃冻结 VLA reference action 条件的概率，用于避免 Actor 只复制 reference；范围 `[0,1]`。 |
 | `policy.q_weight` / `policy.bc_weight` | `0.1 / 5.0` | Actor loss 为 `-q_weight × Q + bc_weight × masked_BC`。增大前者更偏向奖励，增大后者更贴近人工动作/VLA reference。 |
 | `policy.discount` | `0.96` | chunk 内 reward 折扣以及完整窗口 bootstrap 折扣，范围 `(0,1]`。 |
@@ -197,7 +210,7 @@ complementary_info.collector_policy_id == "human"
 | `policy.actor_lr` / `policy.critic_lr` | `3e-4 / 3e-4` | learner 实际使用的 Actor/Critic Adam 学习率。 |
 | `policy.grad_clip_norm` | `10.0` | Actor 与 Critic 各自的梯度范数裁剪上限。 |
 
-PI0.5/RLT 骨干在本 learner 中被冻结；日志里的 `bc_loss` 下降表示新 Actor 更接近 BC target，不表示 VLA 骨干正在更新。通用训练配置中的 `optimizer`、`scheduler` 和 `gradient_accumulation_steps` 不控制这里的两个 Adam optimizer；应使用上表的 `policy.actor_lr`、`policy.critic_lr` 和 `policy.grad_clip_norm`。
+PI0.5/RLT 骨干在本 learner 中被冻结；日志里的 `bc_loss` 下降表示新 Actor 更接近 BC target，不表示 VLA 骨干正在更新。通用 `optimizer` 和 `scheduler` 仍不控制这里的两个 Adam optimizer；`gradient_accumulation_steps` 现已由 PI05 learner 使用。学习率和裁剪继续使用 `policy.actor_lr`、`policy.critic_lr` 与 `policy.grad_clip_norm`。
 
 ### 资源、服务与输出参数
 
@@ -241,7 +254,7 @@ checkpoints/<learner_step>/
 checkpoints/last
 ```
 
-`manifest.json` 记录基座 checkpoint 路径和特征维度；恢复时先从 `policy.pretrained_path` 加载冻结 VLA/RLT，再加载 `actor_critic.pt`。因此基座 checkpoint 必须继续可访问。optimizer、`learner_step`、`interaction_step`、`pending_online_update_steps`、`online_episode_count` 和 online replay 都会恢复。
+`manifest.json` 同时记录基座路径、特征维度、RLinf-compatible Actor/噪声架构、effective batch 和 Critic:Actor 更新比。恢复及在线 Actor 加载会校验架构版本；旧 ReLU/post-tanh-noise Stage 2 checkpoint 会被拒绝。恢复时先从 `policy.pretrained_path` 加载冻结 VLA/RLT，再加载 `actor_critic.pt`。optimizer、`learner_step`、`interaction_step`、更新额度、episode 计数和 online replay 都会恢复。
 
 离线 dataset 始终从 `dataset.root` 读取，不复制进 checkpoint。checkpoint 名称中的 step 是离线和在线阶段累计的 `learner_step`。
 
@@ -305,10 +318,10 @@ python -m lerobot.onlineRL_evoRL.actor_new \
 src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_onlineRL_transition.json
 
 
-source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_onlineRL_transition.json
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0901
+python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
 ```
 
 它还需要：`policy.type=pi05_online_rl`、与 learner 相同的 `policy.pretrained_path` 和 `dataset.root`、有效的 `actor_checkpoint_path`，以及一致的 learner host/port。Actor checkpoint 可指向 learner 输出根目录、checkpoint 目录或具体的 `actor_critic.pt`/`model.safetensors`。

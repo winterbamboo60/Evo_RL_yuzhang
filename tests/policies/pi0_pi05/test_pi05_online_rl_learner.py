@@ -1,4 +1,5 @@
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from lerobot.policies.pi05_onlineRL.learner import (
     _move_training_state,
     _offline_annotations,
     _online_batch_sizes,
+    _save_online_replay_checkpoint,
     _training_phase,
     _validate_online_task,
 )
@@ -201,6 +203,50 @@ def test_online_phase_batch_composition():
     assert _online_batch_sizes(1, online_only=False) == (1, 0)
     with pytest.raises(ValueError, match="online_updates_per_episode"):
         PI05OnlineRLConfig(online_updates_per_episode=0)
+
+
+class _ReplayExporter:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+
+    def to_lerobot_dataset(self, repo_id, fps, root):
+        root = Path(root)
+        root.mkdir(parents=True)
+        (root / "marker.txt").write_text("new")
+        if self.fail:
+            raise RuntimeError("export failed")
+
+
+def test_online_replay_checkpoint_replaces_existing_only_after_export(tmp_path):
+    checkpoint_dir = tmp_path / "001200"
+    old_root = checkpoint_dir / "replay_online"
+    old_root.mkdir(parents=True)
+    (old_root / "marker.txt").write_text("old")
+
+    published = _save_online_replay_checkpoint(
+        _ReplayExporter(), checkpoint_dir, fps=30
+    )
+
+    assert published == old_root
+    assert (published / "marker.txt").read_text() == "new"
+    previous = list(checkpoint_dir.glob("replay_online.previous-*"))
+    assert len(previous) == 1
+    assert (previous[0] / "marker.txt").read_text() == "old"
+
+
+def test_online_replay_checkpoint_preserves_existing_on_export_failure(tmp_path):
+    checkpoint_dir = tmp_path / "001200"
+    old_root = checkpoint_dir / "replay_online"
+    old_root.mkdir(parents=True)
+    (old_root / "marker.txt").write_text("old")
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        _save_online_replay_checkpoint(
+            _ReplayExporter(fail=True), checkpoint_dir, fps=30
+        )
+
+    assert (old_root / "marker.txt").read_text() == "old"
+    assert len(list(checkpoint_dir.glob(".replay_online.tmp-*"))) == 1
 
 
 def test_learner_shutdown_sets_event_before_join(monkeypatch):

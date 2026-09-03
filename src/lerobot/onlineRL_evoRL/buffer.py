@@ -686,8 +686,9 @@ class ReplayBuffer:
             # Add to the dataset's buffer
             lerobot_dataset.add_frame(frame_dict)
 
-            # If we reached an episode boundary, call save_episode, reset counters
-            if self.dones[actual_idx] or self.truncateds[actual_idx]:
+            # Chunk transitions repeat the terminal flag across every window that reaches
+            # the primitive episode end. Only the final one-frame window is a disk boundary.
+            if self._is_dataset_episode_boundary(actual_idx):
                 lerobot_dataset.save_episode()
 
         # Save any remaining frames in the buffer
@@ -698,6 +699,13 @@ class ReplayBuffer:
         lerobot_dataset.finalize()
 
         return lerobot_dataset
+
+    def _is_dataset_episode_boundary(self, index: int) -> bool:
+        """Return whether a replay row ends an episode in the exported dataset."""
+        is_terminal = bool(self.dones[index].item() or self.truncateds[index].item())
+        if not is_terminal or not self.is_chunk:
+            return is_terminal
+        return torch.count_nonzero(self.valid_action_masks[index]).item() == 1
 
     @staticmethod
     def _lerobotdataset_to_transitions(

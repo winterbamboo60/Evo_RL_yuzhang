@@ -88,6 +88,51 @@ def test_chunk_replay_keeps_explicit_next_state_and_masks():
     assert batch["next_state"]["z_rl"].item() == 50
 
 
+def test_chunk_replay_export_uses_primitive_episode_boundaries(monkeypatch, tmp_path):
+    replay = ReplayBuffer(
+        capacity=140,
+        device="cpu",
+        storage_device="cpu",
+        state_keys=("z_rl", "proprio", "ref_action"),
+        use_drq=False,
+        optimize_memory=False,
+    )
+    for _ in range(2):
+        for transition in build_sliding_window_transitions(_episode(70), horizon=50):
+            replay.add(**transition)
+
+    class RecordingDataset:
+        def __init__(self):
+            self.episode_buffer = {"size": 0}
+            self.episode_lengths = []
+
+        def start_image_writer(self, **kwargs):
+            pass
+
+        def add_frame(self, frame):
+            self.episode_buffer["size"] += 1
+
+        def save_episode(self):
+            self.episode_lengths.append(self.episode_buffer["size"])
+            self.episode_buffer["size"] = 0
+
+        def stop_image_writer(self):
+            pass
+
+        def finalize(self):
+            pass
+
+    dataset = RecordingDataset()
+    monkeypatch.setattr(
+        "lerobot.onlineRL_evoRL.buffer.LeRobotDataset.create",
+        lambda **kwargs: dataset,
+    )
+    replay.to_lerobot_dataset("test/replay", root=tmp_path / "replay")
+
+    assert replay.dones.sum().item() == 100
+    assert dataset.episode_lengths == [70, 70]
+
+
 def test_actor_and_critic_shapes_and_padding_invariance():
     from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import (
         RLTChunkActor,

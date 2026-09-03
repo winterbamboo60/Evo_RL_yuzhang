@@ -22,7 +22,7 @@ from lerobot.onlineRL_evoRL.compact_transition import (
     validate_compact_episode,
 )
 from lerobot.policies.factory import make_policy, make_pre_post_processors
-from lerobot.transport.utils import bytes_to_python_object
+from lerobot.transport.utils import bytes_to_python_object, state_to_bytes
 from lerobot.utils.constants import (
     ACTION,
     CHECKPOINTS_DIR,
@@ -40,10 +40,36 @@ from lerobot.utils.train_utils import (
 from lerobot.utils.transition import move_transition_to_device
 
 from .chunk_transition import sliding_windows, split_episodes
-from .modeling_pi05_online_rl import PI05OnlineRLPolicy
+from .modeling_pi05_online_rl import (
+    PI05OnlineRLPolicy,
+    RLT_ACTOR_ARCHITECTURE,
+    RLT_ACTOR_INPUT_ORDER,
+    RLT_ACTOR_NOISE_MODE,
+)
 
 _COLLECTOR_POLICY_ID = "complementary_info.collector_policy_id"
 _FEATURE_KEYS = ("z_rl", "proprio", "ref_action")
+
+
+def _safe_queue_size(queue: Queue) -> int:
+    try:
+        return queue.qsize()
+    except Exception:
+        return -1
+
+
+def _log_cuda_snapshot(prefix: str) -> None:
+    if not torch.cuda.is_available():
+        logging.info("[LEARNER-PI05][MEM] %s cuda unavailable", prefix)
+        return
+    logging.info(
+        "[LEARNER-PI05][MEM] %s allocated_mb=%.2f reserved_mb=%.2f max_allocated_mb=%.2f max_reserved_mb=%.2f",
+        prefix,
+        torch.cuda.memory_allocated() / (1024 * 1024),
+        torch.cuda.memory_reserved() / (1024 * 1024),
+        torch.cuda.max_memory_allocated() / (1024 * 1024),
+        torch.cuda.max_memory_reserved() / (1024 * 1024),
+    )
 
 
 def _merge_processed(items: list[dict]) -> dict:
@@ -292,6 +318,27 @@ def _online_batch_sizes(batch_size: int, online_only: bool) -> tuple[int, int]:
     return online_size, batch_size - online_size
 
 
+def _sample_replay_exact(replay: ReplayBuffer, batch_size: int) -> dict:
+    """Sample exactly batch_size items, repeating draws when replay is still small."""
+    if batch_size <= 0:
+        raise ValueError("replay batch_size must be positive")
+    if len(replay) == 0:
+        raise ValueError("cannot sample from an empty replay buffer")
+
+    sampled_batch = None
+    remaining = batch_size
+    while remaining:
+        sample_size = min(remaining, len(replay))
+        piece = replay.sample(sample_size)
+        sampled_batch = (
+            piece
+            if sampled_batch is None
+            else concatenate_batch_transitions(sampled_batch, piece)
+        )
+        remaining -= sample_size
+    return sampled_batch
+
+
 def _training_phase(learner_step: int, offline_steps: int, online_budget: int) -> str | None:
     if learner_step < offline_steps:
         return "offline_initialization"
@@ -306,6 +353,14 @@ def _move_training_state(policy, optimizers: dict, device: torch.device | str) -
             for key, value in state.items():
                 if key != "step" and isinstance(value, torch.Tensor):
                     state[key] = value.to(device)
+
+
+def _serialize_actor_policy(policy: PI05OnlineRLPolicy, batch_id: int) -> bytes:
+    state_dicts = {
+        "policy": {key: value.detach().cpu() for key, value in policy.actor.state_dict().items()},
+        "batch_id": batch_id,
+    }
+    return state_to_bytes(state_dicts)
 
 
 _ACTOR_CRITIC_FILE = "actor_critic.pt"
@@ -323,6 +378,11 @@ def _load_actor_critic(checkpoint_dir: Path, policy: PI05OnlineRLPolicy) -> None
         raise FileNotFoundError(f"Missing PI05 checkpoint manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
     expected = {
+        "format_version": 2,
+        "actor_architecture": RLT_ACTOR_ARCHITECTURE,
+        "actor_input_order": list(RLT_ACTOR_INPUT_ORDER),
+        "actor_noise_mode": RLT_ACTOR_NOISE_MODE,
+        "fixed_std": policy.config.fixed_std,
         "base_policy_path": str(Path(policy.config.pretrained_path).expanduser().resolve()),
         "chunk_size": policy.config.chunk_size,
         "z_dim": policy.config.z_dim,
@@ -366,7 +426,16 @@ def _save_actor_critic_checkpoint(
     cfg.save_pretrained(pretrained_dir)
     policy.config.save_pretrained(pretrained_dir)
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
+        "actor_architecture": RLT_ACTOR_ARCHITECTURE,
+        "actor_input_order": list(RLT_ACTOR_INPUT_ORDER),
+        "actor_noise_mode": RLT_ACTOR_NOISE_MODE,
+        "critic_architecture": "rlinf_layernorm_tanh_v1",
+        "fixed_std": policy.config.fixed_std,
+        "micro_batch_size": cfg.batch_size,
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+        "effective_batch_size": cfg.batch_size * cfg.gradient_accumulation_steps,
+        "critic_actor_ratio": cfg.policy.actor_update_interval,
         "base_policy_path": str(Path(policy.config.pretrained_path).expanduser().resolve()),
         "chunk_size": policy.config.chunk_size,
         "z_dim": policy.config.z_dim,
@@ -374,6 +443,45 @@ def _save_actor_critic_checkpoint(
     }
     (checkpoint_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     save_training_state(checkpoint_dir, step, optimizers, None)
+
+
+def _save_online_replay_checkpoint(
+    online: ReplayBuffer,
+    checkpoint_dir: Path,
+    fps: int,
+) -> Path:
+    """Export replay data completely before publishing it as replay_online."""
+    checkpoint_dir = Path(checkpoint_dir)
+    final_root = checkpoint_dir / "replay_online"
+    suffix = f"{os.getpid()}-{time.time_ns()}"
+    temporary_root = checkpoint_dir / f".replay_online.tmp-{suffix}"
+    previous_root = None
+
+    logging.info("Exporting online replay checkpoint to temporary path %s", temporary_root)
+    try:
+        online.to_lerobot_dataset(
+            repo_id="pi05_online_rl_online_replay",
+            fps=fps,
+            root=temporary_root,
+        )
+    except Exception:
+        logging.error("Online replay export failed; partial data remains at %s", temporary_root)
+        raise
+
+    if final_root.exists():
+        previous_root = checkpoint_dir / f"replay_online.previous-{suffix}"
+        final_root.replace(previous_root)
+    try:
+        temporary_root.replace(final_root)
+    except Exception:
+        if previous_root is not None and not final_root.exists():
+            previous_root.replace(final_root)
+        raise
+
+    if previous_root is not None:
+        logging.warning("Previous replay checkpoint retained at %s", previous_root)
+    logging.info("Published online replay checkpoint at %s", final_root)
+    return final_root
 
 
 def train_pi05_online_rl(
@@ -385,7 +493,6 @@ def train_pi05_online_rl(
     parameters_queue,
 ):
     """Train RL heads while the VLA and RLT backbone remains frozen."""
-    del parameters_queue  # Actor deployment is intentionally deferred.
     if cfg.dataset is None:
         raise ValueError("pi05_online_rl learner requires a metadata-backed offline dataset")
 
@@ -444,6 +551,18 @@ def train_pi05_online_rl(
     pending_online_tasks = deque()
     pending_online_update_steps = 0
     online_episode_count = 0
+    online_episode_batch_size = max(1, cfg.policy.actor_learner_config.online_episode_batch_size)
+    gradient_accumulation_steps = cfg.gradient_accumulation_steps
+    effective_batch_size = cfg.batch_size * gradient_accumulation_steps
+    logging.info(
+        "PI05 optimizer batches: micro_batch_size=%d accumulation_steps=%d effective_batch_size=%d",
+        cfg.batch_size,
+        gradient_accumulation_steps,
+        effective_batch_size,
+    )
+    episodes_in_current_batch = 0
+    current_batch_id = 0
+    batch_id_waiting_for_ack: int | None = None
     if resume_dir is not None:
         runtime_state_path = resume_dir / TRAINING_STATE_DIR / "training_state.pt"
         if runtime_state_path.is_file():
@@ -451,192 +570,366 @@ def train_pi05_online_rl(
             interaction_step = runtime_state.get("interaction_step", 0)
             pending_online_update_steps = runtime_state.get("pending_online_update_steps", 0)
             online_episode_count = runtime_state.get("online_episode_count", 0)
+            episodes_in_current_batch = runtime_state.get("episodes_in_current_batch", 0)
+            current_batch_id = runtime_state.get("current_batch_id", 0)
+            batch_id_waiting_for_ack = runtime_state.get("batch_id_waiting_for_ack")
     initialization_complete_logged = False
 
-    while shutdown_event is None or not shutdown_event.is_set():
-        while not interaction_message_queue.empty():
-            message = bytes_to_python_object(interaction_message_queue.get())
-            interaction_step = message.get("Interaction step", interaction_step)
-            if message.get("transition_schema") != SCHEMA_NAME:
-                pending_online_tasks.append(message.get("task"))
+    def next_training_micro_batch(training_phase: str) -> dict:
+        if training_phase == "offline_initialization":
+            raw_offline = next(offline_iterator)
+            return _build_offline_batch(raw_offline, annotations, policy, preprocessor)
 
-        while not transition_queue.empty():
-            payload = bytes_to_episode_payload(transition_queue.get())
-            if is_compact_episode(payload):
-                added, metadata = _add_compact_episode(payload, online, policy, valid_tasks)
-                interaction_step = metadata.get("Interaction step", interaction_step)
-                payload_format = SCHEMA_NAME
-            else:
-                pending_online_episodes.append(payload)
-                continue
-            if added:
-                online_episode_count += 1
-                pending_online_update_steps += cfg.policy.online_updates_per_episode
-                logging.info(
-                    "Received online episode %d (%s): added %d transitions, scheduled %d updates",
-                    online_episode_count,
-                    payload_format,
-                    added,
-                    cfg.policy.online_updates_per_episode,
-                )
-
-        if pending_online_episodes and pending_online_tasks and learner_offloaded:
-            _move_training_state(policy, optimizers, training_device)
-            learner_offloaded = False
-            logging.info(
-                "Received legacy raw episode; restored learner training state to %s",
-                training_device,
-            )
-
-        while pending_online_episodes and pending_online_tasks:
-            primitive = [
-                move_transition_to_device(transition, device=device)
-                for transition in pending_online_episodes.popleft()
-            ]
-            added = _add_online_episodes(
-                primitive,
-                online,
-                policy,
-                preprocessor,
-                pending_online_tasks.popleft(),
-                valid_tasks,
-                cfg.batch_size,
-            )
-            if added:
-                online_episode_count += 1
-                pending_online_update_steps += cfg.policy.online_updates_per_episode
-                logging.info(
-                    "Received online episode %d (legacy_raw): added %d transitions, scheduled %d updates",
-                    online_episode_count,
-                    added,
-                    cfg.policy.online_updates_per_episode,
-                )
-
-        training_phase = _training_phase(
-            learner_step, cfg.steps, pending_online_update_steps
+        online_size, offline_size = _online_batch_sizes(
+            cfg.batch_size, cfg.policy.online_only_after_initialization
         )
-        if training_phase != "offline_initialization" and not initialization_complete_logged:
-            logging.info(
-                "Offline initialization complete at learner step %d; entering online phase",
-                learner_step,
+        batch = _sample_replay_exact(online, online_size)
+        if offline_size:
+            raw_offline = _slice_raw_batch(next(offline_iterator), offline_size)
+            offline_batch = _build_offline_batch(raw_offline, annotations, policy, preprocessor)
+            batch = concatenate_batch_transitions(batch, offline_batch)
+        return batch
+
+    try:
+        while shutdown_event is None or not shutdown_event.is_set():
+            while not interaction_message_queue.empty():
+                message = bytes_to_python_object(interaction_message_queue.get())
+                if message.get("interaction_type") == "parameter_sync_ack":
+                    ack_batch_id = message.get("batch_id")
+                    logging.info(
+                        "[PI05][SYNC] received actor parameter ack batch_id=%s waiting_for=%s",
+                        ack_batch_id,
+                        batch_id_waiting_for_ack,
+                    )
+                    if batch_id_waiting_for_ack == ack_batch_id:
+                        batch_id_waiting_for_ack = None
+                    continue
+                interaction_step = message.get("Interaction step", interaction_step)
+                if message.get("transition_schema") != SCHEMA_NAME:
+                    pending_online_tasks.append(message.get("task"))
+
+            while not transition_queue.empty():
+                payload = bytes_to_episode_payload(transition_queue.get())
+                if is_compact_episode(payload):
+                    added, metadata = _add_compact_episode(payload, online, policy, valid_tasks)
+                    interaction_step = metadata.get("Interaction step", interaction_step)
+                    payload_format = SCHEMA_NAME
+                else:
+                    pending_online_episodes.append(payload)
+                    continue
+                if added:
+                    online_episode_count += 1
+                    episodes_in_current_batch += 1
+                    pending_online_update_steps += cfg.policy.online_updates_per_episode
+                    logging.info(
+                        "Received online episode %d (%s): added %d transitions, scheduled %d updates",
+                        online_episode_count,
+                        payload_format,
+                        added,
+                        cfg.policy.online_updates_per_episode,
+                    )
+                    logging.info(
+                        "[PI05][SYNC] batch_progress batch_id=%d episodes=%d/%d pending_updates=%d",
+                        current_batch_id,
+                        episodes_in_current_batch,
+                        online_episode_batch_size,
+                        pending_online_update_steps,
+                    )
+                    logging.info(
+                        "[PI05] queue sizes transitions=%s interactions=%s",
+                        _safe_queue_size(transition_queue),
+                        _safe_queue_size(interaction_message_queue),
+                    )
+                    _log_cuda_snapshot("after_receive_episode")
+
+            if pending_online_episodes and pending_online_tasks and learner_offloaded:
+                _move_training_state(policy, optimizers, training_device)
+                learner_offloaded = False
+                logging.info(
+                    "Received legacy raw episode; restored learner training state to %s",
+                    training_device,
+                )
+
+            while pending_online_episodes and pending_online_tasks:
+                primitive = [
+                    move_transition_to_device(transition, device=device)
+                    for transition in pending_online_episodes.popleft()
+                ]
+                added = _add_online_episodes(
+                    primitive,
+                    online,
+                    policy,
+                    preprocessor,
+                    pending_online_tasks.popleft(),
+                    valid_tasks,
+                    cfg.batch_size,
+                )
+                if added:
+                    online_episode_count += 1
+                    episodes_in_current_batch += 1
+                    pending_online_update_steps += cfg.policy.online_updates_per_episode
+                    logging.info(
+                        "Received online episode %d (legacy_raw): added %d transitions, scheduled %d updates",
+                        online_episode_count,
+                        added,
+                        cfg.policy.online_updates_per_episode,
+                    )
+                    logging.info(
+                        "[PI05][SYNC] batch_progress batch_id=%d episodes=%d/%d pending_updates=%d",
+                        current_batch_id,
+                        episodes_in_current_batch,
+                        online_episode_batch_size,
+                        pending_online_update_steps,
+                    )
+
+            training_phase = _training_phase(
+                learner_step, cfg.steps, pending_online_update_steps
             )
-            initialization_complete_logged = True
-        if training_phase is None:
+            if training_phase != "offline_initialization" and not initialization_complete_logged:
+                logging.info(
+                    "Offline initialization complete at learner step %d; entering online phase",
+                    learner_step,
+                )
+                initialization_complete_logged = True
             if (
-                cfg.policy.offload_to_cpu_while_waiting
-                and training_device.type == "cuda"
-                and not learner_offloaded
+                training_phase == "online"
+                and episodes_in_current_batch < online_episode_batch_size
             ):
+                if (
+                    cfg.policy.offload_to_cpu_while_waiting
+                    and training_device.type == "cuda"
+                    and not learner_offloaded
+                ):
+                    for optimizer in optimizers.values():
+                        optimizer.zero_grad(set_to_none=True)
+                    batch = critic_output = actor_output = offline_batch = None
+                    _move_training_state(policy, optimizers, "cpu")
+                    torch.cuda.empty_cache()
+                    learner_offloaded = True
+                    logging.info(
+                        "[PI05][SYNC] waiting_for_batch_fill batch_id=%d episodes=%d/%d; learner offloaded to CPU",
+                        current_batch_id,
+                        episodes_in_current_batch,
+                        online_episode_batch_size,
+                    )
+                if shutdown_event is not None:
+                    shutdown_event.wait(0.05)
+                else:
+                    time.sleep(0.05)
+                continue
+            if training_phase is None:
+                if (
+                    cfg.policy.offload_to_cpu_while_waiting
+                    and training_device.type == "cuda"
+                    and not learner_offloaded
+                ):
+                    for optimizer in optimizers.values():
+                        optimizer.zero_grad(set_to_none=True)
+                    batch = critic_output = actor_output = offline_batch = None
+                    _move_training_state(policy, optimizers, "cpu")
+                    torch.cuda.empty_cache()
+                    learner_offloaded = True
+                    logging.info(
+                        "No pending online updates; offloaded learner training state from %s to CPU",
+                        training_device,
+                    )
+                if shutdown_event is not None:
+                    shutdown_event.wait(0.05)
+                else:
+                    time.sleep(0.05)
+                continue
+
+            if learner_offloaded:
+                _move_training_state(policy, optimizers, training_device)
+                learner_offloaded = False
+                logging.info(
+                    "Online updates available; restored learner training state to %s",
+                    training_device,
+                )
+
+            started = time.time()
+            micro_batches = [
+                next_training_micro_batch(training_phase)
+                for _ in range(gradient_accumulation_steps)
+            ]
+
+            critic_metrics = {"loss_critic": 0.0, "q": 0.0, "target_q": 0.0}
+            optimizers["critic"].zero_grad(set_to_none=True)
+            for batch in micro_batches:
+                critic_output = policy(batch, model="critic")
+                (critic_output["loss_critic"] / gradient_accumulation_steps).backward()
+                for key in critic_metrics:
+                    critic_metrics[key] += critic_output[key].item()
+            critic_norm = torch.nn.utils.clip_grad_norm_(
+                policy.critic_ensemble.parameters(), cfg.policy.grad_clip_norm
+            )
+            optimizers["critic"].step()
+            policy.soft_update_target()
+            optimizers["critic"].zero_grad(set_to_none=True)
+
+            metrics = {
+                key: value / gradient_accumulation_steps
+                for key, value in critic_metrics.items()
+            }
+            metrics.update(
+                critic_grad_norm=float(critic_norm),
+                micro_batch_size=cfg.batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                effective_batch_size=effective_batch_size,
+            )
+
+            update_actor = learner_step % cfg.policy.actor_update_interval == 0
+            if update_actor:
+                actor_metrics = {"loss_actor": 0.0, "bc_loss": 0.0, "actor_q": 0.0}
+                critic_parameters = list(policy.critic_ensemble.parameters())
+                critic_requires_grad = [parameter.requires_grad for parameter in critic_parameters]
+                for parameter in critic_parameters:
+                    parameter.requires_grad_(False)
+
+                optimizers["actor"].zero_grad(set_to_none=True)
+                try:
+                    for batch in micro_batches:
+                        actor_output = policy(batch, model="actor")
+                        (actor_output["loss_actor"] / gradient_accumulation_steps).backward()
+                        for key in actor_metrics:
+                            actor_metrics[key] += actor_output[key].item()
+                    actor_norm = torch.nn.utils.clip_grad_norm_(
+                        policy.actor.parameters(), cfg.policy.grad_clip_norm
+                    )
+                    optimizers["actor"].step()
+                finally:
+                    for parameter, requires_grad in zip(
+                        critic_parameters, critic_requires_grad, strict=True
+                    ):
+                        parameter.requires_grad_(requires_grad)
+
+                metrics.update(
+                    {
+                        key: value / gradient_accumulation_steps
+                        for key, value in actor_metrics.items()
+                    },
+                    actor_grad_norm=float(actor_norm),
+                )
+            metrics["actor_updated"] = float(update_actor)
+
+            if training_phase == "online":
+                pending_online_update_steps -= 1
+
+            micro_batches.clear()
+            batch = critic_output = actor_output = None
+
+            learner_step += 1
+            checkpoint_saved_this_step = False
+            if learner_step % cfg.log_freq == 0:
+                metrics.update(
+                    learner_step=learner_step,
+                    training_phase=training_phase,
+                    interaction_step=interaction_step,
+                    online_episode_count=online_episode_count,
+                    pending_online_update_steps=pending_online_update_steps,
+                    online_replay_buffer_size=len(online),
+                    update_frequency_hz=1 / max(time.time() - started, 1e-9),
+                )
+                logging.info("PI05 online-RL learner step %d: %s", learner_step, metrics)
+                if wandb_logger:
+                    wandb_logger.log_dict(metrics, mode="train", custom_step_key="learner_step")
+
+            if (
+                training_phase == "online"
+                and episodes_in_current_batch >= online_episode_batch_size
+                and pending_online_update_steps == 0
+                and batch_id_waiting_for_ack is None
+            ):
+                if cfg.save_checkpoint:
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, learner_step)
+                    _save_actor_critic_checkpoint(
+                        checkpoint_dir, learner_step, cfg, policy, optimizers
+                    )
+                    training_dir = os.path.join(checkpoint_dir, TRAINING_STATE_DIR)
+                    os.makedirs(training_dir, exist_ok=True)
+                    torch.save(
+                        {
+                            "step": learner_step,
+                            "interaction_step": interaction_step,
+                            "pending_online_update_steps": pending_online_update_steps,
+                            "online_episode_count": online_episode_count,
+                            "episodes_in_current_batch": episodes_in_current_batch,
+                            "current_batch_id": current_batch_id,
+                            "batch_id_waiting_for_ack": current_batch_id,
+                        },
+                        os.path.join(training_dir, "training_state.pt"),
+                    )
+                    if len(online):
+                        _save_online_replay_checkpoint(
+                            online,
+                            checkpoint_dir,
+                            fps=offline_dataset.fps,
+                        )
+                    update_last_checkpoint(checkpoint_dir)
+                    checkpoint_saved_this_step = True
+                actor_policy_payload = _serialize_actor_policy(policy, current_batch_id)
                 for optimizer in optimizers.values():
                     optimizer.zero_grad(set_to_none=True)
                 batch = critic_output = actor_output = offline_batch = None
+                if training_device.type == "cuda":
+                    torch.cuda.synchronize(training_device)
                 _move_training_state(policy, optimizers, "cpu")
-                torch.cuda.empty_cache()
+                if training_device.type == "cuda":
+                    torch.cuda.empty_cache()
                 learner_offloaded = True
+                _log_cuda_snapshot("before_actor_parameter_publish")
+
+                # Publishing parameters transfers GPU ownership back to the actor. Keep this put
+                # after the complete learner offload so the actor cannot restore concurrently.
+                parameters_queue.put(actor_policy_payload)
+                batch_id_waiting_for_ack = current_batch_id
                 logging.info(
-                    "No pending online updates; offloaded learner training state from %s to CPU",
-                    training_device,
+                    "[PI05][SYNC] batch_complete batch_id=%d updates_done=%d learner_offloaded actor_params_queued",
+                    current_batch_id,
+                    cfg.policy.online_updates_per_episode * online_episode_batch_size,
                 )
-            if shutdown_event is not None:
-                shutdown_event.wait(0.05)
-            else:
-                time.sleep(0.05)
-            continue
+                current_batch_id += 1
+                episodes_in_current_batch = 0
 
-        if learner_offloaded:
-            _move_training_state(policy, optimizers, training_device)
-            learner_offloaded = False
-            logging.info(
-                "Online updates available; restored learner training state to %s",
-                training_device,
-            )
-
-        if training_phase == "offline_initialization":
-            raw_offline = next(offline_iterator)
-            batch = _build_offline_batch(raw_offline, annotations, policy, preprocessor)
-        else:
-            online_size, offline_size = _online_batch_sizes(
-                cfg.batch_size, cfg.policy.online_only_after_initialization
-            )
-            batch = online.sample(online_size)
-            if offline_size:
-                raw_offline = _slice_raw_batch(next(offline_iterator), offline_size)
-                offline_batch = _build_offline_batch(
-                    raw_offline, annotations, policy, preprocessor
+            if (
+                cfg.save_checkpoint
+                and not checkpoint_saved_this_step
+                and (
+                    learner_step % cfg.save_freq == 0 or learner_step == cfg.steps
                 )
-                batch = concatenate_batch_transitions(batch, offline_batch)
-            pending_online_update_steps -= 1
-
-        started = time.time()
-        critic_output = policy(batch, model="critic")
-        optimizers["critic"].zero_grad()
-        critic_output["loss_critic"].backward()
-        critic_norm = torch.nn.utils.clip_grad_norm_(
-            policy.critic_ensemble.parameters(), cfg.policy.grad_clip_norm
-        )
-        optimizers["critic"].step()
-        policy.soft_update_target()
-
-        metrics = {
-            "loss_critic": critic_output["loss_critic"].item(),
-            "q": critic_output["q"].item(),
-            "target_q": critic_output["target_q"].item(),
-            "critic_grad_norm": float(critic_norm),
-        }
-        if learner_step % cfg.policy.actor_update_interval == 0:
-            actor_output = policy(batch, model="actor")
-            optimizers["actor"].zero_grad()
-            actor_output["loss_actor"].backward()
-            actor_norm = torch.nn.utils.clip_grad_norm_(
-                policy.actor.parameters(), cfg.policy.grad_clip_norm
-            )
-            optimizers["actor"].step()
-            metrics.update(
-                loss_actor=actor_output["loss_actor"].item(),
-                bc_loss=actor_output["bc_loss"].item(),
-                actor_q=actor_output["actor_q"].item(),
-                actor_grad_norm=float(actor_norm),
-            )
-
-        learner_step += 1
-        if learner_step % cfg.log_freq == 0:
-            metrics.update(
-                learner_step=learner_step,
-                training_phase=training_phase,
-                interaction_step=interaction_step,
-                online_episode_count=online_episode_count,
-                pending_online_update_steps=pending_online_update_steps,
-                online_replay_buffer_size=len(online),
-                update_frequency_hz=1 / max(time.time() - started, 1e-9),
-            )
-            logging.info("PI05 online-RL learner step %d: %s", learner_step, metrics)
-            if wandb_logger:
-                wandb_logger.log_dict(metrics, mode="train", custom_step_key="learner_step")
-
-        if cfg.save_checkpoint and (
-            learner_step % cfg.save_freq == 0 or learner_step == cfg.steps
-        ):
-            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, learner_step)
-            _save_actor_critic_checkpoint(
-                checkpoint_dir, learner_step, cfg, policy, optimizers
-            )
-            training_dir = os.path.join(checkpoint_dir, TRAINING_STATE_DIR)
-            os.makedirs(training_dir, exist_ok=True)
-            torch.save(
-                {
-                    "step": learner_step,
-                    "interaction_step": interaction_step,
-                    "pending_online_update_steps": pending_online_update_steps,
-                    "online_episode_count": online_episode_count,
-                },
-                os.path.join(training_dir, "training_state.pt"),
-            )
-            if len(online):
-                online.to_lerobot_dataset(
-                    repo_id="pi05_online_rl_online_replay",
-                    fps=offline_dataset.fps,
-                    root=os.path.join(checkpoint_dir, "replay_online"),
+            ):
+                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, learner_step)
+                _save_actor_critic_checkpoint(
+                    checkpoint_dir, learner_step, cfg, policy, optimizers
                 )
-            update_last_checkpoint(checkpoint_dir)
+                training_dir = os.path.join(checkpoint_dir, TRAINING_STATE_DIR)
+                os.makedirs(training_dir, exist_ok=True)
+                torch.save(
+                    {
+                        "step": learner_step,
+                        "interaction_step": interaction_step,
+                        "pending_online_update_steps": pending_online_update_steps,
+                        "online_episode_count": online_episode_count,
+                        "episodes_in_current_batch": episodes_in_current_batch,
+                        "current_batch_id": current_batch_id,
+                        "batch_id_waiting_for_ack": batch_id_waiting_for_ack,
+                    },
+                    os.path.join(training_dir, "training_state.pt"),
+                )
+                if len(online):
+                    _save_online_replay_checkpoint(
+                        online,
+                        checkpoint_dir,
+                        fps=offline_dataset.fps,
+                    )
+                update_last_checkpoint(checkpoint_dir)
+    except torch.cuda.OutOfMemoryError:
+        _log_cuda_snapshot("runtime_oom")
+        logging.exception("[PI05] CUDA out of memory in training loop")
+        raise
+    except Exception:
+        _log_cuda_snapshot("runtime_exception")
+        logging.exception("[PI05] Unexpected error in training loop")
+        raise
 
     return policy

@@ -84,6 +84,11 @@ from lerobot.onlineRL_evoRL.compact_transition import (
 from lerobot.onlineRL_evoRL.process import ProcessSignalHandler
 from lerobot.onlineRL_evoRL.queue import get_last_item_from_queue
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import (
+    RLT_ACTOR_ARCHITECTURE,
+    RLT_ACTOR_INPUT_ORDER,
+    RLT_ACTOR_NOISE_MODE,
+)
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.policies.utils import make_robot_action
 from lerobot.processor import TransitionKey, make_default_processors
@@ -916,6 +921,11 @@ class OnlineActorRuntime(ActorVLARuntime):
                 raise FileNotFoundError(f"Missing Actor checkpoint manifest: {metadata_path}")
             metadata = json.loads(metadata_path.read_text())
             expected = {
+                "format_version": 2,
+                "actor_architecture": RLT_ACTOR_ARCHITECTURE,
+                "actor_input_order": list(RLT_ACTOR_INPUT_ORDER),
+                "actor_noise_mode": RLT_ACTOR_NOISE_MODE,
+                "fixed_std": self.policy_cfg.fixed_std,
                 "base_policy_path": str(self.policy_path.resolve()),
                 "chunk_size": self.policy_cfg.chunk_size,
                 "z_dim": self.policy_cfg.z_dim,
@@ -1010,7 +1020,13 @@ class OnlineActorRuntime(ActorVLARuntime):
             ):
                 batch = self.preprocessor(observation)
                 features = self.policy.extract_rlt_features(batch)
-                chunk = self.policy.actor.mean(features["z_rl"], features["proprio"], features["ref_action"])
+                chunk = self.policy.actor(
+                    features["z_rl"],
+                    features["proprio"],
+                    features["ref_action"],
+                    deterministic=self.policy_cfg.actor_rollout_deterministic,
+                    apply_reference_dropout=False,
+                )
                 self._actor_actions.extend(chunk.transpose(0, 1))
 
         action = self.postprocessor(self._actor_actions.popleft())
@@ -1370,6 +1386,17 @@ def act_with_policy(
         if policy_action_smoother is not None:
             policy_action_smoother.reset()
 
+    def _safe_queue_size(q):
+        try:
+            return q.qsize()
+        except Exception:
+            return -1
+
+    sync_sequence_id = 0
+    sync_batch_size = max(1, getattr(cfg.policy.actor_learner_config, "online_episode_batch_size", 20))
+    sync_wait_timeout_s = getattr(cfg.policy.actor_learner_config, "parameter_sync_wait_timeout_s", 120.0)
+    completed_sync_batches = 0
+
     def action_to_robot_action_dict(action) -> dict[str, float] | None:
         if isinstance(action, dict):
             return {str(k): float(v) for k, v in action.items()}
@@ -1419,6 +1446,7 @@ def act_with_policy(
         timeout: bool,
     ) -> None:
         nonlocal list_transition_to_send_to_learner
+        nonlocal sync_sequence_id, completed_sync_batches
         logging.info(
             "[ACTOR] Global step %s: Episode reward=%s outcome=%s send=%s timeout=%s",
             interaction_step,
@@ -1458,9 +1486,22 @@ def act_with_policy(
             "actor_policy_fingerprint": _as_jsonable(vla_runtime.fingerprint.__dict__)
             if vla_runtime is not None and vla_runtime.fingerprint is not None
             else None,
+            "sync_id": None,
             **stats,
         }
+        sync_sequence_id += 1
+        sync_id = f"actor_sync_{sync_sequence_id:06d}"
+        episode_metadata["sync_id"] = sync_id
 
+        batch_sync_required = (
+            should_send
+            and len(list_transition_to_send_to_learner) > 0
+            and actor_control is not None
+            and actor_control.cfg.actor_mode == "online_actor"
+        )
+        batch_handoff_required = (
+            batch_sync_required and completed_sync_batches + 1 >= sync_batch_size
+        )
         if should_send and len(list_transition_to_send_to_learner) > 0:
             compact_episode = None
             needs_compact = cfg.online_transition.enabled or (
@@ -1483,16 +1524,101 @@ def act_with_policy(
                 )
 
             if cfg.online_transition.enabled:
-                transitions_queue.put(compact_episode_to_bytes(compact_episode))
-                interactions_queue.put(python_object_to_bytes(compact_episode["metadata"]))
-            elif actor_episode_writer is None:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
+                transition_payload = compact_episode_to_bytes(compact_episode)
+                interactions_payload = python_object_to_bytes(compact_episode["metadata"])
+                transition_payload_size = len(transition_payload)
+                transition_count = len(compact_episode["transitions"])
+            else:
+                transition_payload = transitions_to_bytes(list_transition_to_send_to_learner)
+                interactions_payload = python_object_to_bytes(episode_metadata)
+                transition_payload_size = len(transition_payload)
+                transition_count = len(list_transition_to_send_to_learner)
+
+            if batch_handoff_required:
+                logging.info(
+                    "[ACTOR][SYNC] batch_full episodes=%d; releasing GPU before publishing final episode",
+                    completed_sync_batches + 1,
                 )
-                interactions_queue.put(python_object_to_bytes(episode_metadata))
+                # The payload is now CPU-owned. Drop episode/action references before moving the
+                # policy so the learner cannot observe the final episode while actor CUDA tensors
+                # are still alive.
+                list_transition_to_send_to_learner = []
+                compact_episode = None
+                reset_policy_runtime()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                policy.to("cpu")
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    logging.info(
+                        "[ACTOR][SYNC] GPU released before final episode publish allocated_mb=%.2f reserved_mb=%.2f",
+                        torch.cuda.memory_allocated(device) / (1024 * 1024),
+                        torch.cuda.memory_reserved(device) / (1024 * 1024),
+                    )
+
+            # For a full sync batch this publication is the ownership handoff: learner can only
+            # receive the final episode after the actor has released its CUDA model.
+            transitions_queue.put(transition_payload)
+            interactions_queue.put(interactions_payload)
+
+            logging.info(
+                "[ACTOR][SYNC] send queued sync_id=%s transitions=%s bytes=%s transition_qsize=%s interaction_qsize=%s",
+                sync_id,
+                transition_count,
+                transition_payload_size,
+                _safe_queue_size(transitions_queue),
+                _safe_queue_size(interactions_queue),
+            )
+            logging.info(
+                "[ACTOR][SYNC] send complete sync_id=%s phase=end_of_episode",
+                sync_id,
+            )
         else:
             logging.info("[ACTOR] Discard current episode transitions; nothing sent or saved.")
+
+        if batch_sync_required:
+            completed_sync_batches += 1
+            if completed_sync_batches >= sync_batch_size:
+                logging.info(
+                    "[ACTOR][SYNC] batch published episodes=%d; waiting for learner parameters",
+                    completed_sync_batches,
+                )
+                while not shutdown_event.is_set():
+                    bytes_state_dict = get_last_item_from_queue(
+                        parameters_queue,
+                        block=True,
+                        timeout=sync_wait_timeout_s,
+                    )
+                    if bytes_state_dict is None:
+                        logging.warning(
+                            "[ACTOR][SYNC] timed out waiting for learner parameters after %.1fs",
+                            sync_wait_timeout_s,
+                        )
+                        continue
+                    policy.to(device)
+                    state_dicts = _load_policy_parameters_from_bytes(policy, bytes_state_dict, device)
+                    received_batch_id = state_dicts.get("batch_id")
+                    if received_batch_id is None:
+                        logging.warning("[ACTOR][SYNC] learner parameter payload missing batch_id; waiting for next payload")
+                        policy.to("cpu")
+                        torch.cuda.empty_cache()
+                        continue
+                    interactions_queue.put(
+                        python_object_to_bytes(
+                            {
+                                "interaction_type": "parameter_sync_ack",
+                                "batch_id": received_batch_id,
+                                "Interaction step": interaction_step,
+                            }
+                        )
+                    )
+                    logging.info(
+                        "[ACTOR][SYNC] actor received parameters and sent ack batch_id=%s",
+                        received_batch_id,
+                    )
+                    completed_sync_batches = 0
+                    reset_policy_runtime()
+                    break
 
         policy_timer.reset()
         if reset_to_home:
@@ -1721,18 +1847,22 @@ def establish_learner_connection(
     Returns:
         bool: True if the connection is established, False otherwise.
     """
-    for _ in range(attempts):
+    for attempt in range(1, attempts + 1):
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down establish_learner_connection")
             return False
 
         # Force a connection attempt and check state
         try:
-            logging.info("[ACTOR] Send ready message to Learner")
+            logging.info("[ACTOR] Send ready message to Learner (attempt=%d)", attempt)
             if stub.Ready(services_pb2.Empty()) == services_pb2.Empty():
                 return True
         except grpc.RpcError as e:
-            logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")
+            logging.warning(
+                "[ACTOR] Waiting for Learner to be ready... attempt=%d delay=2s error=%s",
+                attempt,
+                e,
+            )
             time.sleep(2)
     return False
 
@@ -1802,9 +1932,10 @@ def receive_policy(
             shutdown_event,
             log_prefix="[ACTOR] parameters",
         )
+        logging.info("[ACTOR][SYNC] receive policy stream completed")
 
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        logging.exception("[ACTOR] gRPC error while receiving parameters: %s", e)
 
     if not use_threads(cfg):
         grpc_channel.close()
@@ -1845,14 +1976,16 @@ def send_transitions(
             port=cfg.policy.actor_learner_config.learner_port,
         )
 
+    logging.info("[ACTOR][SYNC] start streaming transitions")
     try:
         learner_client.SendTransitions(
             transitions_stream(
                 shutdown_event, transitions_queue, cfg.policy.actor_learner_config.queue_get_timeout
             )
         )
+        logging.info("[ACTOR][SYNC] stream transitions completed")
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        logging.exception("[ACTOR] gRPC error while streaming transitions: %s", e)
 
     logging.info("[ACTOR] Finished streaming transitions")
 
@@ -1898,14 +2031,16 @@ def send_interactions(
             port=cfg.policy.actor_learner_config.learner_port,
         )
 
+    logging.info("[ACTOR][SYNC] start streaming interactions")
     try:
         learner_client.SendInteractions(
             interactions_stream(
                 shutdown_event, interactions_queue, cfg.policy.actor_learner_config.queue_get_timeout
             )
         )
+        logging.info("[ACTOR][SYNC] stream interactions completed")
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        logging.exception("[ACTOR] gRPC error while streaming interactions: %s", e)
 
     logging.info("[ACTOR] Finished streaming interactions")
 
@@ -1916,6 +2051,7 @@ def send_interactions(
 
 # 后台发送流
 def transitions_stream(shutdown_event: Event, transitions_queue: Queue, timeout: float) -> services_pb2.Empty:  # type: ignore
+    stream_seq = 0
     while not shutdown_event.is_set():
         try:
             # 从 transitions_queue 取消息
@@ -1924,9 +2060,27 @@ def transitions_stream(shutdown_event: Event, transitions_queue: Queue, timeout:
             logging.debug("[ACTOR] Transition queue is empty")
             continue
 
-        # 通过 send_bytes_in_chunks 发给 learner 的 SendTransitions gRPC 接口
-        yield from send_bytes_in_chunks(
-            message, services_pb2.Transition, log_prefix="[ACTOR] Send transitions"
+        stream_seq += 1
+        start = time.perf_counter()
+        message_size = len(message) if isinstance(message, (bytes, bytearray)) else -1
+        logging.info(
+            "[ACTOR][SYNC] transitions stream start seq=%d bytes=%d queue_size=%d",
+            stream_seq,
+            message_size,
+            transitions_queue.qsize() if hasattr(transitions_queue, "qsize") else -1,
+        )
+        chunk_count = 0
+        for chunk in send_bytes_in_chunks(
+            message, services_pb2.Transition, log_prefix=f"[ACTOR] Send transitions seq={stream_seq}"
+        ):
+            chunk_count += 1
+            yield chunk
+        latency_ms = (time.perf_counter() - start) * 1000
+        logging.info(
+            "[ACTOR][SYNC] transitions stream completed seq=%d chunks=%d latency_ms=%.2f",
+            stream_seq,
+            chunk_count,
+            latency_ms,
         )
 
     return services_pb2.Empty()
@@ -1937,6 +2091,7 @@ def interactions_stream(
     interactions_queue: Queue,
     timeout: float,  # type: ignore
 ) -> services_pb2.Empty:
+    stream_seq = 0
     while not shutdown_event.is_set():
         try:
             message = interactions_queue.get(block=True, timeout=timeout)
@@ -1944,10 +2099,29 @@ def interactions_stream(
             logging.debug("[ACTOR] Interaction queue is empty")
             continue
 
-        yield from send_bytes_in_chunks(
+        stream_seq += 1
+        start = time.perf_counter()
+        message_size = len(message) if isinstance(message, (bytes, bytearray)) else -1
+        logging.info(
+            "[ACTOR][SYNC] interactions stream start seq=%d bytes=%d queue_size=%d",
+            stream_seq,
+            message_size,
+            interactions_queue.qsize() if hasattr(interactions_queue, "qsize") else -1,
+        )
+        chunk_count = 0
+        for chunk in send_bytes_in_chunks(
             message,
             services_pb2.InteractionMessage,
-            log_prefix="[ACTOR] Send interactions",
+            log_prefix=f"[ACTOR] Send interactions seq={stream_seq}",
+        ):
+            chunk_count += 1
+            yield chunk
+        latency_ms = (time.perf_counter() - start) * 1000
+        logging.info(
+            "[ACTOR][SYNC] interactions stream completed seq=%d chunks=%d latency_ms=%.2f",
+            stream_seq,
+            chunk_count,
+            latency_ms,
         )
 
     return services_pb2.Empty()
@@ -1962,29 +2136,23 @@ def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device)
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
-        state_dicts = bytes_to_state_dict(bytes_state_dict)
+        _load_policy_parameters_from_bytes(policy, bytes_state_dict, device)
 
-        # TODO: check encoder parameter synchronization possible issues:
-        # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict
-        #    instead of the updated encoder params from critic (which is optimized separately)
-        # 2. When freeze_vision_encoder=True, we waste bandwidth sending/loading frozen params
-        # 3. Need to handle encoder params correctly for both actor and discrete_critic
-        # Potential fixes:
-        # - Send critic's encoder state when shared_encoder=True
-        # - Skip encoder params entirely when freeze_vision_encoder=True
-        # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
 
-        # Load actor state dict 加载 actor state dict
-        actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
-        policy.actor.load_state_dict(actor_state_dict)
+def _load_policy_parameters_from_bytes(policy: nn.Module, bytes_state_dict, device) -> dict[str, Any]:
+    state_dicts = bytes_to_state_dict(bytes_state_dict)
 
-        # Load discrete critic if present 如果有 discrete critic，也加载
-        if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
-            discrete_critic_state_dict = move_state_dict_to_device(
-                state_dicts["discrete_critic"], device=device
-            )
-            policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
-            logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
+    actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
+    policy.actor.load_state_dict(actor_state_dict)
+
+    if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
+        discrete_critic_state_dict = move_state_dict_to_device(
+            state_dicts["discrete_critic"], device=device
+        )
+        policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
+        logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
+
+    return state_dicts
 
 
 #  Utilities functions
@@ -2008,8 +2176,10 @@ def push_transitions_to_transport_queue(transitions: list, transitions_queue):
                 logging.warning(f"Found NaN values in transition {key}")
 
         transition_to_send_to_learner.append(tr)
+    payload = transitions_to_bytes(transition_to_send_to_learner)
     # 序列化后放入 transitions_queue
-    transitions_queue.put(transitions_to_bytes(transition_to_send_to_learner))
+    transitions_queue.put(payload)
+    return payload
 
 
 def get_frequency_stats(timer: TimerManager) -> dict[str, float]:
