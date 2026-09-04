@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.scripts.recording_loop import _RTCActionChunkRunner, record_loop
+from lerobot.scripts.recording_loop import _RTCActionChunkRunner, _RTCChunkPrediction, record_loop
 from lerobot.utils.constants import ACTION
 
 
@@ -98,6 +98,53 @@ class RTCActionChunkRunnerTest(unittest.TestCase):
         finally:
             policy.second_release.set()
             policy.third_release.set()
+            runner.close()
+
+    def test_custom_actor_chunk_uses_execution_prefix_fusion(self):
+        policy = _ChunkPolicy()
+        predictor_calls = []
+
+        def actor_chunk_predictor(observation, inference_delay, previous_actions, task, robot_type):
+            predictor_calls.append(
+                (observation, inference_delay, previous_actions.detach().clone(), task, robot_type)
+            )
+            return _RTCChunkPrediction(
+                actions=torch.arange(100, 106, dtype=torch.float32).reshape(1, 6, 1),
+                apply_prefix_fusion=True,
+            )
+
+        runner = _RTCActionChunkRunner(
+            policy=policy,
+            preprocessor=_IdentityProcessor(),
+            postprocessor=_IdentityProcessor(),
+            rtc=RTCConfig(enabled=True, execution_horizon=4),
+            fps=30,
+            queue_threshold=3,
+            task="actor-task",
+            robot_type="test_robot",
+            chunk_predictor=actor_chunk_predictor,
+        )
+        previous = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+
+        try:
+            original, processed, snapshot, apply_fusion, _ = runner._infer_chunk(
+                {"observation.state": np.array([0.0], dtype=np.float32)},
+                2,
+                previous,
+                "actor-task",
+                "test_robot",
+            )
+            self.assertIsNone(processed)
+            self.assertTrue(apply_fusion)
+            torch.testing.assert_close(snapshot, previous)
+            self.assertEqual(predictor_calls[0][1], 2)
+            torch.testing.assert_close(predictor_calls[0][2], previous)
+            self.assertEqual(predictor_calls[0][3:], ("actor-task", "test_robot"))
+
+            fused = runner._fuse_action_prefix(original, snapshot, real_delay=2)
+            expected = torch.tensor([[0.0], [1.0], [35.333332], [69.666664], [104.0], [105.0]])
+            torch.testing.assert_close(fused, expected)
+        finally:
             runner.close()
 
     def test_disabled_rtc_keeps_synchronous_select_action_path(self):

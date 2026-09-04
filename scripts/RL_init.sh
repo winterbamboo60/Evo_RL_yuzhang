@@ -6,9 +6,15 @@ Step0. 主从臂都设置成从动模式
 Step1. 切换环境
 
 ```bash
-# mkdir -p ./package_sorting_env_raw && tar -xzf ./package_sorting.tar.gz -C ./package_sorting_env_raw
+# mkdir -p ./package_sorting_env && tar -xzf ./package_sorting.tar.gz -C ./package_sorting_env
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
+
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+/home/lenovo/code/envs/package_sorting_env/bin/conda-unpack
+
+source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
+/mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/conda-unpack
 
 # 适配固件版本：PIPER合并固件_MC(S-V1.9-0)_DRV(V2.0.7 ).bin
 # 卸载当前 0.6.1
@@ -16,6 +22,12 @@ python -m pip uninstall -y piper_sdk
 # 安装 1_0_0_b1 分支
 python -m pip install --no-cache-dir \
 "git+https://github.com/agilexrobotics/piper_sdk.git@1_0_0_b1"
+
+# 下载grpc，用于onlineRL
+pip install grpcio
+
+# 用于日志监控
+pip install tensorboard
 
 # 修改lerobot库路径
 pip install -e . --no-deps --no-build-isolation

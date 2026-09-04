@@ -16,7 +16,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import cycle
 from lerobot.onlineRL_evoRL.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.onlineRL_evoRL.compact_transition import (
+    PRIMITIVE_TRANSITIONS,
     SCHEMA_NAME,
+    SLIDING_WINDOW_TRANSITIONS,
     bytes_to_episode_payload,
     is_compact_episode,
     validate_compact_episode,
@@ -169,15 +171,26 @@ def _add_compact_episode(
             f"Compact episode feature model {feature_path} does not match learner base {expected_path}"
         )
 
-    primitive = [
+    transitions = [
         move_transition_to_device(transition, device=replay.storage_device)
         for transition in payload["transitions"]
     ]
-    episodes = split_episodes(primitive)
-    if len(episodes) != 1:
-        raise ValueError(f"Expected one compact online episode per payload, got {len(episodes)}")
+    transition_layout = payload.get("transition_layout", PRIMITIVE_TRANSITIONS)
+    if transition_layout == PRIMITIVE_TRANSITIONS:
+        episodes = split_episodes(transitions)
+        if len(episodes) != 1:
+            raise ValueError(f"Expected one compact online episode per payload, got {len(episodes)}")
+        replay_transitions = sliding_windows(
+            episodes[0],
+            policy.config.chunk_size,
+            stride=payload.get("sliding_window_stride", 1),
+        )
+    elif transition_layout == SLIDING_WINDOW_TRANSITIONS:
+        replay_transitions = transitions
+    else:  # validate_compact_episode rejects this; keep the branch locally exhaustive.
+        raise ValueError(f"Unsupported compact transition layout: {transition_layout!r}")
 
-    first_state = episodes[0][0]["state"]
+    first_state = replay_transitions[0]["state"]
     if first_state["z_rl"].flatten(1).shape[1] != policy.config.z_dim:
         raise ValueError("Compact z_rl dimension does not match learner policy.z_dim")
     if first_state["proprio"].flatten(1).shape[1] != policy.config.proprio_dim:
@@ -187,7 +200,7 @@ def _add_compact_episode(
         raise ValueError("Compact ref_action shape does not match learner chunk/action dimensions")
 
     count = 0
-    for transition in sliding_windows(episodes[0], policy.config.chunk_size):
+    for transition in replay_transitions:
         replay.add(**transition)
         count += 1
     return count, metadata

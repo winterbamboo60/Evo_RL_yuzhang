@@ -4,10 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lerobot.configs.train import ActorOnlyConfig
+from lerobot.configs.train import ActorOnlyConfig, OnlineTransitionConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.onlineRL_evoRL.actor_new import ActorEpisodeWriter
-from lerobot.onlineRL_evoRL.compact_transition import make_compact_episode
+from lerobot.onlineRL_evoRL.actor_new import ActorEpisodeWriter, ActorVLARuntime
+from lerobot.onlineRL_evoRL.compact_transition import (
+    SLIDING_WINDOW_TRANSITIONS,
+    make_compact_episode,
+)
 from lerobot.onlineRL_evoRL.gym_manipulator import (
     RobotEnv,
     create_transition,
@@ -24,6 +27,72 @@ def test_actor_only_save_format_validation():
     assert ActorOnlyConfig(save_format="lerobot").save_format == "lerobot"
     with pytest.raises(ValueError, match="actor_only.save_format"):
         ActorOnlyConfig(save_format="invalid")
+
+
+def test_online_transition_stride_validation():
+    assert OnlineTransitionConfig().sliding_window_stride == 1
+    assert OnlineTransitionConfig(sliding_window_stride=2).sliding_window_stride == 2
+    with pytest.raises(ValueError, match="sliding_window_stride"):
+        OnlineTransitionConfig(sliding_window_stride=0)
+
+
+def test_compact_episode_computes_features_only_at_stride_boundaries():
+    class Policy:
+        def __init__(self):
+            self.observation_indices = []
+
+        def predict_action_chunk_with_rlt(self, batch):
+            state = batch[OBS_STATE].float()
+            self.observation_indices.extend(int(value) for value in state[:, 0].tolist())
+            return {
+                "z_rl": torch.cat((state, state + 100), dim=-1),
+                "actions": state.unsqueeze(1).repeat(1, 4, 1),
+            }
+
+    policy = Policy()
+    runtime = ActorVLARuntime.__new__(ActorVLARuntime)
+    runtime.policy = policy
+    runtime.policy_cfg = SimpleNamespace(chunk_size=4, proprio_dim=1)
+    runtime.preprocessor = lambda raw: {
+        OBS_STATE: raw[OBS_STATE].reshape(1, -1).float(),
+        ACTION: raw[ACTION].reshape(1, -1).float(),
+    }
+    runtime.fingerprint = SimpleNamespace(resolved_path="/tmp/base")
+    runtime.cfg = SimpleNamespace(online_transition=SimpleNamespace(sliding_window_stride=2))
+
+    transitions = []
+    for index in range(7):
+        transitions.append(
+            {
+                "state": {OBS_STATE: torch.tensor([[float(index)]])},
+                ACTION: torch.tensor([[index + 0.5]]),
+                "reward": float(index),
+                "next_state": {OBS_STATE: torch.tensor([[float(index + 1)]])},
+                "done": index == 6,
+                "truncated": False,
+                "complementary_info": {"is_intervention": index % 2 == 0},
+            }
+        )
+
+    payload = runtime.build_compact_episode(
+        transitions,
+        metadata={"task": "test"},
+        batch_size=3,
+    )
+
+    assert policy.observation_indices == [0, 2, 4, 6, 7]
+    assert payload["transition_layout"] == SLIDING_WINDOW_TRANSITIONS
+    assert payload["sliding_window_stride"] == 2
+    assert payload["primitive_steps"] == 7
+    assert len(payload["transitions"]) == 4
+    assert payload["transitions"][0]["state"]["z_rl"][0, 0] == 0
+    assert payload["transitions"][0]["next_state"]["z_rl"][0, 0] == 4
+    assert payload["transitions"][0]["target_action_chunk"][:, 0].tolist() == [
+        0.5,
+        1.5,
+        2.5,
+        3.5,
+    ]
 
 
 def test_single_env_sends_and_records_unbatched_policy_action():

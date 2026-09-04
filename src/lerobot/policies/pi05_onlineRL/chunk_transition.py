@@ -21,12 +21,25 @@ def _intervention(transition: dict) -> bool:
     return bool(value)
 
 
-def build_sliding_window_transitions(
-    episode: list[dict], horizon: int = 50
-) -> list[dict]:
-    """Return one padded macro transition for every primitive step in an episode."""
+def sliding_window_observation_indices(episode_length: int, horizon: int = 50, stride: int = 1) -> list[int]:
+    """Return observation indices needed by strided macro-transition boundaries."""
     if horizon <= 0:
         raise ValueError("horizon must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if episode_length <= 0:
+        return []
+
+    starts = range(0, episode_length, stride)
+    return sorted(set(starts) | {min(start + horizon, episode_length) for start in starts})
+
+
+def build_sliding_window_transitions(episode: list[dict], horizon: int = 50, stride: int = 1) -> list[dict]:
+    """Return padded macro transitions starting every ``stride`` primitive steps."""
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
     if not episode:
         return []
 
@@ -35,7 +48,7 @@ def build_sliding_window_transitions(
     first_action = episode[0][ACTION].reshape(-1)
     action_dim = first_action.numel()
 
-    for start in range(episode_length):
+    for start in range(0, episode_length, stride):
         valid_length = min(horizon, episode_length - start)
         action_chunk = first_action.new_zeros((horizon, action_dim))
         rewards = first_action.new_zeros(horizon)
@@ -86,9 +99,9 @@ def split_episodes(transitions: list[dict]) -> list[list[dict]]:
     return episodes
 
 
-def sliding_windows(transitions: list[dict], horizon: int = 50) -> list[dict]:
+def sliding_windows(transitions: list[dict], horizon: int = 50, stride: int = 1) -> list[dict]:
     return [
         macro
         for episode in split_episodes(transitions)
-        for macro in build_sliding_window_transitions(episode, horizon)
+        for macro in build_sliding_window_transitions(episode, horizon, stride)
     ]

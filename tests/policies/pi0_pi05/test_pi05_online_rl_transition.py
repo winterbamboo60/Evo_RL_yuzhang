@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import torch
 
 from lerobot.onlineRL_evoRL.buffer import ReplayBuffer
-from lerobot.policies.pi05_onlineRL.chunk_transition import build_sliding_window_transitions
+from lerobot.policies.pi05_onlineRL.chunk_transition import (
+    build_sliding_window_transitions,
+    sliding_window_observation_indices,
+)
 from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import PI05OnlineRLPolicy
 from lerobot.utils.constants import ACTION
 
@@ -66,6 +69,17 @@ def test_length_70_sliding_windows_and_bootstrap_mask():
     assert windows[50]["next_valid_action_mask"].sum() == 0
     assert windows[50]["done"]
     assert windows[50]["target_action_chunk"][20:].eq(0).all()
+
+
+def test_stride_two_windows_and_required_observation_indices():
+    windows = build_sliding_window_transitions(_episode(70), horizon=50, stride=2)
+
+    assert len(windows) == 35
+    assert [window["state"]["z_rl"].item() for window in windows] == list(range(0, 70, 2))
+    assert sliding_window_observation_indices(70, horizon=50, stride=2) == list(range(0, 71, 2))
+    assert windows[0]["next_state"]["z_rl"].item() == 50
+    assert windows[-1]["next_state"]["z_rl"].item() == 70
+    assert windows[-1]["valid_action_mask"].sum() == 2
 
 
 def test_chunk_replay_keeps_explicit_next_state_and_masks():

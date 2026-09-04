@@ -57,7 +57,7 @@ import traceback
 from collections import deque
 from contextlib import nullcontext
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Queue as ThreadQueue
@@ -77,6 +77,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.onlineRL_evoRL.compact_transition import (
     SCHEMA_NAME,
+    SLIDING_WINDOW_TRANSITIONS,
     compact_episode_to_bytes,
     make_compact_episode,
     save_compact_episode,
@@ -84,17 +85,27 @@ from lerobot.onlineRL_evoRL.compact_transition import (
 from lerobot.onlineRL_evoRL.process import ProcessSignalHandler
 from lerobot.onlineRL_evoRL.queue import get_last_item_from_queue
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.pi05_onlineRL.chunk_transition import (
+    build_sliding_window_transitions,
+    sliding_window_observation_indices,
+)
 from lerobot.policies.pi05_onlineRL.modeling_pi05_online_rl import (
     RLT_ACTOR_ARCHITECTURE,
     RLT_ACTOR_INPUT_ORDER,
     RLT_ACTOR_NOISE_MODE,
 )
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.policies.utils import make_robot_action
 from lerobot.processor import TransitionKey, make_default_processors
 from lerobot.robots import piper_follower, so_follower  # noqa: F401
 from lerobot.scripts.recording_hil import PolicySyncDualArmExecutor
-from lerobot.scripts.recording_loop import _OnlinePolicyActionSmoother, _postprocess_policy_action
+from lerobot.scripts.recording_loop import (
+    _OnlinePolicyActionSmoother,
+    _RTCActionChunkRunner,
+    _RTCChunkPrediction,
+    _postprocess_policy_action,
+)
 from lerobot.teleoperators import gamepad, piper_leader, so_leader  # noqa: F401
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
@@ -150,6 +161,8 @@ class ActorPipelineConfig(TrainRLServerPipelineConfig):
     save_format: str = "lerobot"
     actor_checkpoint_path: str | None = None
     task_hotkeys_path: str | None = None
+    rtc: RTCConfig = field(default_factory=lambda: RTCConfig(enabled=False, execution_horizon=25))
+    rtc_action_queue_threshold: int = 32
 
 
 @dataclass
@@ -223,6 +236,13 @@ def _normalize_actor_config(cfg: ActorPipelineConfig) -> None:
         raise ValueError("online_actor mode only supports save_format=transition")
     if not cfg.actor_vla_policy.enabled or not cfg.actor_vla_policy.policy_path:
         raise ValueError("actor_mode requires actor_vla_policy.enabled=true and policy_path")
+    if cfg.rtc.enabled:
+        if cfg.env is None or cfg.env.fps is None or cfg.env.fps <= 0:
+            raise ValueError("rtc.enabled=true requires env.fps > 0")
+        if cfg.rtc.execution_horizon <= 0:
+            raise ValueError("rtc.execution_horizon must be > 0")
+        if cfg.rtc_action_queue_threshold < 0:
+            raise ValueError("rtc_action_queue_threshold must be >= 0")
 
     cfg.actor_only.enabled = cfg.actor_mode == "vla_only"
     cfg.actor_only.save_format = cfg.save_format
@@ -299,9 +319,10 @@ class ActorKeyboardController(KeyboardController):
                 if not self.control.actor_available:
                     logging.error("[ACTOR] B ignored: online Actor weights are unavailable.")
                     continue
-                self.control.use_actor = not self.control.use_actor
+                next_use_actor = not self.control.use_actor
                 if self.control.runtime is not None:
                     self.control.runtime.reset_action_state()
+                self.control.use_actor = next_use_actor
                 if self.control.smoother is not None:
                     self.control.smoother.reset()
                 logging.info(
@@ -311,9 +332,9 @@ class ActorKeyboardController(KeyboardController):
                 continue
 
             task = self.control.task_hotkeys.tasks[key]
-            self.control.cfg.env.task = task
             if self.control.runtime is not None:
                 self.control.runtime.reset_action_state()
+            self.control.cfg.env.task = task
             if self.control.smoother is not None:
                 self.control.smoother.reset()
             state.reset_episode = True
@@ -742,7 +763,7 @@ render();
 
 
 class ActorVLARuntime:
-    def __init__(self, cfg: TrainRLServerPipelineConfig):
+    def __init__(self, cfg: ActorPipelineConfig):
         if not cfg.actor_vla_policy.policy_path:
             raise ValueError("actor_vla_policy.enabled=true requires actor_vla_policy.policy_path")
         self.cfg = cfg
@@ -753,9 +774,11 @@ class ActorVLARuntime:
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
+        self._rtc_runner: _RTCActionChunkRunner | None = None
         self.reload()
 
     def reload(self) -> None:
+        self.close()
         if not self.policy_path.exists():
             raise FileNotFoundError(f"VLA policy path does not exist: {self.policy_path}")
         policy_cfg = PreTrainedConfig.from_pretrained(self.policy_path)
@@ -763,6 +786,7 @@ class ActorVLARuntime:
         if self.cfg.policy is not None and getattr(self.cfg.policy, "device", None):
             policy_cfg.device = self.cfg.policy.device
         policy = make_policy(policy_cfg, env_cfg=self.cfg.env).eval()
+        self._configure_rtc_policy(policy)
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy_cfg,
             pretrained_path=str(policy_cfg.pretrained_path),
@@ -777,6 +801,97 @@ class ActorVLARuntime:
         self.postprocessor = postprocessor
         self.fingerprint = _fingerprint_policy_path(self.policy_path)
         logging.info("[ACTOR] Loaded VLA policy from %s", self.policy_path)
+
+    def _rtc_enabled(self) -> bool:
+        return self.cfg.rtc.enabled
+
+    def _configure_rtc_policy(self, policy: Any) -> None:
+        init_rtc_processor = getattr(policy, "init_rtc_processor", None)
+        if not self._rtc_enabled():
+            if hasattr(policy.config, "rtc_config"):
+                policy.config.rtc_config = None
+                if callable(init_rtc_processor):
+                    init_rtc_processor()
+            return
+        predict_action_chunk = getattr(policy, "predict_action_chunk", None)
+        if not callable(init_rtc_processor) or not callable(predict_action_chunk):
+            raise ValueError(
+                f"Policy type {getattr(policy.config, 'type', '<unknown>')!r} does not support RTC"
+            )
+        policy.config.rtc_config = self.cfg.rtc
+        init_rtc_processor()
+        logging.info(
+            "[ACTOR][RTC] enabled horizon=%d queue_threshold=%d",
+            self.cfg.rtc.execution_horizon,
+            self.cfg.rtc_action_queue_threshold,
+        )
+
+    def _predict_rtc_chunk(
+        self,
+        observation_frame: dict[str, Any],
+        inference_delay: int,
+        previous_actions: torch.Tensor | None,
+        task: str | None,
+        robot_type: str | None,
+    ) -> _RTCChunkPrediction:
+        if self.policy is None or self.preprocessor is None:
+            raise RuntimeError("VLA runtime is not loaded")
+        inference_device = get_safe_torch_device(self.policy_cfg.device)
+        observation = prepare_observation_for_inference(
+            copy(observation_frame),
+            inference_device,
+            task,
+            robot_type,
+        )
+        batch = self.preprocessor(observation)
+        actions = self.policy.predict_action_chunk(
+            batch,
+            inference_delay=inference_delay,
+            prev_chunk_left_over=previous_actions,
+        )
+        return _RTCChunkPrediction(actions=actions)
+
+    def _get_or_create_rtc_runner(self, robot_type: str | None) -> _RTCActionChunkRunner:
+        if self.policy is None or self.preprocessor is None or self.postprocessor is None:
+            raise RuntimeError("VLA runtime is not loaded")
+        task = getattr(self.cfg.env, "task", None)
+        if self._rtc_runner is None:
+            self._rtc_runner = _RTCActionChunkRunner(
+                policy=self.policy,
+                preprocessor=self.preprocessor,
+                postprocessor=self.postprocessor,
+                rtc=self.cfg.rtc,
+                fps=int(self.cfg.env.fps),
+                queue_threshold=self.cfg.rtc_action_queue_threshold,
+                task=task,
+                robot_type=robot_type,
+                chunk_predictor=self._predict_rtc_chunk,
+            )
+        else:
+            self._rtc_runner.task = task
+            self._rtc_runner.robot_type = robot_type
+        return self._rtc_runner
+
+    def invalidate_action_state(self) -> None:
+        if self._rtc_runner is not None:
+            self._rtc_runner.invalidate()
+
+    def quiesce_action_state(self) -> None:
+        if self._rtc_runner is not None:
+            self._rtc_runner.invalidate()
+            self._rtc_runner.wait_for_idle()
+
+    def reset_action_state(self) -> None:
+        self.quiesce_action_state()
+        for component in (self.policy, self.preprocessor, self.postprocessor):
+            reset = getattr(component, "reset", None)
+            if callable(reset):
+                reset()
+
+    def close(self) -> None:
+        if self._rtc_runner is not None:
+            self._rtc_runner.close()
+            self._rtc_runner = None
 
     def reload_if_changed(self) -> None:
         now = time.monotonic()
@@ -797,6 +912,9 @@ class ActorVLARuntime:
     ) -> torch.Tensor:
         if self.policy is None or self.preprocessor is None or self.postprocessor is None:
             raise RuntimeError("VLA runtime is not loaded")
+        if self._rtc_enabled():
+            action = self._get_or_create_rtc_runner(robot_type).get_action(observation_frame)
+            return action.to(device) if isinstance(action, torch.Tensor) else action
         action = predict_action(
             observation=observation_frame,
             policy=self.policy,
@@ -817,12 +935,17 @@ class ActorVLARuntime:
     ) -> dict[str, Any]:
         if self.policy is None or self.preprocessor is None or self.fingerprint is None:
             raise RuntimeError("VLA runtime is not loaded")
+        episode_length = len(transitions)
+        horizon = int(self.policy_cfg.chunk_size)
+        stride = self.cfg.online_transition.sliding_window_stride
         observations = [transition["state"] for transition in transitions]
         observations.append(transitions[-1]["next_state"])
         actions = [transition[ACTION] for transition in transitions]
         actions.append(transitions[-1][ACTION])
 
-        features = {key: [] for key in ("z_rl", "proprio", "ref_action")}
+        feature_indices = sliding_window_observation_indices(episode_length, horizon, stride)
+        feature_index_set = set(feature_indices)
+        features_by_observation: dict[int, dict[str, torch.Tensor]] = {}
         normalized_actions = []
         for start in range(0, len(observations), batch_size):
             items = []
@@ -846,26 +969,40 @@ class ActorVLARuntime:
                 for key, value in items[0].items()
                 if isinstance(value, torch.Tensor)
             }
-            outputs = self.policy.predict_action_chunk_with_rlt(batch)
-            proprio_dim = getattr(self.policy_cfg, "proprio_dim", batch[OBS_STATE].shape[-1])
+            for offset, part in enumerate(batch[ACTION].split(1)):
+                if start + offset < episode_length:
+                    normalized_actions.append(part.detach().cpu())
+
+            selected_offsets = [offset for offset in range(len(items)) if start + offset in feature_index_set]
+            if not selected_offsets:
+                continue
+            feature_batch = {key: value[selected_offsets] for key, value in batch.items()}
+            outputs = self.policy.predict_action_chunk_with_rlt(feature_batch)
+            proprio_dim = getattr(self.policy_cfg, "proprio_dim", feature_batch[OBS_STATE].shape[-1])
             batch_features = {
                 "z_rl": outputs["z_rl"],
-                "proprio": batch[OBS_STATE][..., :proprio_dim],
+                "proprio": feature_batch[OBS_STATE][..., :proprio_dim],
                 "ref_action": outputs["actions"],
             }
-            normalized_actions.extend(part.detach().cpu() for part in batch[ACTION].split(1))
-            for key, value in batch_features.items():
-                features[key].extend(part.detach().cpu() for part in value.split(1))
+            selected_indices = [start + offset for offset in selected_offsets]
+            for feature_index, parts in zip(
+                selected_indices,
+                zip(*(value.split(1) for value in batch_features.values()), strict=True),
+                strict=True,
+            ):
+                features_by_observation[feature_index] = {
+                    key: part.detach().cpu() for key, part in zip(batch_features, parts, strict=True)
+                }
 
-        compact_transitions = []
+        primitive_transitions = []
         for index, transition in enumerate(transitions):
             intervention = (transition.get("complementary_info") or {}).get("is_intervention", False)
             if isinstance(intervention, torch.Tensor):
                 intervention = bool(intervention.detach().float().max().item() > 0.5)
-            compact_transitions.append(
+            primitive_transitions.append(
                 {
-                    "state": {key: features[key][index] for key in features},
-                    "next_state": {key: features[key][index + 1] for key in features},
+                    "state": features_by_observation.get(index, {}),
+                    "next_state": features_by_observation.get(index + 1, {}),
                     ACTION: normalized_actions[index],
                     "reward": transition["reward"],
                     "done": bool(transition["done"]),
@@ -874,11 +1011,31 @@ class ActorVLARuntime:
                 }
             )
 
-        compact_metadata = {**metadata, "transition_schema": SCHEMA_NAME}
+        compact_transitions = build_sliding_window_transitions(
+            primitive_transitions, horizon=horizon, stride=stride
+        )
+        logging.info(
+            "Built %d sliding-window transitions from %d primitive steps with stride=%d; "
+            "computed RLT features for %d/%d observations",
+            len(compact_transitions),
+            episode_length,
+            stride,
+            len(feature_indices),
+            episode_length + 1,
+        )
+        compact_metadata = {
+            **metadata,
+            "transition_schema": SCHEMA_NAME,
+            "transition_layout": SLIDING_WINDOW_TRANSITIONS,
+            "sliding_window_stride": stride,
+        }
         return make_compact_episode(
             transitions=compact_transitions,
             metadata=compact_metadata,
             feature_model=_as_jsonable(self.fingerprint.__dict__),
+            transition_layout=SLIDING_WINDOW_TRANSITIONS,
+            sliding_window_stride=stride,
+            primitive_steps=episode_length,
         )
 
 
@@ -905,6 +1062,9 @@ class OnlineActorRuntime(ActorVLARuntime):
             pretrained_path=str(self.policy_path),
             dataset_stats=control.dataset_meta.stats,
         )
+        self._rtc_runner: _RTCActionChunkRunner | None = None
+        self._configure_rtc_policy(self.policy)
+        # Legacy non-RTC executor queue; RTC mode bypasses this deque entirely.
         self._actor_actions: deque[torch.Tensor] = deque()
         self._actor_checkpoint = _find_actor_checkpoint(self.cfg.actor_checkpoint_path)
         self._actor_checkpoint_stamp: tuple[int, int] | None = None
@@ -989,9 +1149,49 @@ class OnlineActorRuntime(ActorVLARuntime):
 
     def reset_action_state(self) -> None:
         self._actor_actions.clear()
-        reset = getattr(self.policy, "reset", None)
-        if callable(reset):
-            reset()
+        super().reset_action_state()
+
+    def _predict_rtc_chunk(
+        self,
+        observation_frame: dict[str, Any],
+        inference_delay: int,
+        previous_actions: torch.Tensor | None,
+        task: str | None,
+        robot_type: str | None,
+    ) -> _RTCChunkPrediction:
+        if not self.control.use_actor:
+            return super()._predict_rtc_chunk(
+                observation_frame,
+                inference_delay,
+                previous_actions,
+                task,
+                robot_type,
+            )
+        if not self.control.actor_available:
+            raise RuntimeError("online_actor mode selected without loaded Actor weights")
+
+        inference_device = get_safe_torch_device(self.policy_cfg.device)
+        observation = prepare_observation_for_inference(
+            copy(observation_frame),
+            inference_device,
+            task,
+            robot_type,
+        )
+        batch = self.preprocessor(observation)
+        outputs = self.policy.predict_action_chunk_with_rlt(
+            batch,
+            inference_delay=inference_delay,
+            prev_chunk_left_over=previous_actions,
+        )
+        proprio = batch[OBS_STATE][..., : self.policy_cfg.proprio_dim]
+        chunk = self.policy.actor(
+            outputs["z_rl"],
+            proprio,
+            outputs["actions"],
+            deterministic=self.policy_cfg.actor_rollout_deterministic,
+            apply_reference_dropout=False,
+        )
+        return _RTCChunkPrediction(actions=chunk, apply_prefix_fusion=True)
 
     def select_action(
         self,
@@ -999,6 +1199,8 @@ class OnlineActorRuntime(ActorVLARuntime):
         robot_type: str | None,
         device: torch.device,
     ) -> torch.Tensor:
+        if self._rtc_enabled():
+            return super().select_action(observation_frame, robot_type, device)
         if not self.control.use_actor:
             return super().select_action(observation_frame, robot_type, device)
         if not self.control.actor_available:
@@ -1083,7 +1285,7 @@ def _get_concurrency_entity(cfg: TrainRLServerPipelineConfig):
 
 
 def run_actor_only(
-    cfg: TrainRLServerPipelineConfig, shutdown_event: Event, actor_control: ActorControl | None = None
+    cfg: ActorPipelineConfig, shutdown_event: Event, actor_control: ActorControl | None = None
 ):  # type: ignore
     logging.info("[ACTOR] Starting actor-only mode; learner connection is disabled.")
     if cfg.actor_vla_policy.enabled:
@@ -1113,7 +1315,7 @@ def run_actor_only(
 
 
 def run_actor_online(
-    cfg: TrainRLServerPipelineConfig, shutdown_event: Event, actor_control: ActorControl | None = None
+    cfg: ActorPipelineConfig, shutdown_event: Event, actor_control: ActorControl | None = None
 ):  # type: ignore
     learner_client, grpc_channel = learner_service_client(
         host=cfg.policy.actor_learner_config.learner_host,
@@ -1211,7 +1413,7 @@ def run_actor_online(
 
 
 def act_with_policy(
-    cfg: TrainRLServerPipelineConfig,
+    cfg: ActorPipelineConfig,
     shutdown_event: any,  # Event,
     parameters_queue: Queue,
     transitions_queue: Queue,
@@ -1329,6 +1531,8 @@ def act_with_policy(
         if cfg.actor_vla_policy.enabled
         else None
     )
+    if actor_control is not None:
+        actor_control.runtime = vla_runtime
 
     # Reset hardware once; the first recorded observation is read at the top of the control loop.
     online_env.reset()
@@ -1371,16 +1575,10 @@ def act_with_policy(
             logging.exception("Failed to switch teleop manual-control mode to %s", enabled)
 
     def reset_policy_runtime() -> None:
-        reset_action_state = getattr(vla_runtime, "reset_action_state", None)
-        if callable(reset_action_state):
-            reset_action_state()
-        active_policy = vla_runtime.policy if vla_runtime is not None else policy
-        for component in (
-            active_policy,
-            vla_runtime.preprocessor if vla_runtime is not None else None,
-            vla_runtime.postprocessor if vla_runtime is not None else None,
-        ):
-            reset = getattr(component, "reset", None)
+        if vla_runtime is not None:
+            vla_runtime.reset_action_state()
+        else:
+            reset = getattr(policy, "reset", None)
             if callable(reset):
                 reset()
         if policy_action_smoother is not None:
@@ -1455,6 +1653,8 @@ def act_with_policy(
             should_send,
             timeout,
         )
+        if vla_runtime is not None:
+            vla_runtime.quiesce_action_state()
         if vla_runtime is None:
             update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
         elif cfg.actor_vla_policy.reload_on_episode_boundary:
@@ -1644,6 +1844,8 @@ def act_with_policy(
             if keyboard_state.toggle_intervention:
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     intervention_state = INTERVENTION_STATE_ACTIVE
+                    if vla_runtime is not None:
+                        vla_runtime.invalidate_action_state()
                     set_teleop_manual_control(True)
                     logging.info("[ACTOR] Intervention enabled: teleop actions override policy execution.")
                 else:
@@ -1826,6 +2028,8 @@ def act_with_policy(
                 precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
     finally:
         stop_keyboard_listener(keyboard_listener)
+        if vla_runtime is not None:
+            vla_runtime.close()
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
 

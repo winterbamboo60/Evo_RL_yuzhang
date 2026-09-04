@@ -70,10 +70,13 @@ class OnlineTransitionConfig:
     save_local_copy: bool = True
     episode_output_dir: str | None = None
     feature_batch_size: int = 8
+    sliding_window_stride: int = 1
 
     def __post_init__(self):
         if self.feature_batch_size <= 0:
             raise ValueError("online_transition.feature_batch_size must be positive")
+        if self.sliding_window_stride <= 0:
+            raise ValueError("online_transition.sliding_window_stride must be positive")
 
 
 @dataclass

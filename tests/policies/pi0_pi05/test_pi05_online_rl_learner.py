@@ -7,6 +7,7 @@ import torch
 
 from lerobot.onlineRL_evoRL import learner as server_learner
 from lerobot.onlineRL_evoRL.compact_transition import (
+    SLIDING_WINDOW_TRANSITIONS,
     bytes_to_episode_payload,
     compact_episode_to_bytes,
     make_compact_episode,
@@ -141,18 +142,83 @@ def test_compact_episode_round_trip_and_replay_insert(tmp_path):
     save_compact_episode(payload, local_path)
     local_payload = torch.load(local_path, weights_only=True)
     online_payload = bytes_to_episode_payload(compact_episode_to_bytes(payload))
+    legacy_payload = dict(payload)
+    legacy_payload["schema_version"] = 1
+    for key in ("transition_layout", "sliding_window_stride", "primitive_steps"):
+        legacy_payload.pop(key)
 
     assert local_payload.keys() == online_payload.keys()
     assert torch.equal(
         local_payload["transitions"][0]["state"]["z_rl"],
         online_payload["transitions"][0]["state"]["z_rl"],
     )
-    for decoded in (local_payload, online_payload):
+    for decoded in (local_payload, online_payload, legacy_payload):
         replay = Replay()
         count, metadata = _add_compact_episode(decoded, replay, policy, {"a"})
         assert count == len(replay.items) == 1
         assert metadata["task"] == "a"
         assert replay.items[0]["intervene_flags"].tolist() == [True, False]
+
+
+def test_compact_sliding_windows_are_inserted_without_second_windowing():
+    class Replay:
+        storage_device = "cpu"
+
+        def __init__(self):
+            self.items = []
+
+        def add(self, **transition):
+            self.items.append(transition)
+
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            pretrained_path="/tmp/base",
+            z_dim=2,
+            proprio_dim=7,
+            chunk_size=2,
+        ),
+        action_dim=7,
+    )
+
+    def state(value):
+        return {
+            "z_rl": torch.full((1, 2), float(value)),
+            "proprio": torch.full((1, 7), float(value)),
+            "ref_action": torch.full((1, 2, 7), float(value)),
+        }
+
+    transitions = []
+    for index in range(2):
+        transitions.append(
+            {
+                "state": state(index),
+                "next_state": state(index + 2),
+                "action": torch.full((1, 7), float(index + 1)),
+                "target_action_chunk": torch.full((2, 7), float(index + 9)),
+                "reward": torch.tensor([1.0, 2.0]),
+                "intervene_flags": torch.tensor([True, False]),
+                "valid_action_mask": torch.ones(2),
+                "next_valid_action_mask": torch.zeros(2),
+                "done": index == 1,
+                "truncated": False,
+                "complementary_info": {"is_intervention": index == 0},
+            }
+        )
+    payload = make_compact_episode(
+        transitions=transitions,
+        metadata={"task": "a"},
+        feature_model={"resolved_path": "/tmp/base"},
+        transition_layout=SLIDING_WINDOW_TRANSITIONS,
+        sliding_window_stride=2,
+        primitive_steps=4,
+    )
+
+    replay = Replay()
+    count, _ = _add_compact_episode(payload, replay, policy, {"a"})
+
+    assert count == len(replay.items) == 2
+    assert torch.equal(replay.items[0]["target_action_chunk"], transitions[0]["target_action_chunk"])
+    assert torch.equal(replay.items[1]["target_action_chunk"], transitions[1]["target_action_chunk"])
 
 
 def test_pi05_online_rl_step_parameters_are_unambiguous():

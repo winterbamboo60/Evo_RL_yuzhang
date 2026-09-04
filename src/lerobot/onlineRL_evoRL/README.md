@@ -63,25 +63,36 @@ PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic�
 启动命令必须使用带等号的配置参数：
 
 ```bash
-source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0901
 python -m lerobot.onlineRL_evoRL.learner \
   --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
+
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0901
+mkdir /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k
+nohup env PYTHONUNBUFFERED=1 python -m lerobot.onlineRL_evoRL.learner \
+    --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
+    > /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
 ```
 
 断点重启
 ```bash
-source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0901
 python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_cup_catch_v2_0819_25k/learner_output/checkpoints/last/pretrained_model/train_config.json \
-  --resume=true
+  --config_path=/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output/checkpoints/last/pretrained_model/train_config.json \
+  --resume=true \
+  >> /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
 
 # 接续离线rl训练
+source /home/lenovo/code/envs/package_sorting_env/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0901
 python -m lerobot.onlineRL_evoRL.learner \
-    --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_cup_catch_v2_0819_35k/learner_output/checkpoints/last/pretrained_model/train_config.json \
-    --resume=true \
-    --steps=3000
+  --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output/checkpoints/last/pretrained_model/train_config.json \
+  --resume=true \
+  --steps=3000 \
+  >> /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
 ```
 
 
@@ -327,6 +338,39 @@ python -m lerobot.onlineRL_evoRL.actor_new \
 它还需要：`policy.type=pi05_online_rl`、与 learner 相同的 `policy.pretrained_path` 和 `dataset.root`、有效的 `actor_checkpoint_path`，以及一致的 learner host/port。Actor checkpoint 可指向 learner 输出根目录、checkpoint 目录或具体的 `actor_critic.pt`/`model.safetensors`。
 
 `task_hotkeys_path` 可用于两种模式；按 task 键会丢弃当前 episode、切换 `env.task` 并复位。`B` 仅在已加载 Actor head 时切换 Online Actor/VLA，并清空 action chunk 与平滑缓存。
+
+### 可选 RTC 动作执行
+
+RTC 默认关闭；不配置时保留原有同步 VLA 路径和 Online Actor 的 `_actor_actions` chunk 缓存。
+开启后，VLA 和 Online Actor 的完整动作块都交给同一个 RTC 执行队列，逐拍取出的动作再经过
+平滑、夹爪处理和 robot processor 后发送给机械臂。Online Actor 模式下不会再使用
+`_actor_actions`，避免双重动作队列。
+
+配置文件中可加入：
+
+```json
+"rtc": {
+  "enabled": true,
+  "execution_horizon": 25,
+  "prefix_attention_schedule": "LINEAR",
+  "max_guidance_weight": 10.0
+},
+"rtc_action_queue_threshold": 32
+```
+
+也可以仅在启动时覆盖：
+
+```bash
+python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path=src/lerobot/onlineRL_evoRL/configs/actor/<actor-config>.json \
+  --rtc.enabled=true \
+  --rtc.execution_horizon=25 \
+  --rtc_action_queue_threshold=32
+```
+
+`rtc.enabled=false` 时顶层开关会明确禁用 checkpoint 中可能保存的 RTC 配置。开始人工接管时
+会立即废弃 RTC 队列；任务切换、VLA/Actor 切换、episode 边界和关闭进程时，还会等待旧的
+后台推理安全退出后再重置或换权重。
 
 ## Actor-only 模式
 

@@ -22,6 +22,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import numpy as np
@@ -62,6 +63,20 @@ from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.visualization_utils import log_rerun_data
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class _RTCChunkPrediction:
+    """One normalized action chunk produced for the RTC execution queue."""
+
+    actions: torch.Tensor
+    apply_prefix_fusion: bool = False
+
+
+RTCChunkPredictor = Callable[
+    [dict[str, np.ndarray], int, torch.Tensor | None, str | None, str | None],
+    torch.Tensor | _RTCChunkPrediction,
+]
 
 
 """ --------------- record_loop() data flow --------------------------
@@ -178,6 +193,7 @@ class _RTCActionChunkRunner:
         queue_threshold: int,
         task: str | None,
         robot_type: str | None,
+        chunk_predictor: RTCChunkPredictor | None = None,
     ) -> None:
         self.policy = policy
         self.preprocessor = preprocessor
@@ -187,11 +203,14 @@ class _RTCActionChunkRunner:
         self.queue_threshold = queue_threshold
         self.task = task
         self.robot_type = robot_type
+        self.chunk_predictor = chunk_predictor
         self.device = get_safe_torch_device(policy.config.device)
         self.action_queue = ActionQueue(rtc)
         self.latency_tracker = LatencyTracker()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-inference")
-        self.future: Future[tuple[torch.Tensor, torch.Tensor, float]] | None = None
+        self.future: Future[
+            tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, float]
+        ] | None = None
         self.future_generation = 0
         self.action_index_before_inference = 0
         self.generation = 0
@@ -202,7 +221,9 @@ class _RTCActionChunkRunner:
         observation_frame: dict[str, np.ndarray],
         inference_delay: int,
         previous_actions: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        task: str | None,
+        robot_type: str | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, float]:
         started_at = time.perf_counter()
         amp_context = (
             torch.autocast(device_type=self.device.type)
@@ -210,20 +231,51 @@ class _RTCActionChunkRunner:
             else nullcontext()
         )
         with torch.no_grad(), amp_context:
-            observation = prepare_observation_for_inference(
-                observation_frame, self.device, self.task, self.robot_type
-            )
-            observation = self.preprocessor(observation)
-            actions = self.policy.predict_action_chunk(
-                observation,
-                inference_delay=inference_delay,
-                prev_chunk_left_over=previous_actions,
-            )
+            if self.chunk_predictor is None:
+                observation = prepare_observation_for_inference(
+                    observation_frame, self.device, task, robot_type
+                )
+                observation = self.preprocessor(observation)
+                prediction = _RTCChunkPrediction(
+                    actions=self.policy.predict_action_chunk(
+                        observation,
+                        inference_delay=inference_delay,
+                        prev_chunk_left_over=previous_actions,
+                    )
+                )
+            else:
+                prediction = self.chunk_predictor(
+                    observation_frame,
+                    inference_delay,
+                    previous_actions,
+                    task,
+                    robot_type,
+                )
+                if isinstance(prediction, torch.Tensor):
+                    prediction = _RTCChunkPrediction(actions=prediction)
+
+            actions = prediction.actions
+            if actions.ndim == 2:
+                actions = actions.unsqueeze(0)
+            if actions.ndim != 3 or actions.shape[0] != 1:
+                raise ValueError(
+                    "RTC chunk predictor must return actions shaped [1, time, action] or [time, action], "
+                    f"got {tuple(actions.shape)}"
+                )
             original_actions = actions.squeeze(0).detach().clone()
-            processed_actions = self.postprocessor(actions).squeeze(0).detach().clone()
+            processed_actions = None
+            if not prediction.apply_prefix_fusion:
+                processed_actions = self.postprocessor(actions).squeeze(0).detach().clone()
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
-        return original_actions, processed_actions, time.perf_counter() - started_at
+        previous_snapshot = previous_actions.detach().clone() if previous_actions is not None else None
+        return (
+            original_actions,
+            processed_actions,
+            previous_snapshot,
+            prediction.apply_prefix_fusion,
+            time.perf_counter() - started_at,
+        )
 
     def _start_inference(self, observation_frame: dict[str, np.ndarray]) -> None:
         previous_actions = self.action_queue.get_left_over()
@@ -237,6 +289,8 @@ class _RTCActionChunkRunner:
             deepcopy(observation_frame),
             inference_delay,
             previous_actions,
+            self.task,
+            self.robot_type,
         )
 
     def _collect_inference(self, *, wait: bool = False) -> None:
@@ -247,7 +301,13 @@ class _RTCActionChunkRunner:
         generation = self.future_generation
         action_index_before_inference = self.action_index_before_inference
         try:
-            original_actions, processed_actions, latency = future.result()
+            (
+                original_actions,
+                processed_actions,
+                previous_actions,
+                apply_prefix_fusion,
+                latency,
+            ) = future.result()
         except Exception:
             self.future = None
             if generation != self.generation:
@@ -260,6 +320,17 @@ class _RTCActionChunkRunner:
             return
 
         real_delay = self.action_queue.get_action_index() - action_index_before_inference
+        if apply_prefix_fusion:
+            original_actions = self._fuse_action_prefix(
+                original_actions,
+                previous_actions,
+                real_delay,
+            )
+            processed_actions = (
+                self.postprocessor(original_actions.unsqueeze(0)).squeeze(0).detach().clone()
+            )
+        if processed_actions is None:
+            raise RuntimeError("RTC chunk postprocessing did not produce an action chunk")
         self.action_queue.merge(
             original_actions,
             processed_actions,
@@ -267,6 +338,41 @@ class _RTCActionChunkRunner:
             action_index_before_inference,
         )
         self.latency_tracker.add(latency)
+
+    def _fuse_action_prefix(
+        self,
+        actions: torch.Tensor,
+        previous_actions: torch.Tensor | None,
+        real_delay: int,
+    ) -> torch.Tensor:
+        """Blend a non-denoising policy chunk into the unconsumed previous chunk."""
+        if previous_actions is None:
+            return actions
+        if actions.ndim != 2 or previous_actions.ndim != 2:
+            raise ValueError("RTC prefix fusion expects [time, action] tensors")
+        if actions.shape[1] != previous_actions.shape[1]:
+            raise ValueError(
+                "RTC prefix fusion action dimensions differ: "
+                f"{actions.shape[1]} != {previous_actions.shape[1]}"
+            )
+
+        horizon = min(
+            self.rtc.execution_horizon,
+            actions.shape[0],
+            previous_actions.shape[0],
+        )
+        if horizon <= 0:
+            return actions
+
+        from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+        start = min(max(real_delay, 0), horizon)
+        weights = RTCProcessor(self.rtc).get_prefix_weights(start, horizon, actions.shape[0])
+        weights = weights[:horizon].to(device=actions.device, dtype=actions.dtype).unsqueeze(-1)
+        previous_prefix = previous_actions[:horizon].to(device=actions.device, dtype=actions.dtype)
+        fused = actions.clone()
+        fused[:horizon] = weights * previous_prefix + (1.0 - weights) * fused[:horizon]
+        return fused
 
     def get_action(self, observation_frame: dict[str, np.ndarray]) -> torch.Tensor:
         self._collect_inference()
