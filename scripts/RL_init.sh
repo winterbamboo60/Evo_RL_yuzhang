@@ -88,8 +88,13 @@ done
 
 
 
-Step3. 初始化2个CAN口
+Step3. 初始化CAN口
+
 lerobot-setup-can --mode=setup --interfaces=can0,can1
+
+默认 CAN 映射：
+左主臂 can0 -> 左从臂 can1
+右主臂 can2 -> 右从臂 can3
 lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
 
 Step4. CAN口模式测试，需要能看到持续输出的数据

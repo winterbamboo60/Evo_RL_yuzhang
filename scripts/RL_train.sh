@@ -6,151 +6,8 @@
 #     --OUTPUT_DIR <输出目录> \
 #     [--history_pretrained_path <上一轮策略模型路径>]   # 可选：策略训练预训练权重，默认用基础模型
 # 示例：
-# conda activate evo-rl-0609
-# source /home/yz/projects/env/package_sorting_env/bin/activate
-# bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_loop_0624_act_merged_122_checked \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/V6_task2_0624_act_merged_122_onlyRL_Intervention_0626_H100 \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100
 
-# bash /home/yuzhang/projects/VLA/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yuzhang/projects/VLA/datasets/package_sorting_task2_loop_0624_act_merged_122_checked \
-#   --ModelZoo /home/yuzhang/projects/modelZoo \
-#   --OUTPUT_DIR /home/yuzhang/projects/VLA/outputs/V6_task2_0624_act_merged_122_onlyRL_Intervention_0626 \
-#   --history_pretrained_path /home/yuzhang/projects/modelZoo/package_scan_model_v6
-
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_V6_0624_act_merged_122_checked_merged_331 \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/V6_task2_0624_act_merged_122_checked_merged_331_SFT+RL \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100 \
-#   > /home/yz/projects/outputs/logs/train_0630_2.log 2>&1 &
-# echo "PID: $!"
-
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_V6_0624_act_merged_122_checked_merged_331 \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/V6_task2_0624_act_merged_122_checked_merged_331_SFT+RL_0626Checkpoint \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100 \
-#   > /home/yz/projects/outputs/logs/train_0629_0626Checkpoint.log 2>&1 &
-# echo "PID: $!"
-
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_V6_task2_0624_0630_merged_186 \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/V6_task2_0624_0630_merged_186_0701_H100 \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100 \
-#   > /home/yz/projects/outputs/logs/train_0701_onlyRL.log 2>&1 &
-# echo "PID: $!"
-
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_V6_task2_0624_0630_merged_186 \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/V6_task2_0624_0630_merged_186_noIncep_0701_H100 \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100 \
-#   > /home/yz/projects/outputs/logs/train_0701_onlyRL_noIncep.log 2>&1 &
-# echo "PID: $!"
-
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT /home/yz/datasets/package_sorting_task2_V6_task2_0630_merged_64_SFT \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR /home/yz/projects/outputs/pi05_libero_base_task2_0630_merged_64_SFT_0702_onlySFT_H100 \
-#   --history_pretrained_path /home/yz/modelZoo/pi05_libero_base \
-#   > /home/yz/projects/outputs/logs/train_0702_onlySFT.log 2>&1 &
-# echo "PID: $!"
-
-# V6_task1&3_V7_task2_646
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/V6_task1&3_V7_task2_646" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/V6_task1&3_V7_task2_646" \
-#   --history_pretrained_path /home/yz/package_scan_model_v6_H100 \
-#   > "/home/yz/projects/outputs/logs/train_0703_V6_task1&3_V7_task2_646.log" 2>&1 &
-# echo "PID: $!"
-
-# V8-1_0710
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/V8_0706/V8-1_task2_merged_391_rawTask" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/V8-1_task2_merged_391" \
-#   --history_pretrained_path /home/yz/modelZoo/V7_task2_20k \
-#   > "/home/yz/projects/outputs/logs/V8-1_task2_merged_391_Train0713.log" 2>&1 &
-# echo "PID: $!"
-
-# V8_task123_0706
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/V8_0706/V8_task123_merged_952" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/V8_task123_merged_952" \
-#   --history_pretrained_path /home/yz/modelZoo/V7_task2_20k \
-#   > "/home/yz/projects/outputs/logs/V8_task123_merged_952_Train0708.log" 2>&1 &
-# echo "PID: $!"
-
-# smovla_v2_0713
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/1F_0713/smovla_V2_0713" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/smovla_v2_0713" \
-#   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
-#   > "/home/yz/projects/outputs/logs/smovla_v2_0713_Train0714.log" 2>&1 &
-# echo "PID: $!"
-
-# smovla_v3_0720
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/1F_0713/smovla_V3_0720_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/smovla_v3_0720" \
-#   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
-#   > "/home/yz/projects/outputs/logs/smovla_v3_0720_Train0720.log" 2>&1 &
-# echo "PID: $!"
-
-# pi05_lebero_smovla_v3_0720
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/1F_0713/smovla_V3_0720_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_smovla_v3_0720" \
-#   > "/home/yz/projects/outputs/logs/pi05_smovla_v3_0720_Train0722.log" 2>&1 &
-# echo "PID: $!"
-
-# # pi05_base_smovla_v3_0720_size512
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/1F_0713/smovla_V3_0720_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_base_smovla_v3_0720_size512" \
-#   > "/home/yz/projects/outputs/logs/pi05_base_smovla_v3_0720_size512_Train0727.log" 2>&1 &
-# echo "PID: $!"
-
-# pi05_base_v9_task123_0728
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/v9_task123_0728_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_base_v9_task123_0728" \
-#   > "/home/yz/projects/outputs/logs/pi05_base_v9_task123_0728_Train0728.log" 2>&1 &
-# echo "PID: $!"
-
-# smovla_v9_task123_0728
-# nohup bash /home/yz/projects/Evo-RL-loop-0609/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/v9_task123_0728_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/smovla_v9_task123_0728" \
-#   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
-#   > "/home/yz/projects/outputs/logs/smovla_v9_task123_0728_Train0728.log" 2>&1 &
-# echo "PID: $!"
-
-# pi05_base_smovla_v3_0720_RLT
-# source /home/yz/projects/env/package_sorting_env/bin/activate
-# nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/1F_0713/smovla_V3_0720_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_base_smovla_v3_0720_RLT" \
-#   > "/home/yz/projects/outputs/logs/pi05_base_smovla_v3_0720_RLT_Train0811.log" 2>&1 &
-# echo "PID: $!"
-
-
+# 一楼真机训练
 # pi05_base_cup_catch_0813
 # source /home/yz/projects/env/package_sorting_env/bin/activate
 # nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
@@ -170,6 +27,61 @@
 #   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
 #   > "/home/yz/projects/outputs/logs/smovla_base_cup_catch_0813_train0814_0810.log" 2>&1 &
 # echo "PID: $!"
+
+
+
+
+# 北京5080训练
+# pi05_base_rlt_sft_cup_catch_v4_merged_train0901
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
+# nohup bash ./scripts/RL_train.sh \
+#   --DATASET_ROOT "/home/lenovo/datasets/cup_catch_v4_merged_checked" \
+#   --ModelZoo /home/lenovo/modelZoo \
+#   --OUTPUT_DIR "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901" \
+#   --history_pretrained_path /home/lenovo/outputs/pi05_base_sft_cup_catch_v4_merged_train0831/train/checkpoints/040000/pi05_base_sft_cup_catch_v4_merged_train0831_40k \
+#   > "/home/lenovo/outputs/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901.log" 2>&1 &
+# echo "PID: $!"
+
+# smolvla_base_cup_catch_0813
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
+# nohup bash ./scripts/RL_train.sh \
+#   --DATASET_ROOT "/home/lenovo/datasets/cup_catch_v4_merged_checked" \
+#   --ModelZoo /home/lenovo/modelZoo \
+#   --policy_type "smolvla" \
+#   --OUTPUT_DIR "/home/lenovo/outputs/smovla_cup_catch_v4_merged_train0829" \
+#   --history_pretrained_path /home/lenovo/modelZoo/smolvla_base \
+#   > "/home/lenovo/outputs/logs/smovla_cup_catch_v4_merged_train0829.log" 2>&1 &
+# echo "PID: $!"
+
+
+
+
+# 百度云训练
+# pi05_base_rlt_sft_cup_catch_v4_merged_train0901
+# source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
+# cd /root/projects/Evo_RL_yuzhang
+# nohup bash /root/projects/Evo_RL_yuzhang/scripts/RL_train.sh \
+#   --DATASET_ROOT "/mnt/cfs/0z9lxh/yuzhang/datasets/cup_catch_v4_merged_checked" \
+#   --ModelZoo /mnt/cfs/0z9lxh/yuzhang/modelZoo \
+#   --OUTPUT_DIR "/mnt/cfs/0z9lxh/yuzhang/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901" \
+#   --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/outputs/pi05_base_sft_cup_catch_v4_merged_train0831/train/checkpoints/040000/pi05_base_sft_cup_catch_v4_merged_train0831_40k \
+#   > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901.log" 2>&1 &
+# echo "PID: $!"
+
+
+# smolvla_base_cup_catch_0813
+# source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
+# nohup bash /root/projects/Evo_RL_yuzhang/scripts/RL_train.sh \
+#   --DATASET_ROOT "/mnt/cfs/0z9lxh/yuzhang/datasets/cup_catch_v4_merged" \
+#   --ModelZoo /mnt/cfs/0z9lxh/yuzhang/modelZoo \
+#   --policy_type "smolvla" \
+#   --OUTPUT_DIR "/mnt/cfs/0z9lxh/yuzhang/outputs/smovla_cup_catch_v4_merged_train0829" \
+#   --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/modelZoo/smolvla_base \
+#   > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/smovla_cup_catch_v4_merged_train0829.log" 2>&1 &
+# echo "PID: $!"
+
 
 set -e
 

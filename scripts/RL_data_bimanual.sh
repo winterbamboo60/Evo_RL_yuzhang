@@ -5,7 +5,7 @@
 #
 # 默认 CAN 映射：
 #   左主臂 can0 -> 左从臂 can1
-#   右主臂 can2 -> 右从臂 can3c
+#   右主臂 can2 -> 右从臂 can3
 #
 # 三路 Intel RealSense：
 #   左臂子配置 wrist + top，右臂子配置 wrist

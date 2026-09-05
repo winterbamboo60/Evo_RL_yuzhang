@@ -24,6 +24,14 @@
 # 输出：
 # 打印DATASET_ROOT所在位置
 
+
+# Pick up the cup on the right
+# Take the middle cup away
+# Grab the left cupc
+# clean 0828_left_row1: 28   0828_left_row3: 102 101c
+# 0828_mid_row2:74   0828_mid_row3:53
+
+# 一楼真机
 # 纯人工示范（不传 policy.path）
 # source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
@@ -32,55 +40,7 @@
 #   --wrist_camera.index_or_path 260422275773 \
 #   --top_camera.index_or_path 10
 
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0828_mid_row3_add1 \
-#   --dataset.single_task "Take the middle cup away" \
-#   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 10
-
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch_v4/0831_testNeedDelete \
-#   --dataset.single_task "Pick up the cup on the right" \
-#   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 10
-
-# Pick up the cup on the right
-# Take the middle cup away
-# Grab the left cupc
-# clean 0828_left_row1: 28   0828_left_row3: 102 101c
-# 0828_mid_row2:74   0828_mid_row3:53
-
-
-
-
-
 # 策略模型 + 人工介入
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_smovla_v3_0720_RLT_30K_test_1 \
-#   --dataset.single_task "You are a parcel sorter. First, Grab the package and place it on the pallet. Then, Flip the package if the barcode is not facing up. Finally, Grab the scanned package and place it into the box." \
-#   --wrist_camera.index_or_path 4 \
-#   --top_camera.index_or_path 12 \
-#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_smovla_v3_0720_RLT_30K \
-#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
-
-# pi05_base_cup_catch_0813_tain0813_30K
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/cup_catch/0814_right_1 \
-#   --dataset.single_task "Pick up the cup on the right" \
-#   --wrist_camera.index_or_path 4 \
-#   --top_camera.index_or_path 12 \
-#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_0813_tain0813_30K \
-#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
-
-# pi05_base_cup_catch_v2_0819_25k
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_cup_catch_v2_0819_25k_test1 \
-#   --dataset.single_task "Grab the left cup" \
-#   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 12 \
-#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_cup_catch_v2_0819_25k \
-#   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
-
 # smovla_cup_catch_v2_0819_40k
 # bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
 #   --dataset.root /home/hpc/yuzhang/datasets/smovla_cup_catch_v2_0819_40k_test1 \
@@ -90,44 +50,48 @@
 #   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v2_0819_40k \
 #   --event.config.path /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/event_config.json
 
-# pi05_base_cup_catch_v4_merged_train0829_30k
-# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-# cd /home/hpc/yuzhang/Evo-RL-loop-0817
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/pi05_base_sft_cup_catch_v4_merged_train0831_30k_test_needDelete \
+
+# 北京5080
+# 纯人工示范（不传 policy.path）
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
+# bash /home/lenovo/code/Evo-RL-loop-0901/scripts/RL_data.sh \
+#   --dataset.root /home/lenovo/datasets/cup_catch_v4/0828_left_row3 \
+#   --dataset.single_task "Grab the left cup" \
+#   --wrist_camera.index_or_path 260422275773 \
+#   --top_camera.index_or_path 261822303677
+
+# 策略模型 + 人工介入
+# smovla_cup_catch_v2_0819_40k
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
+# bash /home/lenovo/code/Evo-RL-loop-0901/scripts/RL_data.sh \
+#   --dataset.root /home/lenovo/datasets/smovla_cup_catch_v2_0819_40k_test1 \
 #   --dataset.single_task "Pick up the cup on the right" \
 #   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 261822305080 \
-#   --policy.path /home/hpc/yuzhang/outputs/pi05_base_sft_cup_catch_v4_merged_train0831_30k \
-#   --rtc.enabled true
+#   --top_camera.index_or_path 261822303677 \
+#   --policy.path /home/lenovo/outputs/smovla_cup_catch_v2_0819_40k \
+#   --event.config.path ./scripts/event_config.json
 
 
-# smovla_cup_catch_v4_merged_train0829_40k
-# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-# cd /home/hpc/yuzhang/Evo-RL-loop-0817
-# bash /home/hpc/yuzhang/Evo-RL-loop-0817/scripts/RL_data.sh \
-#   --dataset.root /home/hpc/yuzhang/datasets/smovla_cup_catch_v4_merged_train0829_40k_test_needDelete \
-#   --dataset.single_task "Pick up the cup on the right" \
-#   --wrist_camera.index_or_path 260422275773 \
-#   --top_camera.index_or_path 12 \
-#   --policy.path /home/hpc/yuzhang/outputs/smovla_cup_catch_v4_merged_train0829_40k
 
 
 # 合并数据集
-# cd /home/yz/projects/Evo-RL-loop-0609/src
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/yz/datasets/v9_task123_0728_merged \
+#     --repo_id /home/lenovo/datasets/v9_task123_0728_merged \
 #     --operation.type merge \
-#     --operation.repo_ids "['/home/yz/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/yz/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/yz/datasets/task2_grab_the_package_and_place_it_into_the_b']"
+#     --operation.repo_ids "['/home/lenovo/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/lenovo/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/lenovo/datasets/task2_grab_the_package_and_place_it_into_the_b']"
 
-# source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
-# cd /home/hpc/yuzhang/Evo-RL-loop-0817/src
+# source /home/lenovo/code/envs/package_sorting_env/bin/activate
+# cd /home/lenovo/code/Evo-RL-loop-0901
 # python -m lerobot.scripts.lerobot_edit_dataset \
-#     --repo_id /home/hpc/yuzhang/datasets/cup_catch_v4_merged \
+#     --repo_id /home/lenovo/datasets/cup_catch_v4_merged \
 #     --operation.type merge \
-#     --operation.source_dir /home/hpc/yuzhang/datasets/cup_catch_v4
+#     --operation.source_dir /home/lenovo/datasets/cup_catch_v4
 
-# cd /home/hpc/yuzhang/outputs
+# cd /home/lenovo/outputs
 # downloadyuzhang pi05_base_cup_catch_v2_0819_35k.tar
 
 set -e
