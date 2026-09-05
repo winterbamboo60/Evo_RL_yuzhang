@@ -802,10 +802,16 @@ def record_loop(
                 robot_action_to_send = robot_action_processor((action_values, obs))
                 # 需要在send_action中添加偏置【已完成】
                 # logging.info(f"将动作发给主臂+从臂")
+                # _sent_action = run_with_connection_retry(
+                #     "policy_sync_executor.send_action",
+                #     lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
+                #         robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                #     ),
+                # )
                 _sent_action = run_with_connection_retry(
                     "policy_sync_executor.send_action",
                     lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
-                        robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                        robot_action_to_send
                     ),
                 )
             else:  # 接管动作只发给从臂，一般由接管状态下主臂由teleop控制，不添加偏置
@@ -813,10 +819,16 @@ def record_loop(
                 robot_action_to_send = robot_action_processor((action_values, obs))
 
                 # logging.info(f"将动作发给从臂")
+                # _sent_action = run_with_connection_retry(
+                #     "robot.send_action",
+                #     lambda robot_action_to_send=robot_action_to_send: robot.send_action(
+                #         robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                #     ),
+                # )
                 _sent_action = run_with_connection_retry(
                     "robot.send_action",
                     lambda robot_action_to_send=robot_action_to_send: robot.send_action(
-                        robot_action_to_send, add_offset=not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)  # 只有在非接管状态才添加偏置,即模型自行生成的动作才添加偏置，接管状态下主臂由teleop控制，不添加偏置
+                        robot_action_to_send
                     ),
                 )
 

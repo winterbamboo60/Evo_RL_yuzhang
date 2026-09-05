@@ -125,15 +125,13 @@ from lerobot.teleoperators import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.utils.constants import ACTION
-from lerobot.utils.piper_sdk import PIPER_JOINT_NAMES
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
-    is_headless,
     sanity_check_bimanual_piper_pair,
-    sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS, PIPER_JOINT_NAMES, milli_to_unit
 from lerobot.utils.recording_annotations import (
     EPISODE_FAILURE,
     infer_collector_policy_id,
@@ -145,7 +143,6 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun
-
 
 # Default home pose for piper arms, mirroring src/lerobot/reset.py: all six joints at 0 via raw
 # JointCtrl (bypassing calibration), gripper closed, so leader + follower land on the same
@@ -160,6 +157,7 @@ _PIPER_HOME_SETTLE_S = 3.0
 # 用 duration/step_dt 个小步逐步逼近目标来自己控速，整体快慢由 duration 决定，与模式无关。
 _PIPER_HOME_SMOOTH_DURATION_S = 4.0
 _PIPER_HOME_SMOOTH_STEP_DT_S = 0.02
+_BIMANUAL_PIPER_TYPES = {"bi_piper_follower", "bi_piperx_follower"}
 # 用户显式按 ← 要求重录时，不立刻开始下一次记录，而是先等待这么多秒，
 # 给操作者复位/准备的时间，并在命令行做整秒倒计时提示。
 _RERECORD_DELAY_S = 2.0
@@ -222,6 +220,52 @@ def _read_arm_raw_joints(arm) -> tuple[list[int], int]:
     return joints, gripper
 
 
+def _piper_follower_raw_pose_to_action(follower, joints: list[int], gripper: int) -> dict[str, float]:
+    """Convert live follower SDK feedback to the calibrated action space shared with its leader."""
+    if len(joints) != len(PIPER_JOINT_NAMES):
+        raise ValueError(f"Expected {len(PIPER_JOINT_NAMES)} piper joints, got {len(joints)}.")
+
+    calibration = getattr(follower, "calibration", None)
+    missing = [key for key in PIPER_ACTION_KEYS if not calibration or key not in calibration]
+    if missing:
+        raise RuntimeError(f"Piper follower calibration is missing keys: {missing}")
+
+    raw_pose = {
+        **{
+            f"{joint_name}.pos": milli_to_unit(raw)
+            for joint_name, raw in zip(PIPER_JOINT_NAMES, joints, strict=True)
+        },
+        "gripper.pos": abs(milli_to_unit(gripper)),
+    }
+    scale = float(follower.config.calibration_scale)
+    action: dict[str, float] = {}
+    for key in PIPER_ACTION_KEYS:
+        cal = calibration[key]
+        min_value = float(cal.range_min) / scale
+        max_value = float(cal.range_max) / scale
+        home_value = float(cal.homing_offset) / scale
+        bounded = min(max_value, max(min_value, raw_pose[key]))
+        centered = bounded - home_value
+        action[key] = -centered if cal.drive_mode else centered
+    return action
+
+
+def _capture_bimanual_piper_follower_pose(robot):
+    """Capture both follower poses before issuing any paired leader commands."""
+    snapshots: dict[str, tuple[object, object, list[int], int]] = {}
+    action: dict[str, float] = {}
+    for side in ("left", "right"):
+        follower = getattr(robot, f"{side}_arm", None)
+        arm = getattr(follower, "arm", None)
+        if follower is None or arm is None or not hasattr(arm, "JointCtrl"):
+            raise RuntimeError(f"Bimanual piper {side} follower does not expose a JointCtrl interface.")
+        joints, gripper = _read_arm_raw_joints(arm)
+        snapshots[side] = (follower, arm, joints, gripper)
+        side_action = _piper_follower_raw_pose_to_action(follower, joints, gripper)
+        action.update({f"{side}_{key}": value for key, value in side_action.items()})
+    return snapshots, action
+
+
 def _hold_piper_arm(arm, joints: list[int], gripper: int, speed: int = _PIPER_HOME_SPEED) -> None:
     """Lock a piper arm stiff at the given joint/gripper pose (position-velocity mode)."""
     arm.MotionCtrl_2(0x01, 0x01, speed, 0x00)
@@ -229,13 +273,33 @@ def _hold_piper_arm(arm, joints: list[int], gripper: int, speed: int = _PIPER_HO
     arm.GripperCtrl(gripper, 1000, 0x01, 0)
 
 
-def _hold_arms_current_pose(robot, teleop, leader_action: dict[str, float] | None = None) -> None:
-    """Hold can0 at can1's last accepted action and lock can1 at its live pose."""
+def _hold_arms_current_pose(
+    robot,
+    teleop,
+    leader_action: dict[str, float] | None = None,
+    *,
+    sync_teleop: bool = True,
+) -> None:
+    """Lock follower arms at their live pose and optionally synchronize commandable leaders."""
+    if getattr(robot, "name", None) in _BIMANUAL_PIPER_TYPES:
+        snapshots, synchronized_action = _capture_bimanual_piper_follower_pose(robot)
+        for _follower, arm, joints, gripper in snapshots.values():
+            _hold_piper_arm(arm, joints, gripper)
+        if sync_teleop and teleop is not None and not isinstance(teleop, list):
+            teleop.send_feedback(synchronized_action)
+        if sync_teleop:
+            logging.info(
+                "Episode ended: each bimanual leader is synchronized to its paired follower's live pose."
+            )
+        else:
+            logging.info("Episode ended: bimanual followers hold their live pose; leaders remain read-only.")
+        return
+
     held_any = False
 
     # Reuse the exact common-coordinate action that can1 accepted. PiperLeader.send_feedback handles
     # the calibration round-trip and safely leaves gravity-comp mode before applying this target.
-    if teleop is not None and not isinstance(teleop, list):
+    if sync_teleop and teleop is not None and not isinstance(teleop, list):
         leader_arm = getattr(teleop, "arm", None)
         if leader_arm is not None and hasattr(leader_arm, "JointCtrl"):
             if leader_action is None:
@@ -251,7 +315,10 @@ def _hold_arms_current_pose(robot, teleop, leader_action: dict[str, float] | Non
         held_any = True
 
     if held_any:
-        logging.info("Episode ended: leader + follower holding current pose until next episode.")
+        if sync_teleop:
+            logging.info("Episode ended: leader + follower holding current pose until next episode.")
+        else:
+            logging.info("Episode ended: follower holding current pose; leader remains read-only.")
     else:
         logging.warning("Hold-current-pose skipped: arms do not expose a piper JointCtrl interface.")
 
@@ -264,6 +331,39 @@ def _home_arms_to_default(robot, teleop, speed: int = _PIPER_HOME_SLOW_SPEED) ->
     模式、进入位置模式再下发。对不暴露 piper SDK 接口的臂静默跳过。
     """
     homed_any = False
+    if getattr(robot, "name", None) in _BIMANUAL_PIPER_TYPES:
+        snapshots, follower_start = _capture_bimanual_piper_follower_pose(robot)
+        goal: dict[str, float] = {}
+        for side, (follower, _arm, _joints, _gripper) in snapshots.items():
+            side_goal = _piper_follower_raw_pose_to_action(
+                follower, list(_PIPER_HOME_JOINTS), _PIPER_HOME_GRIPPER
+            )
+            goal.update({f"{side}_{key}": value for key, value in side_goal.items()})
+
+        leader_start = dict(follower_start)
+        if teleop is not None and not isinstance(teleop, list):
+            # Read each physical leader while it is still in manual/gravity-compensation mode,
+            # so its first command starts from its own live pose instead of jumping to the follower.
+            leader_start = teleop.get_action()
+            teleop.set_manual_control(False)
+
+        steps = max(int(_PIPER_HOME_SMOOTH_DURATION_S / _PIPER_HOME_SMOOTH_STEP_DT_S), 1)
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            follower_command = {
+                key: follower_start[key] + (goal[key] - follower_start[key]) * ratio for key in goal
+            }
+            robot.send_action(follower_command)
+            if teleop is not None and not isinstance(teleop, list):
+                leader_command = {
+                    key: leader_start[key] + (goal[key] - leader_start[key]) * ratio for key in goal
+                }
+                teleop.send_feedback(leader_command)
+            time.sleep(_PIPER_HOME_SMOOTH_STEP_DT_S)
+
+        time.sleep(_PIPER_HOME_SETTLE_S)
+        logging.info("First episode: both bimanual leader/follower pairs smoothly homed.")
+        return
 
     # 主臂：准备过程必须与 VLA(send_feedback) 完全一致。set_manual_control(False) 会退出重力补偿、
     # 进入 command_high_follow 模式(0xAD)并使能。先准备好主臂、确定 mit_mode，但延后实际下发——
@@ -510,7 +610,7 @@ def _ensure_human_inloop_compatible_features(
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging(log_file=os.path.join(os.getcwd(), "inloop_record.log"), file_level="INFO")
-    
+
     logging.info(
         "Human-in-loop recording is enabled. Press '%s' to toggle takeover. "
         "Press '%s' to mark success and end, '%s' to mark failure and end. "
@@ -702,8 +802,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         with VideoEncodingManager(dataset):
             # 第一个 episode 开始前：参考 reset.py，把主从臂慢速归位到初始(全零)位置，
-            # 仅在有策略模型时执行（纯人工示范无需归位）。让策略从一致、已同步的姿态起步。
-            if policy is not None and not events["stop_recording"]:
+            # 仅在有策略模型时执行；无 VLA 的人工示范保持当前姿态并直接开始录制。
+            should_home_on_start = policy is not None
+            if should_home_on_start and not events["stop_recording"]:
                 log_say("Homing arms to default pose", cfg.play_sounds)
                 _home_arms_to_default(robot, teleop)
 
@@ -795,7 +896,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         logging.info("Resetting Unitree G1 robot...")
                         robot.reset()
 
-                    _hold_arms_current_pose(robot, teleop, last_robot_action)
+                    _hold_arms_current_pose(
+                        robot,
+                        teleop,
+                        last_robot_action,
+                        sync_teleop=policy is not None,
+                    )
 
                     # record_loop(  # policy preprocessor postprocessor dataset传空
                     #     robot=robot,

@@ -29,8 +29,11 @@ python -m lerobot.find_cameras
 
 import argparse
 import concurrent.futures
+import json
 import logging
+import math
 import time
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -44,6 +47,109 @@ from lerobot.cameras.realsense.camera_realsense import RealSenseCamera
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
+
+
+_RESERVED_REALSENSE_CONFIG_FIELDS = {"serial_number_or_name", "color_mode"}
+_INTEGER_REALSENSE_CONFIG_FIELDS = {
+    "fps",
+    "width",
+    "height",
+    "rotation",
+    "warmup_s",
+    "manual_exposure_us",
+    "manual_gain",
+    "auto_exposure_limit_us",
+    "auto_gain_limit",
+    "white_balance_kelvin",
+}
+_NULLABLE_INTEGER_REALSENSE_CONFIG_FIELDS = {"fps", "width", "height", "white_balance_kelvin"}
+
+
+def parse_camera_configs(value: str) -> dict[str, dict[str, Any]]:
+    """Parse and validate RealSense overrides keyed by camera serial number."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+
+    if not isinstance(parsed, dict) or not parsed:
+        raise argparse.ArgumentTypeError("must be a non-empty JSON object keyed by RealSense serial number")
+
+    allowed_fields = {field.name for field in fields(RealSenseCameraConfig)}
+    allowed_override_fields = allowed_fields - _RESERVED_REALSENSE_CONFIG_FIELDS
+    camera_configs: dict[str, dict[str, Any]] = {}
+
+    for raw_serial, raw_overrides in parsed.items():
+        if not isinstance(raw_serial, str) or not raw_serial.strip():
+            raise argparse.ArgumentTypeError("each camera serial must be a non-empty string")
+        serial = raw_serial.strip()
+        if serial in camera_configs:
+            raise argparse.ArgumentTypeError(f"duplicate camera serial after trimming: {serial}")
+        if not isinstance(raw_overrides, dict):
+            raise argparse.ArgumentTypeError(f"camera {serial}: configuration must be a JSON object")
+
+        reserved_fields = sorted(set(raw_overrides) & _RESERVED_REALSENSE_CONFIG_FIELDS)
+        if reserved_fields:
+            raise argparse.ArgumentTypeError(
+                f"camera {serial}: fields are controlled by the CLI and cannot be overridden: "
+                f"{', '.join(reserved_fields)}"
+            )
+
+        unknown_fields = sorted(set(raw_overrides) - allowed_override_fields)
+        if unknown_fields:
+            raise argparse.ArgumentTypeError(
+                f"camera {serial}: unknown configuration fields: {', '.join(unknown_fields)}"
+            )
+
+        for field_name in _INTEGER_REALSENSE_CONFIG_FIELDS & set(raw_overrides):
+            field_value = raw_overrides[field_name]
+            if field_value is None and field_name in _NULLABLE_INTEGER_REALSENSE_CONFIG_FIELDS:
+                continue
+            if not isinstance(field_value, int) or isinstance(field_value, bool):
+                raise argparse.ArgumentTypeError(f"camera {serial}: {field_name} must be an integer")
+
+        if "use_depth" in raw_overrides and not isinstance(raw_overrides["use_depth"], bool):
+            raise argparse.ArgumentTypeError(f"camera {serial}: use_depth must be true or false")
+
+        roi = raw_overrides.get("auto_exposure_roi")
+        if roi is not None and (
+            not isinstance(roi, list)
+            or any(not isinstance(coordinate, int) or isinstance(coordinate, bool) for coordinate in roi)
+        ):
+            raise argparse.ArgumentTypeError(
+                f"camera {serial}: auto_exposure_roi must be a JSON array containing integers"
+            )
+
+        if raw_overrides.get("warmup_s", 0) < 0:
+            raise argparse.ArgumentTypeError(f"camera {serial}: warmup_s must be non-negative")
+        for field_name in ("fps", "width", "height"):
+            field_value = raw_overrides.get(field_name)
+            if field_value is not None and field_value <= 0:
+                raise argparse.ArgumentTypeError(f"camera {serial}: {field_name} must be greater than zero")
+
+        try:
+            RealSenseCameraConfig(
+                serial_number_or_name=serial,
+                color_mode=ColorMode.RGB,
+                **raw_overrides,
+            )
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"camera {serial}: {exc}") from exc
+
+        camera_configs[serial] = raw_overrides
+
+    return camera_configs
+
+
+def positive_float(value: str) -> float:
+    """Parse a strictly positive floating-point CLI value."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return parsed
 
 
 def find_all_opencv_cameras() -> List[Dict[str, Any]]:
@@ -153,13 +259,18 @@ def save_image(
         logger.error(f"Failed to save image for camera {camera_identifier} (type {camera_type}): {e}")
 
 
-def create_camera_instance(cam_meta: Dict[str, Any]) -> Dict[str, Any] | None:
+def create_camera_instance(
+    cam_meta: Dict[str, Any],
+    camera_configs: dict[str, dict[str, Any]] | None = None,
+) -> Dict[str, Any] | None:
     """Create and connect to a camera instance based on metadata."""
     cam_type = cam_meta.get("type")
     cam_id = cam_meta.get("id")
     instance = None
+    overrides = (camera_configs or {}).get(str(cam_id), {})
+    profile_name = "configured profile" if overrides else "default profile"
 
-    logger.info(f"Preparing {cam_type} ID {cam_id} with default profile")
+    logger.info(f"Preparing {cam_type} ID {cam_id} with {profile_name}")
 
     try:
         if cam_type == "OpenCV":
@@ -170,9 +281,9 @@ def create_camera_instance(cam_meta: Dict[str, Any]) -> Dict[str, Any] | None:
             instance = OpenCVCamera(cv_config)
         elif cam_type == "RealSense":
             rs_config = RealSenseCameraConfig(
-                # serial_number_or_name=int(cam_id),
                 serial_number_or_name=str(cam_id),
                 color_mode=ColorMode.RGB,
+                **overrides,
             )
             instance = RealSenseCamera(rs_config)
         else:
@@ -181,7 +292,7 @@ def create_camera_instance(cam_meta: Dict[str, Any]) -> Dict[str, Any] | None:
 
         if instance:
             logger.info(f"Connecting to {cam_type} camera: {cam_id}...")
-            instance.connect(warmup=False)
+            instance.connect(warmup=cam_type == "RealSense")
             return {"instance": instance, "meta": cam_meta}
     except Exception as e:
         logger.error(f"Failed to connect or configure {cam_type} camera {cam_id}: {e}")
@@ -228,10 +339,44 @@ def cleanup_cameras(cameras_to_use: List[Dict[str, Any]]):
             logger.error(f"Error disconnecting camera {cam_dict['meta'].get('id')}: {e}")
 
 
+def select_configured_realsense_cameras(
+    all_camera_metadata: list[dict[str, Any]],
+    camera_configs: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Select requested RealSense devices and fail if any configured serial is absent."""
+    if camera_configs is None:
+        return all_camera_metadata
+
+    requested_serials = set(camera_configs)
+    detected_serials = {
+        str(cam_meta.get("id"))
+        for cam_meta in all_camera_metadata
+        if cam_meta.get("type") == "RealSense"
+    }
+    missing_serials = sorted(requested_serials - detected_serials)
+    if missing_serials:
+        detected_text = ", ".join(sorted(detected_serials)) or "none"
+        raise RuntimeError(
+            "Configured RealSense camera(s) not detected: "
+            f"{', '.join(missing_serials)}. Detected serials: {detected_text}."
+        )
+
+    ignored_serials = sorted(detected_serials - requested_serials)
+    if ignored_serials:
+        logger.info("Ignoring unconfigured RealSense camera(s): %s", ", ".join(ignored_serials))
+
+    return [
+        cam_meta
+        for cam_meta in all_camera_metadata
+        if cam_meta.get("type") == "RealSense" and str(cam_meta.get("id")) in requested_serials
+    ]
+
+
 def save_images_from_all_cameras(
     output_dir: Path,
     record_time_s: float = 2.0,
     camera_type: str | None = None,
+    camera_configs: dict[str, dict[str, Any]] | None = None,
 ):
     """
     Connects to detected cameras (optionally filtered by type) and saves images from each.
@@ -242,20 +387,30 @@ def save_images_from_all_cameras(
         record_time_s: Duration in seconds to record images.
         camera_type: Optional string to filter cameras ("realsense" or "opencv").
                             If None, uses all detected cameras.
+        camera_configs: Optional RealSense configuration overrides keyed by serial number.
+                        When provided, only the listed RealSense devices are used.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving images to {output_dir}")
     all_camera_metadata = find_and_print_cameras(camera_type_filter=camera_type)
+    all_camera_metadata = select_configured_realsense_cameras(all_camera_metadata, camera_configs)
 
     if not all_camera_metadata:
         logger.warning("No cameras detected matching the criteria. Cannot save images.")
         return
 
     cameras_to_use = []
+    failed_camera_ids = []
     for cam_meta in all_camera_metadata:
-        camera_instance = create_camera_instance(cam_meta)
+        camera_instance = create_camera_instance(cam_meta, camera_configs)
         if camera_instance:
             cameras_to_use.append(camera_instance)
+        else:
+            failed_camera_ids.append(str(cam_meta.get("id")))
+
+    if camera_configs is not None and failed_camera_ids:
+        cleanup_cameras(cameras_to_use)
+        raise RuntimeError(f"Failed to connect configured camera(s): {', '.join(failed_camera_ids)}.")
 
     if not cameras_to_use:
         logger.warning("No cameras could be connected. Aborting image save.")
@@ -287,7 +442,7 @@ def save_images_from_all_cameras(
             logger.info(f"Image capture finished. Images saved to {output_dir}")
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Unified camera utility script for listing cameras and capturing images."
     )
@@ -308,9 +463,28 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--record-time-s",
-        type=float,
+        type=positive_float,
         default=6.0,
         help="Time duration to attempt capturing frames. Default: 6 seconds.",
     )
+    parser.add_argument(
+        "--camera-configs",
+        type=parse_camera_configs,
+        default=None,
+        help=(
+            "Strict JSON object mapping RealSense serial numbers to per-camera configuration overrides. "
+            "Only listed devices are captured; width, height, and fps must be supplied together."
+        ),
+    )
     args = parser.parse_args()
-    save_images_from_all_cameras(**vars(args))
+    if args.camera_configs is not None and args.camera_type != "realsense":
+        parser.error("--camera-configs requires camera_type 'realsense'")
+
+    try:
+        save_images_from_all_cameras(**vars(args))
+    except RuntimeError as exc:
+        parser.exit(status=1, message=f"error: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()

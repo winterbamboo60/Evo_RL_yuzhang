@@ -67,8 +67,8 @@ class RealSenseCameraConfig(CameraConfig):
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
 
-    # Change these defaults to tune all D405 cameras without changing launch commands.
-    exposure_mode: Literal["device_default", "auto", "manual"] = "device_default"
+    # Keep defaults non-invasive; set controls per camera in the launch config. ["device_default", "auto", "manual"]
+    exposure_mode: str = "device_default"
     manual_exposure_us: int = 20000
     manual_gain: int = 16
     auto_exposure_limit_us: int = 10000

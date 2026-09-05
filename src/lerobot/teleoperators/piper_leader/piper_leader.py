@@ -108,7 +108,8 @@ class PiperLeader(Teleoperator):
         self.arm.ConnectPort()
         if self.config.startup_sleep_s > 0:
             time.sleep(self.config.startup_sleep_s)
-        guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
+        if not self.config.read_only_teaching_mode:
+            guard_piper_ctrl_mode_on_connect(arm=self.arm, interface_name=self.config.port)
 
         self._is_connected = True
         # Recompute control mode on every fresh connection.
@@ -116,7 +117,13 @@ class PiperLeader(Teleoperator):
         self._last_feedback_joint_timestamp = 0.0
         self._last_feedback_gripper_timestamp = 0.0
         try:
-            self.configure()
+            if self.config.read_only_teaching_mode:
+                logger.info(
+                    "[%s] connected in read-only teaching mode; leader mode checks and commands are disabled.",
+                    self.config.port,
+                )
+            else:
+                self.configure()
             if not self.is_calibrated and calibrate and self.config.require_calibration:
                 logger.info(
                     "No piper-leader calibration file found for '%s'. Running lerobot-calibrate flow.",
@@ -233,6 +240,14 @@ class PiperLeader(Teleoperator):
     def set_manual_control(self, enabled: bool) -> None:
         if not self._is_connected:
             return
+        if self.config.read_only_teaching_mode:
+            logger.debug(
+                "[%s] ignoring set_manual_control(%s) in read-only teaching mode.",
+                self.config.port,
+                enabled,
+            )
+            return
+
         if enabled and self._manual_control_enabled is not True:
             logger.info(
                 "[%s] entering manual control: gravity_hz=%.1f, tx_ratio=%s, "
@@ -481,6 +496,10 @@ class PiperLeader(Teleoperator):
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any], add_offset: bool = False) -> None:
+        if self.config.read_only_teaching_mode:
+            raise RuntimeError(
+                f"{self} is in read-only teaching mode; send_feedback cannot command the leader arm."
+            )
         if not self.is_calibrated and not self._use_uncalibrated_passthrough():
             raise RuntimeError(
                 f"{self} is not calibrated. Run `lerobot-calibrate --teleop.type={self.config.type} --teleop.id={self.id}` first."
@@ -546,7 +565,7 @@ class PiperLeader(Teleoperator):
     def disconnect(self) -> None:
         try:
             self._stop_gravity_comp_loop_if_needed()
-            if self.config.disable_on_disconnect:
+            if self.config.disable_on_disconnect and not self.config.read_only_teaching_mode:
                 self.arm.DisableArm(7)
         finally:
             self.arm.DisconnectPort()

@@ -115,7 +115,34 @@ if __name__ == "__main__":
     time.sleep(1)
 
 
+    piper = C_PiperInterface_V2("can2")
+    piper.ConnectPort()
+    piper.EnableArm(7)
+    enable_fun(piper=piper)
+    time.sleep(2)
+    piper.GripperCtrl(70000, 1000, 0x01, 0)
+
+    # 设置初始位置：can0 是主臂(leader)。0xAD 下 speed 无效，用插值平滑慢速归位（约 4 秒）。
+    joints = [0, 0, 0, 0, 0, 0, 0]
+    control_arm_smooth(piper, joints, mit_mode=0xAD, duration_s=4.0)
+    time.sleep(1)
+
+
     piper2 = C_PiperInterface_V2("can1")
+    print(f"piper2: {piper2}")
+    piper2.ConnectPort()
+    piper2.EnableArm(7)
+    enable_fun(piper=piper2)
+    time.sleep(2)
+    piper2.GripperCtrl(70000, 1000, 0x01, 0)
+
+    # 设置初始位置：can1 是从臂(follower)，0x00 位置模式下 speed 生效，单条指令即可（speed=50）。
+    # 如也想更平滑，可换成 control_arm_smooth(piper2, joints, mit_mode=0x00, duration_s=4.0)。
+    joints = [0, 0, 0, 0, 0, 0, 0]
+    control_arm(piper2, joints, 50, mit_mode=0x00)
+    time.sleep(2)
+
+    piper2 = C_PiperInterface_V2("can3")
     print(f"piper2: {piper2}")
     piper2.ConnectPort()
     piper2.EnableArm(7)

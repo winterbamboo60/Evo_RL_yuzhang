@@ -368,7 +368,13 @@ class RealSenseCamera(Camera):
 
         if mode == "manual":
             self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 0, "enable_auto_exposure")
-            self._set_sensor_option(sensor, rs.option.exposure, self.config.manual_exposure_us, "exposure_us")
+            # Dedicated RGB sensors use 100-us UVC units; stereo imagers use microseconds.
+            native_exposure = self.config.manual_exposure_us / (
+                100 if sensor.is_color_sensor() else 1
+            )
+            self._set_sensor_option(
+                sensor, rs.option.exposure, native_exposure, "exposure_native"
+            )
             self._set_sensor_option(sensor, rs.option.gain, self.config.manual_gain, "gain")
         elif mode == "auto":
             self._set_sensor_option(sensor, rs.option.enable_auto_exposure, 1, "enable_auto_exposure")

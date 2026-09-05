@@ -38,6 +38,10 @@ class PiperLeaderConfigBase:
     # Manual backdrivable mode for human teleop
     manual_control: bool = True
 
+    # Observation-only mode for a hardware leader already configured for teaching/demo.
+    # LeRobot only reads CAN state and never changes the leader's role or motion mode.
+    read_only_teaching_mode: bool = False
+
     # Read control messages from leader first, fallback to feedback state if missing
     prefer_ctrl_messages: bool = True
     fallback_to_feedback: bool = True
@@ -90,6 +94,8 @@ def _validate_piper_leader_config(config: PiperLeaderConfigBase) -> None:
         raise ValueError("`calibration_scale` must be > 0.")
     if not isinstance(config.require_calibration, bool):
         raise ValueError("require_calibration must be true or false.")
+    if not isinstance(config.read_only_teaching_mode, bool):
+        raise ValueError("read_only_teaching_mode must be true or false.")
     if config.startup_sleep_s < 0:
         raise ValueError("`startup_sleep_s` must be >= 0.")
     if not (0 <= config.gripper_effort_default <= 5000):

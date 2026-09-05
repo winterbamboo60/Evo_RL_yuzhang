@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import lerobot.robots.piper_follower.piper_follower as piper_follower_module
+import lerobot.scripts.lerobot_record as lerobot_record_module
 import lerobot.teleoperators.bi_piper_leader.bi_piper_leader as bi_piper_leader_module
 import lerobot.teleoperators.piper_leader.piper_leader as piper_leader_module
 import lerobot.utils.piper_sdk as piper_sdk_utils
@@ -26,6 +27,7 @@ from lerobot.robots.piper_follower import (
     PiperXFollowerConfig,
 )
 from lerobot.robots.utils import make_robot_from_config
+from lerobot.scripts.lerobot_teleoperate import teleop_loop
 from lerobot.teleoperators.bi_piper_leader import (
     BiPiperLeader,
     BiPiperLeaderConfig,
@@ -40,7 +42,6 @@ from lerobot.teleoperators.piper_leader import (
     PiperXLeaderConfig,
     PiperXLeaderConfigBase,
 )
-from lerobot.scripts.lerobot_teleoperate import teleop_loop
 from lerobot.teleoperators.utils import make_teleoperator_from_config
 from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 
@@ -620,6 +621,41 @@ def test_piper_connect_fails_and_writes_follower_role_when_in_teach_mode(
     assert device.arm.role_commands[-1] == (0xFC, 0x00, 0x00, 0x00)
 
 
+def test_piper_leader_read_only_teaching_mode_is_observation_only(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    teleop = PiperLeader(
+        PiperLeaderConfig(
+            port="can1",
+            read_only_teaching_mode=True,
+            require_calibration=False,
+            disable_on_disconnect=True,
+        )
+    )
+    teleop.arm._arm_status.arm_status.ctrl_mode = 0x06
+
+    teleop.connect(calibrate=False)
+    try:
+        action = teleop.get_action()
+        assert action["joint_1.pos"] == 10.0
+        assert action["gripper.pos"] == 42.0
+        assert teleop.arm.role_commands == []
+        assert teleop.arm.mode_commands == []
+        assert teleop.arm.enable_calls == 0
+        assert teleop.arm.gripper_calls == []
+        assert teleop.arm.joint_mit_calls == []
+
+        teleop.set_manual_control(True)
+        teleop.set_manual_control(False)
+        assert teleop.arm.mode_commands == []
+        with pytest.raises(RuntimeError, match="read-only teaching mode"):
+            teleop.send_feedback(action)
+    finally:
+        teleop.disconnect()
+
+    assert teleop.arm.disable_calls == 0
+
+
 def test_piper_lfs_pointer_urdf_raises_actionable_error(tmp_path):
     pointer_file = tmp_path / "lfs_pointer.urdf"
     pointer_file.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:deadbeef\nsize 123\n")
@@ -848,13 +884,25 @@ def test_bimanual_piper_leader_uses_process_proxy_by_default(monkeypatch):
 
     teleop = make_teleoperator_from_config(
         BiPiperLeaderConfig(
-            left_arm_config=PiperLeaderConfigBase(port="can0", manual_control=False, sync_gripper=True),
-            right_arm_config=PiperLeaderConfigBase(port="can1", manual_control=False, sync_gripper=True),
+            left_arm_config=PiperLeaderConfigBase(
+                port="can0",
+                manual_control=False,
+                sync_gripper=True,
+                read_only_teaching_mode=True,
+            ),
+            right_arm_config=PiperLeaderConfigBase(
+                port="can1",
+                manual_control=False,
+                sync_gripper=True,
+                read_only_teaching_mode=True,
+            ),
         )
     )
 
     assert isinstance(teleop.left_arm, DummyProxy)
     assert isinstance(teleop.right_arm, DummyProxy)
+    assert teleop.left_arm.arm_config.read_only_teaching_mode is True
+    assert teleop.right_arm.arm_config.read_only_teaching_mode is True
 
 
 def test_piper_follower_send_only_mode_skips_sdk_reader_threads(monkeypatch):
@@ -931,3 +979,137 @@ def test_bimanual_piper_send_only_mode_propagates_to_both_followers(monkeypatch)
         assert robot.right_arm.arm.connect_calls[-1]["start_thread"] is False
     finally:
         robot.disconnect()
+
+
+def test_bimanual_piper_keeps_all_three_camera_keys(monkeypatch):
+    patch_fake_sdk(monkeypatch)
+
+    class FakeCamera:
+        is_connected = False
+
+    monkeypatch.setattr(
+        piper_follower_module,
+        "make_cameras_from_configs",
+        lambda configs: {key: FakeCamera() for key in configs},
+    )
+
+    def camera_config():
+        return SimpleNamespace(width=640, height=480, fps=30)
+
+    robot = make_robot_from_config(
+        BiPiperFollowerConfig(
+            left_arm_config=PiperFollowerConfigBase(
+                port="can1",
+                cameras={"wrist": camera_config(), "top": camera_config()},
+            ),
+            right_arm_config=PiperFollowerConfigBase(
+                port="can3",
+                cameras={"wrist": camera_config()},
+            ),
+        )
+    )
+
+    assert set(robot.cameras) == {"left_wrist", "left_top", "right_wrist"}
+    assert set(robot._cameras_ft) == {"left_wrist", "left_top", "right_wrist"}
+
+
+def _make_recording_arm(joints, gripper):
+    arm = FakePiperInterface("fake")
+    # SDK joint feedback uses joint_1 rather than joint_1.pos.
+    arm._joint_state.joint_state = SimpleNamespace(
+        **dict(zip(("joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"), joints, strict=True))
+    )
+    arm._gripper_state.gripper_state.grippers_angle = gripper
+    return arm
+
+
+def _make_recording_robot(left_joints, right_joints):
+    calibration = make_identity_calibration()
+
+    def follower(arm):
+        return SimpleNamespace(
+            arm=arm,
+            calibration=calibration,
+            config=SimpleNamespace(calibration_scale=1000),
+        )
+
+    class Robot:
+        name = "bi_piper_follower"
+
+        def __init__(self):
+            self.left_arm = follower(_make_recording_arm(left_joints, 43000))
+            self.right_arm = follower(_make_recording_arm(right_joints, 53000))
+            self.sent_actions = []
+
+        def send_action(self, action):
+            self.sent_actions.append(dict(action))
+            return action
+
+    return Robot()
+
+
+class _RecordingTeleop:
+    def __init__(self, start_action=None):
+        self.start_action = start_action
+        self.manual_control = []
+        self.feedback = []
+
+    def get_action(self):
+        return dict(self.start_action)
+
+    def set_manual_control(self, enabled):
+        self.manual_control.append(enabled)
+
+    def send_feedback(self, action):
+        self.feedback.append(dict(action))
+
+
+def test_bimanual_episode_hold_uses_each_follower_live_pose():
+    left_joints = [1000, 2000, 3000, 4000, 5000, 6000]
+    right_joints = [11000, 12000, 13000, 14000, 15000, 16000]
+    robot = _make_recording_robot(left_joints, right_joints)
+    teleop = _RecordingTeleop()
+
+    lerobot_record_module._hold_arms_current_pose(robot, teleop)
+
+    assert robot.left_arm.arm.last_joint == tuple(left_joints)
+    assert robot.right_arm.arm.last_joint == tuple(right_joints)
+    assert teleop.feedback[-1]["left_joint_1.pos"] == 1.0
+    assert teleop.feedback[-1]["right_joint_1.pos"] == 11.0
+    assert teleop.feedback[-1]["left_gripper.pos"] == 43.0
+    assert teleop.feedback[-1]["right_gripper.pos"] == 53.0
+
+
+def test_bimanual_episode_hold_can_leave_leaders_read_only():
+    left_joints = [1000, 2000, 3000, 4000, 5000, 6000]
+    right_joints = [11000, 12000, 13000, 14000, 15000, 16000]
+    robot = _make_recording_robot(left_joints, right_joints)
+    teleop = _RecordingTeleop()
+
+    lerobot_record_module._hold_arms_current_pose(robot, teleop, sync_teleop=False)
+
+    assert robot.left_arm.arm.last_joint == tuple(left_joints)
+    assert robot.right_arm.arm.last_joint == tuple(right_joints)
+    assert teleop.feedback == []
+
+
+def test_bimanual_home_interpolates_leaders_and_followers_independently(monkeypatch):
+    robot = _make_recording_robot(
+        [10000, 20000, 30000, 40000, 50000, 60000],
+        [20000, 30000, 40000, 50000, 60000, 70000],
+    )
+    leader_start = {f"{side}_{key}": 30.0 for side in ("left", "right") for key in PIPER_ACTION_KEYS}
+    teleop = _RecordingTeleop(leader_start)
+    monkeypatch.setattr(lerobot_record_module, "_PIPER_HOME_SMOOTH_DURATION_S", 0.04)
+    monkeypatch.setattr(lerobot_record_module, "_PIPER_HOME_SMOOTH_STEP_DT_S", 0.02)
+    monkeypatch.setattr(lerobot_record_module, "_PIPER_HOME_SETTLE_S", 0.0)
+    monkeypatch.setattr(lerobot_record_module.time, "sleep", lambda _: None)
+
+    lerobot_record_module._home_arms_to_default(robot, teleop)
+
+    assert teleop.manual_control == [False]
+    assert len(robot.sent_actions) == 2
+    assert len(teleop.feedback) == 2
+    assert robot.sent_actions[0]["left_joint_1.pos"] == 5.0
+    assert teleop.feedback[0]["left_joint_1.pos"] == 15.0
+    assert robot.sent_actions[-1]["left_joint_1.pos"] == 0.0

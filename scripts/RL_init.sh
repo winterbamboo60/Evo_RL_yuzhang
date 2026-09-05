@@ -31,6 +31,9 @@ pip install tensorboard
 
 # 修改lerobot库路径
 pip install -e . --no-deps --no-build-isolation
+
+echo 'alias yzre="python /home/lenovo/code/Evo-RL-loop-0817/src/lerobot/reset.py"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 模型下载A800
@@ -87,6 +90,7 @@ done
 
 Step3. 初始化2个CAN口
 lerobot-setup-can --mode=setup --interfaces=can0,can1
+lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
 
 Step4. CAN口模式测试，需要能看到持续输出的数据
 lerobot-setup-can --mode=test --interfaces=can0
@@ -107,3 +111,61 @@ conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_
 
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py realsense
+
+rm -r /home/lenovo/code/Evo-RL-loop-0901/src/outputs/captured_images
+source /home/lenovo/code/envs/package_sorting_env/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0901/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
+source /home/lenovo/code/envs/package_sorting_env/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0901/src; PYTHONPATH=. python lerobot/find_cameras.py realsense --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check
+
+# Step6. 使用与 RL_data.sh 相同的双 RealSense 参数抓取彩色快照
+(
+  source /home/lenovo/code/envs/package_sorting_env/bin/activate
+  cd /home/lenovo/code/Evo-RL-loop-0901/src
+  PYTHONPATH=. python lerobot/find_cameras.py realsense \
+    --camera-configs '{"260422275773":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"260422275792":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"261822303677":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":9000,"manual_gain":76,"white_balance_kelvin":3800}}' \
+    --record-time-s 2 \
+    --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check_2
+)
+
+(
+    source /home/lenovo/code/envs/package_sorting_env/bin/activate
+    cd /home/lenovo/code/Evo-RL-loop-0901/src
+
+    PYTHONPATH=. python lerobot/find_cameras.py realsense \
+      --camera-configs '{
+        "260422275773": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 10000,
+          "manual_gain": 16,
+          "white_balance_kelvin": 3860
+        },
+        "260422275792": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 10000,
+          "manual_gain": 16,
+          "white_balance_kelvin": 3860
+        },
+        "261822303677": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 8200,
+          "manual_gain": 76,
+          "white_balance_kelvin": 3820
+        }
+      }' \
+      --record-time-s 2 \
+      --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check_2
+)

@@ -80,8 +80,13 @@ class BiPiperFollower(Robot):
         self.left_arm = arm_cls(left_arm_config)
         self.right_arm = arm_cls(right_arm_config)
 
-        # Only for compatibility with other parts of the codebase that expect `robot.cameras`.
-        self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
+        # Keep the public camera keys aligned with the prefixed observation keys. In particular,
+        # both child arms may define a camera named `wrist`; a raw dict merge would silently drop
+        # the left one and under-count the image-writer workers.
+        self.cameras = {
+            **{f"left_{key}": camera for key, camera in self.left_arm.cameras.items()},
+            **{f"right_{key}": camera for key, camera in self.right_arm.cameras.items()},
+        }
 
     @property
     def _motors_ft(self) -> dict[str, type]:

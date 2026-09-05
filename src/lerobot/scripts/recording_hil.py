@@ -193,14 +193,14 @@ class PolicySyncDualArmExecutor:
         self.parallel_dispatch = parallel_dispatch
         self._pool = ThreadPoolExecutor(max_workers=2) if parallel_dispatch else None
 
-    def send_action(self, action: RobotAction, add_offset: bool = False) -> RobotAction:
+    def send_action(self, action: RobotAction) -> RobotAction:
         if self._pool is None:
-            sent_action = self.robot.send_action(action, add_offset=add_offset)
-            self.teleop.send_feedback(action, add_offset=add_offset)
+            sent_action = self.robot.send_action(action)
+            self.teleop.send_feedback(action)
             return sent_action
 
-        robot_future = self._pool.submit(self.robot.send_action, action, add_offset=add_offset)
-        teleop_future = self._pool.submit(self.teleop.send_feedback, action, add_offset=add_offset)
+        robot_future = self._pool.submit(self.robot.send_action, action)
+        teleop_future = self._pool.submit(self.teleop.send_feedback, action)
         sent_action = robot_future.result()
         teleop_future.result()
         return sent_action

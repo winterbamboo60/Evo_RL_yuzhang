@@ -20,8 +20,12 @@ def test_teleoperate_parses_bi_piperx_types():
         "--teleop.right_arm_config.port=can3",
         "--teleop.left_arm_config.require_calibration=false",
         "--teleop.right_arm_config.require_calibration=false",
+        "--teleop.left_arm_config.read_only_teaching_mode=true",
+        "--teleop.right_arm_config.read_only_teaching_mode=true",
     ]
     cfg = draccus.parse(config_class=TeleoperateConfig, config_path=None, args=args)
+    assert cfg.teleop.left_arm_config.read_only_teaching_mode is True
+    assert cfg.teleop.right_arm_config.read_only_teaching_mode is True
     assert cfg.robot.type == "bi_piperx_follower"
     assert cfg.teleop.type == "bi_piperx_leader"
 

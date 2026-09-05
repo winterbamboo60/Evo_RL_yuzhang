@@ -248,6 +248,10 @@ fi
 # 若提供了策略模型路径则追加（启用人机协同模式）
 if [[ -n "$POLICY_PATH" ]]; then
     CMD+=("--policy.path=${POLICY_PATH}")
+    echo "[模式] VLA：启动时归位，主臂允许程序控制。"
+else
+    CMD+=(--teleop.read_only_teaching_mode=true)
+    echo "[模式] 人工示范：启动时不归位，主臂只读，允许硬件示教模式。"
 fi
 
 # RTC 默认关闭；关闭时不向 Python 入口追加任何 RTC 参数，完整保留原执行路径。

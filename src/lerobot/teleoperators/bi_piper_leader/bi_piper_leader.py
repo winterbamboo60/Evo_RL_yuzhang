@@ -192,6 +192,7 @@ class BiPiperLeader(Teleoperator):
         "log_level",
         "startup_sleep_s",
         "manual_control",
+        "read_only_teaching_mode",
         "prefer_ctrl_messages",
         "fallback_to_feedback",
         "sync_gripper",
