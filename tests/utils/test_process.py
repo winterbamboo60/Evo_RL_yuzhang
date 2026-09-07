@@ -77,6 +77,11 @@ def test_setup_process_handlers_event_with_processes():
 )
 def test_signal_handler_sets_event(use_threads, sig):
     """Test that the signal handler sets the event on receiving a signal."""
+    if sig == signal.SIGHUP:
+        # Ensure this test covers the normal foreground-process disposition,
+        # independently of how pytest itself was launched.
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
     handler = ProcessSignalHandler(use_threads=use_threads)
     shutdown_event = handler.shutdown_event
 
@@ -110,3 +115,16 @@ def test_force_shutdown_on_second_signal(mock_sys_exit, use_threads):
 
     assert handler.counter == 2
     mock_sys_exit.assert_called_once_with(1)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP not available")
+def test_online_rl_process_handler_preserves_ignored_sighup():
+    """Keep the SIGHUP disposition inherited from nohup."""
+    from lerobot.onlineRL_evoRL.process import ProcessSignalHandler as OnlineRLProcessSignalHandler
+
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    handler = OnlineRLProcessSignalHandler(use_threads=True)
+
+    assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    os.kill(os.getpid(), signal.SIGHUP)

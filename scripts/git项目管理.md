@@ -33,6 +33,9 @@ git add .
 git commit -m "dev:[本次更新的内容]"
 git push
 
+改最近一次提交的说明，执行：
+git commit --amend -m "新的提交说明"
+
 # 项目更新
 ## 完全采用最新git代码
 cd 你的项目目录

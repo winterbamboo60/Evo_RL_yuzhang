@@ -77,6 +77,11 @@ class ProcessSignalHandler:
                 # instance does not provide SIGHUP, SIGQUIT…). Skip it.
                 continue
             try:
+                # `nohup` marks SIGHUP as ignored before exec. Preserve that
+                # inherited disposition instead of making the process
+                # vulnerable to terminal hangups again.
+                if sig_name == "SIGHUP" and signal.getsignal(sig) == signal.SIG_IGN:
+                    continue
                 signal.signal(sig, _signal_handler)
             except (ValueError, OSError):  # pragma: no cover – unlikely but safe
                 # Signal not supported or we are in a non-main thread.
