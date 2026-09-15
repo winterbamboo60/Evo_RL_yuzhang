@@ -102,6 +102,14 @@ Merge multiple datasets while keeping one file per source file (no video/data st
         --operation.concatenate_videos false \
         --operation.concatenate_data false
 
+Evo-RL 0901 compatibility: recursively merge all datasets below a local directory:
+    lerobot-edit-dataset \
+        --repo_id /path/to/pusht_merged \
+        --operation.type merge \
+        --operation.source_dir /path/to/datasets_parent
+
+For new scripts, prefer the explicit --new_repo_id/--new_root/--operation.roots form above.
+
 Remove camera feature:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -294,6 +302,8 @@ class SplitConfig(OperationConfig):
 class MergeConfig(OperationConfig):
     repo_ids: list[str] | None = None
     roots: list[str] | None = None
+    # Evo-RL 0901 compatibility: recursively discover datasets below a local parent directory.
+    source_dir: str | None = None
     # When False, keep one file per source file instead of packing into shards.
     concatenate_videos: bool = True
     concatenate_data: bool = True
@@ -366,6 +376,41 @@ class EditDatasetConfig:
     new_root: str | None = None
     # Upload dataset to Hugging Face hub.
     push_to_hub: bool = False
+
+
+def _discover_lerobot_dataset_dirs(source_dir: str | Path) -> list[Path]:
+    """Return all LeRobot dataset roots below a local parent, in stable path order."""
+    parent = Path(source_dir).expanduser().resolve()
+    if not parent.is_dir():
+        raise FileNotFoundError(f"Merge source_dir does not exist or is not a directory: {parent}")
+
+    dataset_dirs = sorted(
+        {info_path.parent.parent for info_path in parent.rglob("meta/info.json")},
+        key=lambda path: path.relative_to(parent).as_posix(),
+    )
+    if not dataset_dirs:
+        raise FileNotFoundError(
+            f"No LeRobot datasets found under {parent}. "
+            "Expected dataset directories containing meta/info.json."
+        )
+    return dataset_dirs
+
+
+def _repo_id_from_dataset_dir(dataset_dir: Path, source_dir: str | Path) -> str:
+    parent = Path(source_dir).expanduser().resolve()
+    relative = dataset_dir.resolve().relative_to(parent).as_posix()
+    return dataset_dir.name if relative == "." else relative
+
+
+def _resolve_legacy_merge_output(repo_id: str, root: str | Path | None) -> tuple[str, Path]:
+    """Map the Evo-RL 0901 merge output syntax onto the current output fields."""
+    candidate = Path(repo_id).expanduser()
+    if candidate.is_absolute():
+        output_dir = candidate.resolve()
+        return f"local/{output_dir.name}", output_dir
+
+    output_dir = (Path(root) / repo_id if root else HF_LEROBOT_HOME / repo_id).expanduser().resolve()
+    return repo_id, output_dir
 
 
 def _resolve_io_paths(
@@ -488,32 +533,65 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, MergeConfig):
         raise ValueError("Operation config must be MergeConfig")
 
-    if not cfg.operation.repo_ids:
-        raise ValueError("repo_ids must be specified for merge operation")
+    if not cfg.operation.repo_ids and not cfg.operation.source_dir:
+        raise ValueError("Either repo_ids or source_dir must be specified for merge operation")
 
-    if cfg.repo_id is not None or cfg.root is not None:
+    if cfg.new_repo_id is None:
+        if not cfg.repo_id:
+            raise ValueError(
+                "Legacy source_dir merge requires --repo_id as its output path or repository identifier"
+            )
+        output_repo_id, output_dir = _resolve_legacy_merge_output(cfg.repo_id, cfg.root)
         logging.warning(
-            "merge uses --new_repo_id and --new_root for the merged dataset. The --repo_id and --root parameters are ignored."
+            "Using Evo-RL 0901 merge compatibility: --repo_id selects the output. "
+            "Prefer --new_repo_id and --new_root for new commands."
+        )
+    else:
+        output_repo_id = cfg.new_repo_id
+        output_dir = Path(cfg.new_root) if cfg.new_root else HF_LEROBOT_HOME / output_repo_id
+        if cfg.repo_id is not None or cfg.root is not None:
+            logging.warning(
+                "merge uses --new_repo_id and --new_root for the merged dataset. "
+                "The --repo_id and --root parameters are ignored."
+            )
+
+    output_dir = output_dir.expanduser().resolve()
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Merge output directory already exists: {output_dir}. "
+            "Choose a new output directory to avoid duplicate or partial merges."
         )
 
-    if cfg.operation.roots:
+    merge_sources: list[tuple[str, str | Path | None]] = []
+    if cfg.operation.repo_ids and cfg.operation.roots:
         if len(cfg.operation.roots) != len(cfg.operation.repo_ids):
             raise ValueError("repo_ids and roots must have the same length for merge operation")
-        logging.info(f"Loading {len(cfg.operation.roots)} datasets to merge")
-        datasets = [
-            LeRobotDataset(repo_id=repo_id, root=root)
-            for repo_id, root in zip(cfg.operation.repo_ids, cfg.operation.roots, strict=True)
-        ]
-    else:
-        logging.info(f"Loading {len(cfg.operation.repo_ids)} datasets to merge")
-        datasets = [LeRobotDataset(repo_id) for repo_id in cfg.operation.repo_ids]
+        merge_sources.extend(zip(cfg.operation.repo_ids, cfg.operation.roots, strict=True))
+    elif cfg.operation.repo_ids:
+        merge_sources.extend((repo_id, None) for repo_id in cfg.operation.repo_ids)
 
-    output_dir = Path(cfg.new_root) if cfg.new_root else HF_LEROBOT_HOME / cfg.new_repo_id
+    if cfg.operation.source_dir:
+        source_dir = Path(cfg.operation.source_dir).expanduser().resolve()
+        discovered_dirs = _discover_lerobot_dataset_dirs(source_dir)
+        logging.info(f"Found {len(discovered_dirs)} datasets under {source_dir}")
+        for dataset_dir in discovered_dirs:
+            if dataset_dir.resolve() == output_dir:
+                logging.info(f"Skipping output dataset directory discovered in source_dir: {dataset_dir}")
+                continue
+            merge_sources.append((_repo_id_from_dataset_dir(dataset_dir, source_dir), dataset_dir))
 
-    logging.info(f"Merging datasets into {cfg.new_repo_id}")
+    if not merge_sources:
+        raise ValueError("No input datasets found for merge operation")
+
+    logging.info(f"Loading {len(merge_sources)} datasets to merge")
+    for repo_id, root in merge_sources:
+        logging.info(f"  source: repo_id={repo_id}, root={root}")
+    datasets = [LeRobotDataset(repo_id=repo_id, root=root) for repo_id, root in merge_sources]
+
+    logging.info(f"Merging datasets into {output_repo_id}")
     merged_dataset = merge_datasets(
         datasets,
-        output_repo_id=cfg.new_repo_id,
+        output_repo_id=output_repo_id,
         output_dir=output_dir,
         concatenate_videos=cfg.operation.concatenate_videos,
         concatenate_data=cfg.operation.concatenate_data,
@@ -525,7 +603,7 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     )
 
     if cfg.push_to_hub:
-        logging.info(f"Pushing to hub as {cfg.new_repo_id}")
+        logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(merged_dataset.repo_id, root=output_dir).push_to_hub()
 
 
@@ -833,8 +911,12 @@ def handle_info(cfg: EditDatasetConfig):
 
 def _validate_config(cfg: EditDatasetConfig) -> None:
     if isinstance(cfg.operation, MergeConfig):
-        if not cfg.new_repo_id:
-            raise ValueError("--new_repo_id is required for merge operation (the merged dataset identifier)")
+        legacy_source_dir_output = bool(cfg.operation.source_dir and cfg.repo_id)
+        if not cfg.new_repo_id and not legacy_source_dir_output:
+            raise ValueError(
+                "--new_repo_id is required for merge operation, except for the Evo-RL 0901 "
+                "compatibility form using --repo_id with --operation.source_dir"
+            )
     else:
         if not cfg.repo_id:
             raise ValueError(

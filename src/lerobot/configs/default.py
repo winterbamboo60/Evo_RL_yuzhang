@@ -105,6 +105,15 @@ class WandBConfig:
 
 
 @dataclass
+class TensorBoardConfig:
+    """Optional local TensorBoard metric logging."""
+
+    enable: bool = False
+    # Wrappers can set a sibling directory such as OUTPUT_DIR/tensoborad.
+    log_dir: str | None = None
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.

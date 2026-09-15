@@ -52,6 +52,8 @@ from .import_utils import _pynput_available
 
 logger = logging.getLogger(__name__)
 
+INTERVENTION_TOGGLE_COOLDOWN_S = 0.5
+
 # POSIX-only terminal modules (absent on Windows, where the pynput backend is used).
 if TYPE_CHECKING:
     import termios
@@ -393,48 +395,75 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
     return None
 
 
-def init_keyboard_listener():
-    """Initialize a non-blocking keyboard listener for interactive recording controls.
+def init_keyboard_listener(
+    *,
+    intervention_toggle_key: str | None = None,
+    episode_success_key: str | None = None,
+    episode_failure_key: str | None = None,
+    rerecord_episode_key: str | None = None,
+    reset_episode_key: str | None = None,
+):
+    """Initialize display-independent recording controls.
 
-    Backend selection:
-
-    * ``pynput`` global listener when :func:`pynput_can_capture` is true (real
-      X11, macOS, Windows). On macOS the listener's ``IS_TRUSTED`` flag is checked
-      after start; if the process lacks Accessibility / Input-Monitoring
-      permission, the listener is stopped and the terminal backend is used.
-    * a :class:`TerminalKeyListener` reading the controlling TTY when ``pynput``
-      cannot capture (Wayland / headless-SSH / macOS-untrusted) *and* stdin is a TTY.
-    * otherwise no listener (non-interactive / piped runs) — recording relies on
-      the episode/reset timers (or Ctrl+C).
-
-    Both backends accept the same controls: Right/Left/Esc, plus the single-byte letter
-    equivalents ``n`` (next), ``r`` (re-record) and ``q`` (quit). The letters are the most
-    reliable choice over high-latency SSH/VNC links, where arrow-key escape sequences can
-    be split, delayed, or intercepted by the terminal.
-
-    Returns:
-        A tuple ``(listener, events)`` where ``listener`` exposes ``.stop()`` or is
-        ``None``, and ``events`` is the dict of flags (``exit_early``,
-        ``rerecord_episode``, ``stop_recording``) set by key presses.
+    With no keyword arguments this retains the standard Right/Left/Esc behavior.
+    EvoRL recording can replace Left with an explicit re-record hotkey.
     """
     events = {
         "exit_early": False,
         "rerecord_episode": False,
         "stop_recording": False,
+        "toggle_intervention": False,
+        "episode_outcome": None,
+        "reset_episode": False,
     }
+    last_intervention_time = 0.0
 
-    # Accept the single-byte letter equivalents n/r/q alongside the arrow/Esc keys: the
-    # letters are immune to the escape-sequence split/delay/interception that affects arrows
-    # over laggy SSH/VNC links. Case-insensitive so Shift+letter still works.
     def on_key(name: str) -> None:
+        nonlocal last_intervention_time
         key = name.lower()
-        if key in ("right", "n"):
+        if episode_success_key and key == episode_success_key.lower():
+            events["episode_outcome"] = "success"
+            events["exit_early"] = True
+            logger.info("Recording control: episode marked successful")
+        elif episode_failure_key and key == episode_failure_key.lower():
+            events["episode_outcome"] = "failure"
+            events["exit_early"] = True
+            logger.info("Recording control: episode marked failed")
+        elif rerecord_episode_key and key == rerecord_episode_key.lower():
+            events["rerecord_episode"] = True
+            events["exit_early"] = True
+            logger.info("Recording control: discard and re-record requested")
+        elif reset_episode_key and key == reset_episode_key.lower():
+            events["reset_episode"] = True
+            events["rerecord_episode"] = True
+            events["exit_early"] = True
+            logger.info("Recording control: reset and re-record requested")
+        elif intervention_toggle_key and key == intervention_toggle_key.lower():
+            now = time.monotonic()
+            if now - last_intervention_time >= INTERVENTION_TOGGLE_COOLDOWN_S:
+                last_intervention_time = now
+                events["toggle_intervention"] = True
+                logger.info("Recording control: human-intervention toggle requested")
+        elif key in ("right", "n"):
             apply_recording_control("right", events)
-        elif key in ("left", "r"):
+        elif (key == "left" and not rerecord_episode_key) or (not reset_episode_key and key == "r"):
             apply_recording_control("left", events)
         elif key in ("esc", "q"):
             apply_recording_control("esc", events)
-        # other keys (incl. up/down) are intentionally ignored
 
-    listener = create_key_listener(on_key, controls_help="Right/Left/Esc, or n=next, r=re-record, q=quit")
+    navigation_help = "Right/Esc" if rerecord_episode_key else "Right/Left/Esc"
+    help_parts = [navigation_help, "n=next", "q=quit"]
+    if rerecord_episode_key:
+        help_parts.append(f"{rerecord_episode_key}=re-record")
+    if reset_episode_key:
+        help_parts.append(f"{reset_episode_key}=reset")
+    else:
+        help_parts.append("r=re-record")
+    if intervention_toggle_key:
+        help_parts.append(f"{intervention_toggle_key}=intervention")
+    if episode_success_key:
+        help_parts.append(f"{episode_success_key}=success")
+    if episode_failure_key:
+        help_parts.append(f"{episode_failure_key}=failure")
+    listener = create_key_listener(on_key, controls_help=", ".join(help_parts))
     return listener, events

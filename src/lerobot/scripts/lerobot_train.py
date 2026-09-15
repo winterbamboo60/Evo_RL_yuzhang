@@ -33,7 +33,7 @@ import logging
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -57,7 +57,7 @@ from lerobot.common.train_utils import (
     should_save_checkpoint,
     update_last_checkpoint,
 )
-from lerobot.common.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import TensorBoardLogger, WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
@@ -97,6 +97,17 @@ else:
 from .lerobot_eval import eval_policy_all
 
 EMA_STATE_FILENAME = "ema_state.pt"
+
+
+def _enable_line_buffered_output() -> None:
+    """Make redirected stdout/stderr visible promptly during nohup training."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        # Captured streams used by tests and notebooks may not be reconfigurable.
+        with suppress(OSError, ValueError):
+            reconfigure(line_buffering=True, write_through=True)
 
 
 @contextmanager
@@ -403,9 +414,11 @@ def train(cfg: TrainPipelineConfig):
     if cfg.job.is_remote:
         return submit_to_hf(cfg)
 
+    logging.info("Checking training dependencies and configuration")
     require_package("accelerate", extra="training")
 
     cfg.validate()  # all fail-fasts fire here, before any distributed init
+    logging.info("Training configuration validated; initializing Accelerator")
 
     # --- engine & topology --------------------------------------------------------------------
     # The factory is the ONLY accelerate configuration site: it guards against env-var
@@ -415,17 +428,28 @@ def train(cfg: TrainPipelineConfig):
     parallel_dims = ParallelDims.from_config(
         cfg.parallelism, accelerator.num_processes, accelerator.device.type
     )
-    init_logging(accelerator=accelerator)
+
+    # cfg.validate() rejects an existing directory for a fresh run, so only create the
+    # directory after validation. Keep a native Python log in every run directory even
+    # when lerobot-train is invoked directly instead of through scripts/RL_train.sh.
+    train_log_file = None
+    if accelerator.is_main_process:
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        train_log_file = cfg.output_dir / "RL_train.log"
+    accelerator.wait_for_everyone()
+    init_logging(log_file=train_log_file, file_level="INFO", accelerator=accelerator)
 
     if is_main_process():
+        logging.info("Training log: %s", train_log_file)
         logging.info(pformat(cfg.to_dict()))
 
-    if cfg.wandb.enable and cfg.wandb.project and is_main_process():
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
-        if is_main_process():
-            logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+    wandb_logger = WandBLogger(cfg) if cfg.wandb.enable and cfg.wandb.project and is_main_process() else None
+    tensorboard_cfg = getattr(cfg, "tensorboard", None)
+    tensorboard_logger = (
+        TensorBoardLogger(cfg) if getattr(tensorboard_cfg, "enable", False) and is_main_process() else None
+    )
+    if wandb_logger is None and tensorboard_logger is None and is_main_process():
+        logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
@@ -776,7 +800,7 @@ def train(cfg: TrainPipelineConfig):
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
-                if wandb_logger:
+                if wandb_logger or tensorboard_logger:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,
                     # rank-reduced averages — no per-step output_dict passthrough needed.
@@ -788,7 +812,10 @@ def train(cfg: TrainPipelineConfig):
                     if ema is not None and ema.cur_decay_value is not None:
                         wandb_log_dict["ema/decay"] = ema.cur_decay_value
                         wandb_log_dict["ema/step"] = ema.optimization_step
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                    if wandb_logger:
+                        wandb_logger.log_dict(wandb_log_dict, step)
+                    if tensorboard_logger:
+                        tensorboard_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step:
@@ -812,6 +839,8 @@ def train(cfg: TrainPipelineConfig):
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                if tensorboard_logger:
+                    tensorboard_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
@@ -907,6 +936,10 @@ def train(cfg: TrainPipelineConfig):
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if tensorboard_logger:
+                    tensorboard_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    tensorboard_logger.log_dict(tensorboard_log_dict, step, mode="eval")
+                    tensorboard_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -948,6 +981,8 @@ def train(cfg: TrainPipelineConfig):
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()
+    if tensorboard_logger:
+        tensorboard_logger.finish()
     accelerator.end_training()
 
 
@@ -968,13 +1003,25 @@ def _remote_target_in_argv() -> bool:
 
 
 def main():
-    register_third_party_plugins()
-    if _remote_target_in_argv():
-        # The policy device is resolved on the remote pod, not here, so silence the
-        # client-side "Device '...' is not available" warning PreTrainedConfig emits
-        # while parsing the config (it fires before train() can dispatch remotely).
-        logging.getLogger("lerobot.configs.policies").setLevel(logging.ERROR)
-    train()
+    _enable_line_buffered_output()
+    init_logging()
+    logging.info("Starting lerobot-train")
+    try:
+        register_third_party_plugins()
+        if _remote_target_in_argv():
+            # The policy device is resolved on the remote pod, not here, so silence the
+            # client-side "Device '...' is not available" warning PreTrainedConfig emits
+            # while parsing the config (it fires before train() can dispatch remotely).
+            logging.getLogger("lerobot.configs.policies").setLevel(logging.ERROR)
+        train()
+    except KeyboardInterrupt:
+        logging.warning("Training interrupted by user")
+        raise
+    except Exception:
+        # Once train() initializes its file handler this also persists the traceback in
+        # output_dir/RL_train.log. Before that point it still appears immediately on stderr.
+        logging.exception("Training failed")
+        raise
 
 
 if __name__ == "__main__":

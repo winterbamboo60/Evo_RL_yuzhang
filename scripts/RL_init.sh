@@ -1,0 +1,187 @@
+```bash
+# 此处对外仅暴露lerobot-setup-can
+
+# 自动执行，但只允许修改当前项目
+codex --sandbox workspace-write --ask-for-approval never
+
+Step0. 主从臂都设置成从动模式
+
+Step1. 切换环境
+
+```bash
+# mkdir -p ./package_sorting_env && tar -xzf ./package_sorting.tar.gz -C ./package_sorting_env
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+/home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
+
+source /home/lenovo/code/envs/evo_0911/bin/activate
+/home/lenovo/code/envs/evo_0911/bin/conda-unpack
+
+source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
+/mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/conda-unpack
+
+# lerobot 0.6.1环境
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
+
+# 百度云激活环境
+export CONDA_PREFIX=/mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw; export PATH="$CONDA_PREFIX/bin:$PATH"
+
+
+# 适配固件版本：PIPER合并固件_MC(S-V1.9-0)_DRV(V2.0.7 ).bin
+# 卸载当前 0.6.1
+python -m pip uninstall -y piper_sdk
+# 安装 1_0_0_b1 分支
+python -m pip install --no-cache-dir \
+"git+https://github.com/agilexrobotics/piper_sdk.git@1_0_0_b1"
+
+# 下载grpc，用于onlineRL
+pip install grpcio
+
+# 用于日志监控
+pip install tensorboard
+
+# 修改lerobot库路径
+pip install -e . --no-deps --no-build-isolation
+
+echo 'alias yzre="python /home/lenovo/code/Evo-RL-loop-0817/src/lerobot/reset.py"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+模型下载A800
+downloadyuzhang() {
+    if [ $# -eq 0 ]; then
+	echo "用法： d <filename>"
+        return 1
+    fi
+    DOWNLOAD_URL="http://192.168.110.115:20181/yuzhang/download.php"
+    REMOTE_FILE="$1"
+    if [ -f "${REMOTE_FILE}" ]; then
+        rm "${REMOTE_FILE}"
+    fi
+    if ! curl -f -OJ "${DOWNLOAD_URL}?file=${REMOTE_FILE}"; then
+        echo "文件不存在"
+    fi
+}
+
+数据上传A800
+
+Step2. 查看所有CAN口号
+# 检查 ethtool 是否已安装
+if ! dpkg -l | grep -q "ethtool"; then
+    echo "\e[31m错误: 系统中未检测到 ethtool。\e[0m"
+    echo "请使用以下命令安装 ethtool:"
+    echo "sudo apt update && sudo apt install ethtool"
+    exit 1
+fi
+
+# 检查 can-utils 是否已安装
+if ! dpkg -l | grep -q "can-utils"; then
+    echo "\e[31m错误: 系统中未检测到 can-utils。\e[0m"
+    echo "请使用以下命令安装 can-utils:"
+    echo "sudo apt update && sudo apt install can-utils"
+    exit 1
+fi
+
+echo "ethtool 和 can-utils 均已安装。"
+
+# 遍历所有 CAN 接口
+for iface in $(ip -br link show type can | awk '{print $1}'); do
+    # 使用 ethtool 获取 bus-info
+    BUS_INFO=$(sudo ethtool -i "$iface" | grep "bus-info" | awk '{print $2}')
+    
+    if [ -z "$BUS_INFO" ];then
+        echo "错误: 无法获取接口 $iface 的 bus-info 信息。"
+        continue
+    fi
+    
+    echo "接口 $iface 插入在 USB 端口 $BUS_INFO"
+done
+
+
+
+Step3. 初始化CAN口
+source /home/lenovo/code/envs/evo_0911/bin/activate
+lerobot-setup-can --mode=setup --interfaces=can0,can1
+
+默认 CAN 映射：
+左主臂 can0 -> 左从臂 can1
+右主臂 can2 -> 右从臂 can3
+lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
+
+Step4. CAN口模式测试，需要能看到持续输出的数据
+lerobot-setup-can --mode=test --interfaces=can0
+lerobot-setup-can --mode=test --interfaces=can1
+
+Step5. 摄影机模式测试，需要根据输出确认摄像头索引
+python ./lerobot/srclerobot/find_cameras.py opencv && ll ./lerobot/src/outputs/captured_images
+
+进入lerobot虚拟环境：  conda activate lerobot
+进入工作目录： cd ~/VLA/lerobot/src/
+查询can口号： bash piper_sdk/find_all_can_port.sh 
+根据can 口号修改： /home/hpc/VLA/lerobot/src/activate_single_arm_can.sh  里的can口号
+激活can口： bash activate_single_arm_can.sh
+查询摄像头index号： PYTHONPATH=. python lerobot/find_cameras.py opencv    确认top和wrist视角的index，然后在对应的命令里修改index
+
+conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_cameras.py opencv
+conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_cameras.py realsense
+
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
+source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py realsense
+
+mkdir -p /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
+source /home/lenovo/code/envs/evo_0911/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras opencv
+source /home/lenovo/code/envs/evo_0911/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras realsense --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
+
+# Step6. 使用与 RL_data.sh 相同的双 RealSense 参数抓取彩色快照
+(
+  source /home/lenovo/code/envs/evo_0911/bin/activate
+  cd /home/lenovo/code/Evo-RL-loop-0911
+  lerobot-find-cameras realsense \
+    --camera-configs '{"260422275773":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"260422275792":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"261822303677":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":9000,"manual_gain":76,"white_balance_kelvin":3800}}' \
+    --record-time-s 2 \
+    --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check_2
+)
+
+(
+    source /home/lenovo/code/envs/evo_0911/bin/activate
+    cd /home/lenovo/code/Evo-RL-loop-0911
+
+    lerobot-find-cameras realsense \
+      --camera-configs '{
+        "260422275773": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 10000,
+          "manual_gain": 16,
+          "white_balance_kelvin": 3860
+        },
+        "260422275792": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 10000,
+          "manual_gain": 16,
+          "white_balance_kelvin": 3860
+        },
+        "261822303677": {
+          "width": 640,
+          "height": 480,
+          "fps": 30,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "manual_exposure_us": 8200,
+          "manual_gain": 76,
+          "white_balance_kelvin": 3820
+        }
+      }' \
+      --record-time-s 2 \
+      --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check_2
+)

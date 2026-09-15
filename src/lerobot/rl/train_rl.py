@@ -23,6 +23,7 @@ from lerobot.configs.train import TrainPipelineConfig
 
 from .algorithms.configs import RLAlgorithmConfig
 from .algorithms.factory import make_algorithm_config
+from .algorithms.rlt_chunk import RLTChunkAlgorithmConfig  # noqa: F401
 from .algorithms.sac import SACAlgorithmConfig  # noqa: F401
 
 
@@ -41,7 +42,17 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     online_ratio: float = 0.5
 
     def validate(self) -> None:
-        super().validate()
+        # TrainPipelineConfig still assumes an offline dataset is always
+        # present. Current online-only algorithms (notably rlt_chunk) require
+        # dataset=None, so use a validation-only placeholder and restore the
+        # public value before the learner builds its replay buffers.
+        configured_dataset = self.dataset
+        if configured_dataset is None:
+            self.dataset = DatasetConfig(repo_id="__online_only__")
+        try:
+            super().validate()
+        finally:
+            self.dataset = configured_dataset
 
         if self.algorithm is None:
             self.algorithm = make_algorithm_config("sac")

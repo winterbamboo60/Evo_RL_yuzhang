@@ -165,6 +165,9 @@ wandb/
 # Data folders
 data/
 outputs/
+/artifacts/evo_0911/
+!scripts/ci/env/
+!scripts/ci/env/**
 
 # Translations
 *.mo

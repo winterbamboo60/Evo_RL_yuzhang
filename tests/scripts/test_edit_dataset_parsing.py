@@ -30,6 +30,9 @@ from lerobot.scripts.lerobot_edit_dataset import (
     ReencodeVideosConfig,
     RemoveFeatureConfig,
     SplitConfig,
+    _discover_lerobot_dataset_dirs,
+    _repo_id_from_dataset_dir,
+    _resolve_legacy_merge_output,
     _validate_config,
 )
 
@@ -66,6 +69,22 @@ class TestOperationTypeParsing:
         cfg = parse_cfg(["--operation.type", "merge"])
         with pytest.raises(ValueError, match="--new_repo_id is required for merge"):
             _validate_config(cfg)
+
+    def test_merge_accepts_evorl_0901_source_dir_form(self, tmp_path):
+        output_dir = tmp_path / "merged"
+        source_dir = tmp_path / "sources"
+        cfg = parse_cfg(
+            [
+                "--repo_id",
+                str(output_dir),
+                "--operation.type",
+                "merge",
+                "--operation.source_dir",
+                str(source_dir),
+            ]
+        )
+        _validate_config(cfg)
+        assert cfg.operation.source_dir == str(source_dir)
 
     @pytest.mark.parametrize("flag", ["concatenate_videos", "concatenate_data"])
     def test_merge_concatenate_flag_defaults_true(self, flag):
@@ -121,6 +140,30 @@ class TestOperationTypeParsing:
             "task_0": "pick cube",
             "task_1": "place cube",
         }
+
+
+def test_discover_lerobot_dataset_dirs_and_legacy_output_resolution(tmp_path):
+    source_dir = tmp_path / "sources"
+    first = source_dir / "a"
+    second = source_dir / "nested" / "b"
+    ignored = source_dir / "not_a_dataset"
+    for root in (first, second):
+        (root / "meta").mkdir(parents=True)
+        (root / "meta" / "info.json").write_text("{}")
+    ignored.mkdir(parents=True)
+
+    assert _discover_lerobot_dataset_dirs(source_dir) == [first, second]
+    assert _repo_id_from_dataset_dir(second, source_dir) == "nested/b"
+
+    output_dir = tmp_path / "merged"
+    output_repo_id, resolved_output = _resolve_legacy_merge_output(str(output_dir), root=None)
+    assert output_repo_id == "local/merged"
+    assert resolved_output == output_dir.resolve()
+
+
+def test_discover_lerobot_dataset_dirs_rejects_empty_parent(tmp_path):
+    with pytest.raises(FileNotFoundError, match="No LeRobot datasets found"):
+        _discover_lerobot_dataset_dirs(tmp_path)
 
 
 class TestDepthEncoderParsing:

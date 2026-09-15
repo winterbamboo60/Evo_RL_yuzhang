@@ -329,10 +329,24 @@ class RTCInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        self._invalidate_pending_action_state()
+
+    def invalidate_pending_actions(self) -> None:
+        """Immediately invalidate queued and in-flight actions without resetting the policy.
+
+        Human intervention uses this after pausing RTC.  Clearing the observation prevents
+        another chunk from starting, while the epoch bump makes a chunk already being computed
+        fail its merge guard when it returns.
+        """
+        logger.info("Invalidating pending RTC actions for human intervention")
+        self._invalidate_pending_action_state()
+
+    def _invalidate_pending_action_state(self) -> None:
+        """Clear asynchronous action state under the same lock used by chunk merging."""
         with self._obs_lock:
             # Clear and bump in one critical section, mirroring _rtc_loop's epoch
-            # check-and-merge, so a reset cannot leak a pre-reset chunk into the fresh
-            # queue.  Lock order is _obs_lock -> queue.lock on both sides.
+            # check-and-merge, so an invalidation cannot leak an older chunk into the
+            # fresh queue.  Lock order is _obs_lock -> queue.lock on both sides.
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
@@ -560,7 +574,7 @@ class RTCInferenceEngine(InferenceEngine):
                             if epoch_unchanged:
                                 queue.merge(original, processed, new_delay, idx_before, task=task)
                         if not epoch_unchanged:
-                            logger.info("Discarding action chunk computed before an engine reset")
+                            logger.info("Discarding action chunk computed before an engine state invalidation")
 
                         if (
                             is_warmup

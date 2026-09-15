@@ -76,9 +76,43 @@ class RealSenseCameraConfig(CameraConfig):
     gain: int | None = None
     white_balance: int | None = None
 
+    # Extended controls used by the EvoRL recording rigs. Values are passed in
+    # native RealSense SDK units; query the device range with lerobot-find-cameras.
+    exposure_mode: str = "device_default"
+    auto_exposure_limit: int | None = None
+    auto_gain_limit: int | None = None
+    auto_exposure_roi: tuple[int, int, int, int] | list[int] | None = None
+
+    # Backwards-compatible aliases for the 0901 launch scripts. New configs should
+    # prefer exposure, gain, white_balance and auto_exposure_limit.
+    manual_exposure_us: int | None = None
+    manual_gain: int | None = None
+    auto_exposure_limit_us: int | None = None
+    white_balance_kelvin: int | None = None
+
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
         self.rotation = Cv2Rotation(self.rotation)
+
+        if self.exposure_mode not in {"device_default", "auto", "manual"}:
+            raise ValueError("`exposure_mode` must be device_default, auto, or manual.")
+
+        aliases = (
+            ("manual_exposure_us", "exposure"),
+            ("manual_gain", "gain"),
+            ("auto_exposure_limit_us", "auto_exposure_limit"),
+            ("white_balance_kelvin", "white_balance"),
+        )
+        for alias_name, current_name in aliases:
+            alias_value = getattr(self, alias_name)
+            current_value = getattr(self, current_name)
+            if alias_value is not None and current_value is not None and alias_value != current_value:
+                raise ValueError(
+                    f"Conflicting RealSense values: `{alias_name}`={alias_value} and "
+                    f"`{current_name}`={current_value}."
+                )
+            if current_value is None and alias_value is not None:
+                setattr(self, current_name, alias_value)
 
         if not self.use_rgb and not self.use_depth:
             raise ValueError("At least one of `use_rgb` or `use_depth` must be enabled.")
@@ -94,6 +128,31 @@ class RealSenseCameraConfig(CameraConfig):
                 "Manual color sensor options require `use_rgb=True`. "
                 f"Configured options: {configured_color_options}."
             )
+
+        positive_controls = {
+            "exposure": self.exposure,
+            "white_balance": self.white_balance,
+            "auto_exposure_limit": self.auto_exposure_limit,
+        }
+        for name, value in positive_controls.items():
+            if value is not None and value <= 0:
+                raise ValueError(f"`{name}` must be greater than zero.")
+        for name, value in {"gain": self.gain, "auto_gain_limit": self.auto_gain_limit}.items():
+            if value is not None and value < 0:
+                raise ValueError(f"`{name}` must be non-negative.")
+
+        if self.auto_exposure_roi is not None:
+            if len(self.auto_exposure_roi) != 4:
+                raise ValueError("`auto_exposure_roi` must be [min_x, min_y, max_x, max_y].")
+            min_x, min_y, max_x, max_y = self.auto_exposure_roi
+            if min_x < 0 or min_y < 0 or min_x >= max_x or min_y >= max_y:
+                raise ValueError("`auto_exposure_roi` must contain non-negative coordinates with min < max.")
+            if (
+                self.width is not None
+                and self.height is not None
+                and (max_x > self.width or max_y > self.height)
+            ):
+                raise ValueError("`auto_exposure_roi` must fit inside the configured capture size.")
 
         values = (self.fps, self.width, self.height)
         if any(v is not None for v in values) and any(v is None for v in values):

@@ -23,6 +23,7 @@ from .core import (
 )
 from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
 from .episodic import EpisodicStrategy
+from .evorl_episodic import EvoRLEpisodicStrategy
 from .factory import create_strategy
 from .highlight import HighlightStrategy
 from .sentry import SentryStrategy
@@ -34,6 +35,7 @@ __all__ = [
     "DAggerStrategy",
     "HighlightStrategy",
     "EpisodicStrategy",
+    "EvoRLEpisodicStrategy",
     "RolloutStrategy",
     "SentryStrategy",
     "create_strategy",

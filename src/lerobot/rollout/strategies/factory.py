@@ -24,6 +24,7 @@ from .base import BaseStrategy
 from .core import RolloutStrategy
 from .dagger import DAggerStrategy
 from .episodic import EpisodicStrategy
+from .evorl_episodic import EvoRLEpisodicStrategy
 from .highlight import HighlightStrategy
 from .sentry import SentryStrategy
 
@@ -49,6 +50,8 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
         return DAggerStrategy(config)
     if config.type == "episodic":
         return EpisodicStrategy(config)
+    if config.type == "evorl_episodic":
+        return EvoRLEpisodicStrategy(config)
     try:
         return make_device_from_device_class(config)
     except Exception as e:

@@ -290,12 +290,17 @@ def test_read_latest_too_old():
             _ = camera.read_latest(max_age_ms=0)  # immediately too old
 
 
-def _make_mock_sensor(name: str, supported_options: set | None = None) -> MagicMock:
+def _make_mock_sensor(
+    name: str, supported_options: set | None = None, *, provides_color_stream: bool = False
+) -> MagicMock:
     """Build a fake rs.sensor that reports a name and a configurable supported-options set."""
     supported = supported_options if supported_options is not None else set()
     sensor = MagicMock()
     sensor.get_info.return_value = name
     sensor.supports.side_effect = lambda opt: opt in supported
+    stream_profile = MagicMock()
+    stream_profile.stream_type.return_value = rs.stream.color
+    sensor.get_stream_profiles.return_value = [stream_profile] if provides_color_stream else []
     return sensor
 
 
@@ -312,8 +317,8 @@ def test_get_color_sensor_prefers_rgb_camera():
     config = RealSenseCameraConfig(serial_number_or_name="042")
     camera = RealSenseCamera(config)
 
-    rgb = _make_mock_sensor("RGB Camera")
-    stereo = _make_mock_sensor("Stereo Module")
+    rgb = _make_mock_sensor("RGB Camera", provides_color_stream=True)
+    stereo = _make_mock_sensor("Stereo Module", provides_color_stream=True)
     profile = MagicMock()
     device = MagicMock()
     device.query_sensors.return_value = [stereo, rgb]
@@ -323,16 +328,15 @@ def test_get_color_sensor_prefers_rgb_camera():
     assert camera._get_color_sensor() is rgb
 
 
-def test_get_color_sensor_raises_without_dedicated_rgb_module():
-    """D405 has no separate RGB module; we refuse to touch the shared Stereo Module."""
+def test_get_color_sensor_falls_back_to_shared_color_stream_sensor():
+    """D405 exposes its color stream through the shared Stereo Module."""
     config = RealSenseCameraConfig(serial_number_or_name="042")
     camera = RealSenseCamera(config)
 
-    stereo = _make_mock_sensor("Stereo Module")
+    stereo = _make_mock_sensor("Stereo Module", provides_color_stream=True)
     _attach_mock_color_sensor(camera, stereo)
 
-    with pytest.raises(RuntimeError, match="dedicated 'RGB Camera' module"):
-        camera._get_color_sensor()
+    assert camera._get_color_sensor() is stereo
 
 
 def test_get_color_sensor_raises_with_available_sensors():

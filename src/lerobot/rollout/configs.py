@@ -27,7 +27,17 @@ from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.utils.constants import ACTION
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
+from lerobot.utils.recording_annotations import (
+    EVORL_FAILURE_KEY,
+    EVORL_INTERVENTION_KEY,
+    EVORL_RERECORD_KEY,
+    EVORL_RESET_KEY,
+    EVORL_SUCCESS_KEY,
+    build_evorl_dataset_features,
+    normalize_episode_success_label,
+)
 
 from .inference import InferenceEngineConfig, SyncInferenceConfig
 
@@ -74,12 +84,25 @@ class RolloutStrategyConfig(draccus.ChoiceRegistry, abc.ABC):
         """
         return False
 
+    def teleop_is_required(self) -> bool:
+        """Whether this concrete strategy configuration needs a teleoperator."""
+        return self.requires_teleop
+
     def extra_dataset_features(self) -> dict[str, dict]:
         """Strategy-owned dataset columns, merged into the robot/policy features.
 
         Every recorded frame must carry every key declared here.
         """
         return {}
+
+    def build_extra_dataset_features(self, dataset_features: dict[str, dict]) -> dict[str, dict]:
+        """Build strategy-owned columns after the base action schema is known.
+
+        The separate hook keeps third-party strategies implementing the older
+        ``extra_dataset_features()`` API working unchanged.
+        """
+        del dataset_features
+        return self.extra_dataset_features()
 
 
 @RolloutStrategyConfig.register_subclass("base")
@@ -263,6 +286,48 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
         return {"intervention": {"dtype": "bool", "shape": (1,), "names": None}}
 
 
+@RolloutStrategyConfig.register_subclass("evorl_episodic")
+@dataclass
+class EvoRLEpisodicStrategyConfig(EpisodicStrategyConfig):
+    """Episodic VLA recording with EvoRL human takeover and outcome hotkeys."""
+
+    requires_teleop: ClassVar[bool] = True
+
+    intervention_key: str = EVORL_INTERVENTION_KEY
+    success_key: str = EVORL_SUCCESS_KEY
+    failure_key: str = EVORL_FAILURE_KEY
+    rerecord_key: str = EVORL_RERECORD_KEY
+    reset_key: str = EVORL_RESET_KEY
+    require_outcome: bool = True
+    default_timeout_outcome: str = "failure"
+
+    enable_intervention: bool = True
+
+    def teleop_is_required(self) -> bool:
+        """Require can0 only while human intervention is enabled."""
+        return self.enable_intervention
+
+    def __post_init__(self) -> None:
+        keys = [
+            self.intervention_key,
+            self.success_key,
+            self.failure_key,
+            self.rerecord_key,
+            self.reset_key,
+        ]
+        if any(len(key) != 1 for key in keys):
+            raise ValueError("EvoRL hotkeys must each be one character.")
+        if len({key.lower() for key in keys}) != len(keys):
+            raise ValueError("EvoRL hotkeys must be distinct.")
+        self.default_timeout_outcome = normalize_episode_success_label(self.default_timeout_outcome)
+
+    def requires_streaming_encoding(self) -> bool:
+        return True
+
+    def build_extra_dataset_features(self, dataset_features: dict[str, dict]) -> dict[str, dict]:
+        return build_evorl_dataset_features(dataset_features[ACTION])
+
+
 # ---------------------------------------------------------------------------
 # Top-level rollout config
 # ---------------------------------------------------------------------------
@@ -352,7 +417,7 @@ class RolloutConfig:
         # Read off the strategy's declarations, never its concrete type, so a
         # third-party strategy is validated exactly like a built-in one.
         strategy = self.strategy
-        if strategy.requires_teleop and self.teleop is None:
+        if strategy.teleop_is_required() and self.teleop is None:
             raise ValueError(f"{strategy.type} strategy requires --teleop.type to be set")
         if strategy.dataset_mode == "required" and self.dataset is None:
             raise ValueError(f"{strategy.type} strategy requires --dataset.repo_id to be set")

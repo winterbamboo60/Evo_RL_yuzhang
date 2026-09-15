@@ -114,6 +114,14 @@ from .gym_manipulator import (
 from .queue import get_last_item_from_queue
 from .train_rl import TrainRLServerPipelineConfig
 
+
+def _runtime_config(cfg: TrainRLServerPipelineConfig):
+    """Return algorithm-owned online settings, with SAC policy compatibility."""
+    algorithm = getattr(cfg, "algorithm", None)
+    if algorithm is not None and hasattr(algorithm, "actor_learner_config"):
+        return algorithm
+    return cfg.policy
+
 # Main entry point
 
 
@@ -124,7 +132,7 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     cfg.validate()
     display_pid = False
     if not use_threads(cfg):
-        ensure_multiprocessing_start_method(cfg.policy.concurrency.multiprocessing_context)
+        ensure_multiprocessing_start_method(_runtime_config(cfg).concurrency.multiprocessing_context)
         display_pid = True
 
     # Create logs directory to ensure it exists
@@ -140,8 +148,8 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     shutdown_event = ProcessSignalHandler(is_threaded, display_pid=display_pid).shutdown_event
 
     learner_client, grpc_channel = learner_service_client(
-        host=cfg.policy.actor_learner_config.learner_host,
-        port=cfg.policy.actor_learner_config.learner_port,
+        host=_runtime_config(cfg).actor_learner_config.learner_host,
+        port=_runtime_config(cfg).actor_learner_config.learner_port,
     )
 
     logging.info("[ACTOR] Establishing connection with Learner")
@@ -298,7 +306,7 @@ def act_with_policy(
 
     policy_timer = TimerManager("Policy inference", log=False)
 
-    for interaction_step in range(cfg.policy.online_steps):
+    for interaction_step in range(_runtime_config(cfg).online_steps):
         start_time = time.perf_counter()
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down act_with_policy")
@@ -310,10 +318,19 @@ def act_with_policy(
 
         # Time policy inference and check if it meets FPS requirement
         with policy_timer:
-            normalized_observation = preprocessor.process_observation(observation)
-            action = policy.select_action(batch=normalized_observation)
+            prepare_observation = getattr(algorithm, "prepare_observation", None)
+            normalized_observation = (
+                prepare_observation(preprocessor, observation, task=cfg.env.task)
+                if callable(prepare_observation)
+                else preprocessor.process_observation(observation)
+            )
+            algorithm_select_action = getattr(algorithm, "select_action", None)
+            action = (
+                algorithm_select_action(normalized_observation)
+                if callable(algorithm_select_action) else policy.select_action(batch=normalized_observation)
+            )
             # Unnormalize only the continuous part.
-            if cfg.policy.num_discrete_actions is not None:
+            if getattr(cfg.policy, "num_discrete_actions", None) is not None:
                 continuous_action = postprocessor.process_action(action[..., :-1])
                 discrete_action = action[..., -1:].to(
                     device=continuous_action.device, dtype=continuous_action.dtype
@@ -358,6 +375,9 @@ def act_with_policy(
         if is_intervention:
             episode_intervention = True
             episode_intervention_steps += 1
+            algorithm_reset = getattr(algorithm, "reset", None)
+            if callable(algorithm_reset):
+                algorithm_reset()
 
         complementary_info = {
             "discrete_penalty": torch.tensor(
@@ -387,11 +407,29 @@ def act_with_policy(
             update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
 
             if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
-                )
+                serialize_episode = getattr(algorithm, "serialize_episode_for_transport", None)
+                if callable(serialize_episode):
+                    transitions_queue.put(
+                        serialize_episode(
+                            list_transition_to_send_to_learner,
+                            preprocessor,
+                            task=cfg.env.task,
+                            policy_path=(
+                                str(cfg.policy.pretrained_path)
+                                if cfg.policy.pretrained_path
+                                else None
+                            ),
+                        )
+                    )
+                else:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
                 list_transition_to_send_to_learner = []
+            algorithm_reset = getattr(algorithm, "reset", None)
+            if callable(algorithm_reset):
+                algorithm_reset()
 
             stats = get_frequency_stats(policy_timer)
             policy_timer.reset()
@@ -516,8 +554,8 @@ def receive_policy(
 
     if grpc_channel is None or learner_client is None:
         learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
+            host=_runtime_config(cfg).actor_learner_config.learner_host,
+            port=_runtime_config(cfg).actor_learner_config.learner_port,
         )
 
     try:
@@ -573,14 +611,14 @@ def send_transitions(
 
     if grpc_channel is None or learner_client is None:
         learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
+            host=_runtime_config(cfg).actor_learner_config.learner_host,
+            port=_runtime_config(cfg).actor_learner_config.learner_port,
         )
 
     try:
         learner_client.SendTransitions(
             transitions_stream(
-                shutdown_event, transitions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+                shutdown_event, transitions_queue, _runtime_config(cfg).actor_learner_config.queue_get_timeout
             )
         )
     except grpc.RpcError as e:
@@ -632,14 +670,16 @@ def send_interactions(
 
     if grpc_channel is None or learner_client is None:
         learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
+            host=_runtime_config(cfg).actor_learner_config.learner_host,
+            port=_runtime_config(cfg).actor_learner_config.learner_port,
         )
 
     try:
         learner_client.SendInteractions(
             interactions_stream(
-                shutdown_event, interactions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+                shutdown_event,
+                interactions_queue,
+                _runtime_config(cfg).actor_learner_config.queue_get_timeout,
             )
         )
     except grpc.RpcError as e:
@@ -767,7 +807,7 @@ def log_policy_frequency_issue(policy_fps: float, cfg: TrainRLServerPipelineConf
 
 
 def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
-    return cfg.policy.concurrency.actor == "threads"
+    return _runtime_config(cfg).concurrency.actor == "threads"
 
 
 if __name__ == "__main__":

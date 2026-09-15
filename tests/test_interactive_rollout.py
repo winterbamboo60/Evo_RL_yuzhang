@@ -1250,6 +1250,7 @@ class _StubChunkPolicy:
         self.in_inference = Event()
         self.predicted_tasks: list[str] = []
         self.generate_thread_names: list[str] = []
+        self.reset_calls = 0
 
     def allow_one_inference(self) -> None:
         self._release.release()
@@ -1268,7 +1269,7 @@ class _StubChunkPolicy:
         return torch.zeros(1, self.chunk_len, self.action_dim)
 
     def reset(self):
-        pass
+        self.reset_calls += 1
 
     def supports_text_generation(self):
         return True
@@ -1366,6 +1367,26 @@ def test_rtc_engine_reset_discards_chunk_from_inflight_inference(caplog):
         assert _wait_for(policy.in_inference.is_set)
         policy.allow_one_inference()
         assert _wait_for(lambda: engine.get_action(None) is not None)
+
+
+def test_rtc_engine_intervention_invalidation_discards_inflight_chunk_without_policy_reset(caplog):
+    """Pressing C must make queued and currently-computing policy actions unusable."""
+    with _running_rtc_engine() as (engine, policy):
+        assert _wait_for(policy.in_inference.is_set)
+        epoch_before = engine._reset_epoch
+
+        engine.pause()
+        engine.invalidate_pending_actions()
+
+        assert engine._reset_epoch == epoch_before + 1
+        assert engine._obs_holder["obs"] is None
+        assert engine.action_queue.qsize() == 0
+
+        with caplog.at_level(logging.INFO, logger="lerobot.rollout.inference.rtc"):
+            policy.allow_one_inference()
+            assert _wait_for(lambda: any("Discarding action chunk" in r.getMessage() for r in caplog.records))
+        assert engine.get_action(None) is None
+        assert policy.reset_calls == 0
 
 
 def test_rtc_engine_answers_vqa_on_rtc_thread_delivered_by_control_pump():

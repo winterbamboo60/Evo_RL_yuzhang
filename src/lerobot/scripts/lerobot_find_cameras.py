@@ -28,6 +28,7 @@ lerobot-find-cameras
 # NOTE(Steven): macOS cameras sometimes report different FPS at init time, not an issue here as we don't specify FPS when opening the cameras, but the information displayed might not be truthful.
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -151,7 +152,12 @@ def save_image(
         logger.error(f"Failed to save image for camera {camera_identifier} (type {camera_type}): {e}")
 
 
-def create_camera_instance(cam_meta: dict[str, Any], *, warmup_s: int = 1) -> dict[str, Any] | None:
+def create_camera_instance(
+    cam_meta: dict[str, Any],
+    *,
+    warmup_s: int = 1,
+    camera_configs: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     """Create and connect to a camera instance based on metadata."""
     cam_type = cam_meta.get("type")
     cam_id = cam_meta.get("id")
@@ -168,11 +174,10 @@ def create_camera_instance(cam_meta: dict[str, Any], *, warmup_s: int = 1) -> di
             )
             instance = OpenCVCamera(cv_config)
         elif cam_type == "RealSense":
-            rs_config = RealSenseCameraConfig(
-                serial_number_or_name=cam_id,
-                color_mode=ColorMode.RGB,
-                warmup_s=warmup_s,
-            )
+            overrides = dict((camera_configs or {}).get(str(cam_id), {}))
+            overrides.setdefault("color_mode", ColorMode.RGB)
+            overrides.setdefault("warmup_s", warmup_s)
+            rs_config = RealSenseCameraConfig(serial_number_or_name=str(cam_id), **overrides)
             instance = RealSenseCamera(rs_config)
         else:
             logger.warning(f"Unknown camera type: {cam_type} for ID {cam_id}. Skipping.")
@@ -229,6 +234,7 @@ def save_images_from_all_cameras(
     record_time_s: float = 2.0,
     camera_type: str | None = None,
     warmup_s: int = 1,
+    camera_configs: dict[str, dict[str, Any]] | None = None,
 ):
     """
     Connects to detected cameras (optionally filtered by type) and saves images from each.
@@ -255,7 +261,7 @@ def save_images_from_all_cameras(
 
     try:
         for cam_meta in all_camera_metadata:
-            cam_dict = create_camera_instance(cam_meta, warmup_s=warmup_s)
+            cam_dict = create_camera_instance(cam_meta, warmup_s=warmup_s, camera_configs=camera_configs)
             if cam_dict is None:
                 continue
             start_time = time.perf_counter()
@@ -300,6 +306,12 @@ def main():
         type=int,
         default=1,
         help="Time duration to warmup camera before attempting to capture frames. Default: 1 second.",
+    )
+    parser.add_argument(
+        "--camera-configs",
+        type=json.loads,
+        default=None,
+        help="JSON mapping from RealSense serial number to camera config overrides.",
     )
     args = parser.parse_args()
     save_images_from_all_cameras(**vars(args))

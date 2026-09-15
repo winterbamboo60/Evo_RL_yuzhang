@@ -1,0 +1,8 @@
+{
+  "default_key": "3",
+  "tasks": {
+    "1": "Pick up the cup on the right",
+    "2": "Take the middle cup away",
+    "3": "Grab the left cup"
+  }
+}

@@ -435,26 +435,36 @@ class RealSenseCamera(Camera):
         return self._async_read(timeout_ms=10000, read_depth=read_depth)
 
     def _get_color_sensor(self) -> "rs.sensor":
-        """Returns the dedicated "RGB Camera" sensor that controls the color stream.
+        """Returns the sensor that provides the color stream.
 
-        Manual color controls are only applied to a dedicated RGB module. Cameras
-        without one (e.g. the D405, whose color stream comes from the shared
-        "Stereo Module") are unsupported, so we never fall back to another sensor
-        to avoid altering the depth stream.
+        Prefer a dedicated ``RGB Camera`` module when one is available. Some
+        RealSense models, notably the D405, expose their color stream through the
+        shared ``Stereo Module`` instead, so fall back to capability-based stream
+        detection as the 0901 implementation did.
         """
         if self.rs_profile is None:
             raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
 
         device = self.rs_profile.get_device()
-        sensors = {s.get_info(rs.camera_info.name): s for s in device.query_sensors()}
+        sensors = list(device.query_sensors())
 
-        if "RGB Camera" in sensors:
-            return sensors["RGB Camera"]
+        for sensor in sensors:
+            if sensor.get_info(rs.camera_info.name) == "RGB Camera":
+                return sensor
 
-        available = list(sensors.keys())
+        for sensor in sensors:
+            if any(profile.stream_type() == rs.stream.color for profile in sensor.get_stream_profiles()):
+                sensor_name = sensor.get_info(rs.camera_info.name)
+                logger.info(
+                    "%s using '%s' for color controls because no dedicated RGB Camera module is available.",
+                    self,
+                    sensor_name,
+                )
+                return sensor
+
+        available = [sensor.get_info(rs.camera_info.name) for sensor in sensors]
         raise RuntimeError(
-            f"{self}: manual color controls require a dedicated 'RGB Camera' module, which this camera does not have. ",
-            f"Available sensors: {available}.",
+            f"{self}: no sensor providing a color stream was found. Available sensors: {available}.",
         )
 
     def _set_sensor_option(self, sensor: "rs.sensor", option: "rs.option", value: float, label: str) -> None:
@@ -487,10 +497,23 @@ class RealSenseCamera(Camera):
                 value is invalid. Invalid-value errors include the option name, requested
                 value, and supported range when available.
         """
-        if self.exposure is None and self.gain is None and self.white_balance is None:
+        mode = self.config.exposure_mode
+        manual_requested = (
+            self.exposure is not None or self.gain is not None or self.white_balance is not None
+        )
+        # Preserve the current LeRobot shorthand: providing exposure/gain/white_balance
+        # without an explicit mode means manual controls.
+        if mode == "device_default" and manual_requested:
+            mode = "manual"
+        if mode == "device_default":
+            logger.info("%s using device-default exposure controls.", self)
             return
 
         color_sensor = self._get_color_sensor()
+
+        if mode == "auto":
+            self._configure_auto_exposure(color_sensor)
+            return
 
         requested_options = (
             (rs.option.exposure, self.exposure, "exposure"),
@@ -541,6 +564,63 @@ class RealSenseCamera(Camera):
                 color_sensor, rs.option.white_balance, self.white_balance, "white balance"
             )
             logger.info(f"{self} white balance set to {self.white_balance}.")
+
+    def _configure_auto_exposure(self, color_sensor: "rs.sensor") -> None:
+        """Enable auto exposure and apply optional limits/ROI with readback."""
+        required = ((rs.option.enable_auto_exposure, 1, "auto-exposure"),)
+        optional = (
+            (
+                getattr(rs.option, "auto_exposure_limit", None),
+                self.config.auto_exposure_limit,
+                "auto exposure limit",
+            ),
+            (getattr(rs.option, "auto_gain_limit", None), self.config.auto_gain_limit, "auto gain limit"),
+        )
+        for option, value, label in (*required, *optional):
+            if value is None:
+                continue
+            if option is None or not color_sensor.supports(option):
+                raise ValueError(f"{self}: color sensor does not support requested {label}.")
+            self._set_sensor_option(color_sensor, option, value, label)
+
+        for toggle_name, value in (
+            ("auto_exposure_limit_toggle", self.config.auto_exposure_limit),
+            ("auto_gain_limit_toggle", self.config.auto_gain_limit),
+        ):
+            if value is None:
+                continue
+            toggle = getattr(rs.option, toggle_name, None)
+            if toggle is not None and color_sensor.supports(toggle):
+                self._set_sensor_option(color_sensor, toggle, 1, toggle_name.replace("_", " "))
+
+        if self.config.auto_exposure_roi is not None:
+            min_x, min_y, max_x, max_y = self.config.auto_exposure_roi
+            roi = rs.region_of_interest()
+            roi.min_x, roi.min_y, roi.max_x, roi.max_y = min_x, min_y, max_x, max_y
+            try:
+                roi_sensor = color_sensor.as_roi_sensor()
+                roi_sensor.set_region_of_interest(roi)
+                actual = roi_sensor.get_region_of_interest()
+            except Exception as e:
+                raise ValueError(f"{self}: color sensor does not support the requested exposure ROI.") from e
+            requested_roi = (min_x, min_y, max_x, max_y)
+            actual_roi = (actual.min_x, actual.min_y, actual.max_x, actual.max_y)
+            if actual_roi != requested_roi:
+                raise RuntimeError(
+                    f"{self} exposure ROI requested={requested_roi}, but readback={actual_roi}."
+                )
+            logger.info("%s exposure ROI requested=%s actual=%s", self, requested_roi, actual_roi)
+
+        if self.white_balance is not None:
+            if color_sensor.supports(rs.option.enable_auto_white_balance):
+                self._set_sensor_option(
+                    color_sensor, rs.option.enable_auto_white_balance, 0, "auto white balance"
+                )
+            if not color_sensor.supports(rs.option.white_balance):
+                raise ValueError(f"{self}: color sensor does not support requested white balance.")
+            self._set_sensor_option(
+                color_sensor, rs.option.white_balance, self.white_balance, "white balance"
+            )
 
     @check_if_not_connected
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:

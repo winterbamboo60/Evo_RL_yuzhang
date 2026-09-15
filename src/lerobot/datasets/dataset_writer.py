@@ -69,6 +69,32 @@ from .video_utils import (
 
 logger = logging.getLogger(__name__)
 
+_RESERVED_EPISODE_METADATA_KEYS = {"episode_index", "tasks", "length"}
+_RESERVED_EPISODE_METADATA_PREFIXES = ("stats/", "meta/", "data/", "videos/", "dataset_")
+
+
+def _validate_extra_episode_metadata(
+    metadata: dict[str, str | bool | int | float | None] | None,
+) -> dict[str, str | bool | int | float | None]:
+    """Validate caller annotations before the mutable save path starts."""
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise TypeError("`episode_metadata` must be a dictionary or None.")
+
+    validated: dict[str, str | bool | int | float | None] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("Episode metadata keys must be non-empty strings.")
+        if key in _RESERVED_EPISODE_METADATA_KEYS or key.startswith(_RESERVED_EPISODE_METADATA_PREFIXES):
+            raise ValueError(f"Episode metadata key `{key}` is reserved by LeRobot.")
+        if value is not None and not isinstance(value, (str, bool, int, float)):
+            raise TypeError(
+                f"Episode metadata value for `{key}` must be a parquet-safe scalar, got {type(value)}."
+            )
+        validated[key] = value
+    return validated
+
 
 def _encode_video_worker(
     video_key: str,
@@ -272,8 +298,11 @@ class DatasetWriter:
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
+        *,
+        episode_metadata: dict[str, str | bool | int | float | None] | None = None,
     ) -> None:
-        """Save the current episode in self.episode_buffer to disk."""
+        """Save the current episode and optional scalar annotations to disk."""
+        extra_metadata = _validate_extra_episode_metadata(episode_metadata)
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
@@ -373,6 +402,12 @@ class DatasetWriter:
             else:
                 for video_key in self._meta.video_keys:
                     ep_metadata.update(self._save_episode_video(video_key, episode_index))
+
+        # User annotations are deliberately merged last, but may never replace writer-owned keys.
+        collisions = set(extra_metadata) & set(ep_metadata)
+        if collisions:
+            raise ValueError(f"Episode metadata collides with writer-owned keys: {sorted(collisions)}")
+        ep_metadata.update(extra_metadata)
 
         # `meta.save_episode` need to be executed after encoding the videos
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)

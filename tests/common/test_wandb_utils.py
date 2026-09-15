@@ -15,11 +15,11 @@
 # limitations under the License.
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, sentinel
 
-from lerobot.common.wandb_utils import WandBLogger
-from lerobot.configs.default import WandBConfig
+from lerobot.common.wandb_utils import TensorBoardLogger, WandBLogger
+from lerobot.configs.default import TensorBoardConfig, WandBConfig
 
 
 def test_wandb_config_console_defaults():
@@ -93,3 +93,25 @@ def test_wandb_logger_resumes_with_checkpoint(monkeypatch, tmp_path):
     WandBLogger(cfg)
 
     assert wandb.init.call_args.kwargs["resume"] == "must"
+
+
+def test_tensorboard_logger_uses_configured_directory_and_writes_scalars(monkeypatch, tmp_path):
+    writer = MagicMock()
+    summary_writer = MagicMock(return_value=writer)
+    tensorboard_module = ModuleType("torch.utils.tensorboard")
+    tensorboard_module.SummaryWriter = summary_writer
+    monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", tensorboard_module)
+
+    log_dir = tmp_path / "tensoborad"
+    cfg = SimpleNamespace(
+        tensorboard=TensorBoardConfig(enable=True, log_dir=str(log_dir)),
+        output_dir=tmp_path / "train",
+    )
+    logger = TensorBoardLogger(cfg)
+    logger.log_dict({"loss": 0.25, "ignored": "text"}, step=100)
+    logger.finish()
+
+    summary_writer.assert_called_once_with(log_dir=str(log_dir))
+    writer.add_scalar.assert_called_once_with("train/loss", 0.25, 100)
+    writer.flush.assert_called()
+    writer.close.assert_called_once()

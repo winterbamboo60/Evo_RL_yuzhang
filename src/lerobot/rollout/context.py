@@ -26,7 +26,7 @@ from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Event
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -297,12 +297,13 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     )
 
 
-def build_rollout_context(
+def _build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
     teleop_action_processor: RobotProcessorPipeline | None = None,
     robot_action_processor: RobotProcessorPipeline | None = None,
     robot_observation_processor: RobotProcessorPipeline | None = None,
+    build_resources: _RolloutBuildResources | None = None,
 ) -> RolloutContext:
     """Wire up policy, processors, hardware, dataset, and inference engine.
 
@@ -372,6 +373,8 @@ def build_rollout_context(
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
     logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
     robot = make_robot_from_config(cfg.robot)
+    if build_resources is not None:
+        build_resources.robot = robot
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
@@ -386,6 +389,8 @@ def build_rollout_context(
     if cfg.teleop is not None:
         logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
         teleop = make_teleoperator_from_config(cfg.teleop)
+        if build_resources is not None:
+            build_resources.teleop = teleop
         teleop.connect()
         logger.info("Teleoperator connected")
 
@@ -482,7 +487,7 @@ def build_rollout_context(
         logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
         # Strategy-owned columns join the robot/policy features above the resume/create
         # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
-        dataset_features.update(cfg.strategy.extra_dataset_features())
+        dataset_features.update(cfg.strategy.build_extra_dataset_features(dataset_features))
         if cfg.resume:
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
@@ -524,6 +529,9 @@ def build_rollout_context(
                 encoder_threads=cfg.dataset.encoder_threads,
                 video_files_size_in_mb=target_video_mb,
             )
+
+        if build_resources is not None:
+            build_resources.dataset = dataset
 
     if dataset is not None:
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
@@ -609,3 +617,59 @@ def build_rollout_context(
             ordered_action_keys=ordered_action_keys,
         ),
     )
+
+
+@dataclass
+class _RolloutBuildResources:
+    """Resources to close if rollout context construction fails partway."""
+
+    robot: Any | None = None
+    teleop: Any | None = None
+    dataset: Any | None = None
+
+    def close(self) -> None:
+        dataset = self.dataset
+        self.dataset = None
+        if dataset is not None:
+            try:
+                logger.info("Finalizing dataset after rollout context build failure...")
+                dataset.finalize()
+            except Exception:
+                logger.exception("Failed to finalize dataset during rollout context rollback")
+
+        for label, device in (("teleoperator", self.teleop), ("robot", self.robot)):
+            if device is None:
+                continue
+            try:
+                if getattr(device, "is_connected", False):
+                    logger.info("Disconnecting %s after rollout context build failure...", label)
+                    device.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect %s during rollout context rollback", label)
+
+        self.teleop = None
+        self.robot = None
+
+
+def build_rollout_context(
+    cfg: RolloutConfig,
+    shutdown_event: Event,
+    teleop_action_processor: RobotProcessorPipeline | None = None,
+    robot_action_processor: RobotProcessorPipeline | None = None,
+    robot_observation_processor: RobotProcessorPipeline | None = None,
+) -> RolloutContext:
+    """Build a rollout context and roll back partial resources on failure."""
+    build_resources = _RolloutBuildResources()
+    try:
+        return _build_rollout_context(
+            cfg=cfg,
+            shutdown_event=shutdown_event,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            build_resources=build_resources,
+        )
+    except Exception:
+        logger.exception("Failed to build rollout context; rolling back partial resources")
+        build_resources.close()
+        raise

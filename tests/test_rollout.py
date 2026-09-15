@@ -1003,6 +1003,122 @@ def test_episodic_records_once_per_interpolation_cycle():
     assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
 
 
+def _make_evorl_loop(ctx):
+    from lerobot.rollout import EvoRLEpisodicStrategyConfig
+    from lerobot.rollout.strategies import EvoRLEpisodicStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    config = EvoRLEpisodicStrategyConfig(enable_intervention=True)
+    ctx.runtime.cfg.policy = SimpleNamespace(type="test_policy", pretrained_path=None)
+    ctx.data.dataset_features = {
+        **_LOOP_FEATURES,
+        **config.build_extra_dataset_features(_LOOP_FEATURES),
+    }
+    ctx.hardware.teleop.feedback_features = {"m.pos": float}
+    strategy = EvoRLEpisodicStrategy(config)
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=1)
+    return strategy
+
+
+def test_evorl_autonomous_policy_actions_also_drive_actuated_leader():
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=3)
+    strategy = _make_evorl_loop(ctx)
+    events = {
+        "toggle_intervention": False,
+        "exit_early": False,
+        "stop_recording": False,
+    }
+
+    strategy._policy_loop(
+        ctx=ctx,
+        robot=ctx.hardware.robot_wrapper,
+        events=events,
+        features=ctx.data.dataset_features,
+        timer=CycleTimer(200.0, 1),
+        control_time_s=10.0,
+        dataset=dataset,
+        single_task="task",
+    )
+
+    followed_actions = [call.args[0]["m.pos"] for call in ctx.hardware.teleop.send_feedback.call_args_list]
+    assert followed_actions == [1.0, 2.0, 3.0]
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0]
+
+
+def test_evorl_c_switches_from_synced_policy_motion_to_human_action_without_handover(monkeypatch):
+    events = {
+        "toggle_intervention": False,
+        "exit_early": False,
+        "stop_recording": False,
+    }
+
+    def request_intervention_after_first_policy_tick(tick):
+        if tick == 1:
+            events["toggle_intervention"] = True
+
+    ctx, dataset = _make_loop_ctx(
+        fps=200.0,
+        multiplier=1,
+        num_ticks=2,
+        on_tick=request_intervention_after_first_policy_tick,
+    )
+    strategy = _make_evorl_loop(ctx)
+    ctx.hardware.teleop.get_action.return_value = {"m.pos": 42.0}
+    smooth_handover = MagicMock()
+    monkeypatch.setattr(
+        "lerobot.rollout.strategies.evorl_episodic.teleop_smooth_move_to",
+        smooth_handover,
+    )
+
+    strategy._policy_loop(
+        ctx=ctx,
+        robot=ctx.hardware.robot_wrapper,
+        events=events,
+        features=ctx.data.dataset_features,
+        timer=CycleTimer(200.0, 1),
+        control_time_s=10.0,
+        dataset=dataset,
+        single_task="task",
+    )
+
+    smooth_handover.assert_not_called()
+    assert ctx.policy.inference.pause.call_count >= 1
+    ctx.policy.inference.invalidate_pending_actions.assert_called_once_with()
+    ctx.hardware.teleop.disable_torque.assert_called_once_with()
+    ctx.hardware.teleop.send_feedback.assert_called_once_with({"m.pos": 1.0})
+    sent_actions = [call.args[0]["m.pos"] for call in ctx.hardware.robot_wrapper.send_action.call_args_list]
+    assert sent_actions == [1.0, 42.0]
+
+
+def test_evorl_between_episodes_holds_last_follower_pose_without_releasing_leader():
+    ctx, _dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=1)
+    strategy = _make_evorl_loop(ctx)
+    strategy._last_action = {"m.pos": 99.0}
+    events = {
+        "exit_early": False,
+        "stop_recording": False,
+    }
+
+    strategy._hold_last_follower_position(
+        ctx=ctx,
+        robot=ctx.hardware.robot_wrapper,
+        teleop=ctx.hardware.teleop,
+        events=events,
+        fps=200.0,
+        control_time_s=3.0,
+        display_data=False,
+        display_mode="rerun",
+        display_compressed=False,
+    )
+
+    # The measured follower pose wins over the last commanded policy target.
+    ctx.hardware.robot_wrapper.send_action.assert_called_once_with({"m.pos": 1.0})
+    ctx.hardware.teleop.send_feedback.assert_called_once_with({"m.pos": 1.0})
+    ctx.hardware.teleop.disable_torque.assert_not_called()
+    ctx.hardware.teleop.get_action.assert_not_called()
+
+
 def test_dagger_continuous_records_once_per_interpolation_cycle():
     from lerobot.rollout import DAggerStrategyConfig
     from lerobot.rollout.strategies import DAggerStrategy

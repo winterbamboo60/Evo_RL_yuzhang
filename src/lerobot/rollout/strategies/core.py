@@ -153,25 +153,52 @@ class RolloutStrategy(abc.ABC):
         return False
 
     def _teardown_hardware(self, hw: HardwareContext, return_to_initial_position: bool = True) -> None:
-        """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
+        """Stop inference and disconnect every device, even if one cleanup step fails."""
+        cleanup_error = None
+
         if self._engine is not None:
-            logger.info("Stopping inference engine...")
-            self._engine.stop()
+            try:
+                logger.info("Stopping inference engine...")
+                self._engine.stop()
+            except Exception as exc:
+                cleanup_error = exc
+                logger.exception("Failed to stop inference engine")
+
         robot = hw.robot_wrapper.inner
         if robot.is_connected:
-            if return_to_initial_position and hw.initial_position:
-                logger.info("Returning robot to initial position before shutdown...")
-                self.return_to_initial_position(hw)
-            elif not return_to_initial_position:
-                logger.info(
-                    "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
-                )
-            logger.info("Disconnecting robot...")
-            robot.disconnect()
+            try:
+                if return_to_initial_position and hw.initial_position:
+                    logger.info("Returning robot to initial position before shutdown...")
+                    self.return_to_initial_position(hw)
+                elif not return_to_initial_position:
+                    logger.info(
+                        "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
+                    )
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.exception("Robot return-to-initial-position cleanup failed")
+
+            try:
+                logger.info("Disconnecting robot...")
+                robot.disconnect()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.exception("Failed to disconnect robot")
+
         teleop = hw.teleop
         if teleop is not None and teleop.is_connected:
-            logger.info("Disconnecting teleoperator...")
-            teleop.disconnect()
+            try:
+                logger.info("Disconnecting teleoperator...")
+                teleop.disconnect()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.exception("Failed to disconnect teleoperator")
+
+        if cleanup_error is not None:
+            raise cleanup_error
 
     @staticmethod
     def return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> bool:

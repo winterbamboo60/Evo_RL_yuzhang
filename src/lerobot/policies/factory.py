@@ -179,6 +179,12 @@ def make_pre_post_processors(
         ValueError: If no processor factory exists for the given policy configuration type.
     """
     if pretrained_path:
+        reconcile_pi05_rlt_processors = None
+        if policy_cfg.type == "pi05_rlt":
+            # Import before deserialization so a saved RLT processor step is
+            # registered. The reconciler also upgrades a plain PI0.5 processor.
+            from .pi05_rlt.processor_pi05_rlt import reconcile_pi05_rlt_processors
+
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 
@@ -242,6 +248,12 @@ def make_pre_post_processors(
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
             preprocessor, postprocessor = reconcile_evo1_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+            )
+        if reconcile_pi05_rlt_processors is not None:
+            preprocessor, postprocessor = reconcile_pi05_rlt_processors(
                 policy_cfg,
                 preprocessor,
                 postprocessor,

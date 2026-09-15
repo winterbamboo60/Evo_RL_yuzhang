@@ -143,6 +143,35 @@ core_scripts = ["lerobot[dataset]", "lerobot[hardware]", "lerobot[viz]"]
 evaluation = ["lerobot[av-dep]"]
 # lerobot-dataset-viz, lerobot-imgtransform-viz
 dataset_viz = ["lerobot[dataset]", "lerobot[viz]"]
+piper = [
+    "lerobot[hardware]",
+    "lerobot[can-dep]",
+    "lerobot[intelrealsense]",
+    "piper_sdk @ git+https://github.com/agilexrobotics/piper_sdk.git@1_0_0_b1",
+    "pin>=3.0.0,<4.0.0",
+    # Pinocchio wheels currently link against the urdfdom 4 / tinyxml2 10 ABI.
+    # Their transitive dependency floors otherwise allow incompatible major upgrades.
+    "cmeel-urdfdom>=4,<5",
+    "cmeel-tinyxml2<11",
+]
+pistar06 = [
+    "lerobot[training]",
+    "lerobot[transformers-dep]",
+    "lerobot[scipy-dep]",
+    "lerobot[matplotlib-dep]",
+]
+online_evorl = [
+    "lerobot[training]",
+    "lerobot[grpcio-dep]",
+    "lerobot[piper]",
+    "tensorboard>=2.16.0,<3.0.0",
+]
+evo = [
+    "lerobot[core_scripts]",
+    "lerobot[pi]",
+    "lerobot[pistar06]",
+    "lerobot[online_evorl]",
+]
 
 # Common
 av-dep = ["av>=15.0.0,<16.0.0"]
@@ -206,8 +235,8 @@ reachy2 = [
 rebot = ["lerobot[motorbridge-dep]", "lerobot[motorbridge-smart-servo-dep]"]
 kinematics = ["lerobot[placo-dep]"]
 intelrealsense = [
-    "pyrealsense2>=2.55.1.6486,<2.57.0 ; sys_platform != 'darwin'",
-    "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",
+    "pyrealsense2>=2.55.1.6486,<2.59.0 ; sys_platform != 'darwin'",
+    "pyrealsense2-macosx>=2.54,<2.59.0 ; sys_platform == 'darwin'",
 ]
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 
@@ -367,6 +396,11 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-value-train="lerobot.scripts.lerobot_value_train:main"
+lerobot-value-infer="lerobot.scripts.lerobot_value_infer:main"
+lerobot-dataset-report="lerobot.scripts.lerobot_dataset_report:main"
+lerobot-export-boundary-frames="lerobot.scripts.lerobot_export_boundary_frames:main"
+lerobot-migrate-evorl-dataset="lerobot.scripts.lerobot_migrate_evorl_dataset:main"
 
 # ---------------- Tool Configurations ----------------
 
@@ -384,7 +418,11 @@ torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [tool.setuptools.package-data]
-lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
+lerobot = [
+    "envs/*.json",
+    "annotations/steerable_pipeline/prompts/*.txt",
+    "assets/piper_description/**/*",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

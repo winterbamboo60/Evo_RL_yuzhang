@@ -19,6 +19,7 @@ import re
 from glob import glob
 from pathlib import Path
 
+import torch
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
 
@@ -212,3 +213,65 @@ class WandBLogger:
 
         wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
         self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+
+
+class TensorBoardLogger:
+    """Local scalar logger based on the TensorBoard implementation used by Evo-RL 0901."""
+
+    def __init__(self, cfg: TrainPipelineConfig):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise ImportError(
+                "TensorBoard logging is enabled but tensorboard is not installed. "
+                "Install it with: pip install tensorboard"
+            ) from exc
+
+        configured_log_dir = cfg.tensorboard.log_dir
+        self.log_dir = Path(configured_log_dir) if configured_log_dir else Path(cfg.output_dir) / "tensoborad"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._writer = SummaryWriter(log_dir=str(self.log_dir))
+        logging.info(colored("Logs will be saved to TensorBoard.", "blue", attrs=["bold"]))
+        logging.info("Track this run --> tensorboard --logdir %s", self.log_dir)
+
+    @staticmethod
+    def _to_scalar(value):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int | float):
+            return value
+        if isinstance(value, torch.Tensor) and value.numel() == 1:
+            return value.detach().float().cpu().item()
+        return None
+
+    def log_dict(
+        self, d: dict, step: int | None = None, mode: str = "train", custom_step_key: str | None = None
+    ):
+        if mode not in {"train", "eval"}:
+            raise ValueError(mode)
+        if step is None and custom_step_key is None:
+            raise ValueError("Either step or custom_step_key must be provided.")
+
+        if custom_step_key is not None and custom_step_key in d and step is None:
+            custom_step = self._to_scalar(d[custom_step_key])
+            if custom_step is not None:
+                step = int(custom_step)
+        if step is None:
+            raise ValueError(f'Could not infer TensorBoard step from key "{custom_step_key}".')
+
+        for key, value in d.items():
+            if custom_step_key is not None and key == custom_step_key:
+                continue
+            scalar = self._to_scalar(value)
+            if scalar is not None:
+                self._writer.add_scalar(f"{mode}/{key}", scalar, step)
+        self._writer.flush()
+
+    def log_video(self, video_path: str, step: int, mode: str = "train"):
+        if mode not in {"train", "eval"}:
+            raise ValueError(mode)
+        logging.warning("TensorBoard video logging is not implemented; skipped %s.", video_path)
+
+    def finish(self):
+        self._writer.flush()
+        self._writer.close()

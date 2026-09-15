@@ -90,16 +90,24 @@ lerobot-record \\
 """
 
 import logging
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
+
+import numpy as np
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
-from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
+from lerobot.common.control_utils import (
+    follower_smooth_move_to,
+    sanity_check_dataset_robot_compatibility,
+    teleop_smooth_move_to,
+    teleop_supports_feedback,
+)
 from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.datasets import (
@@ -156,6 +164,20 @@ from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.keyboard_input import init_keyboard_listener
+from lerobot.utils.recording_annotations import (
+    EVORL_COLLECTOR_POLICY_ID_FIELD,
+    EVORL_FAILURE_KEY,
+    EVORL_INTERVENTION_FIELD,
+    EVORL_INTERVENTION_KEY,
+    EVORL_POLICY_ACTION_FIELD,
+    EVORL_RERECORD_KEY,
+    EVORL_RESET_KEY,
+    EVORL_STATE_FIELD,
+    EVORL_STATE_POLICY,
+    EVORL_SUCCESS_KEY,
+    build_evorl_dataset_features,
+    normalize_episode_success_label,
+)
 from lerobot.utils.utils import (
     init_logging,
     log_say,
@@ -189,6 +211,15 @@ class RecordConfig:
     # Resume recording on an existing dataset.
     resume: bool = False
 
+    # EvoRL-compatible episode controls. Disabled by default so the upstream
+    # recording CLI keeps its standard Right/Left/Esc behavior.
+    enable_evorl_controls: bool = False
+    intervention_toggle_key: str = EVORL_INTERVENTION_KEY
+    episode_success_key: str = EVORL_SUCCESS_KEY
+    episode_failure_key: str = EVORL_FAILURE_KEY
+    rerecord_episode_key: str = EVORL_RERECORD_KEY
+    reset_episode_key: str = EVORL_RESET_KEY
+
     def __post_init__(self):
         if self.teleop is None:
             raise ValueError(
@@ -197,31 +228,53 @@ class RecordConfig:
                 "For policy-based deployment, use lerobot-rollout instead."
             )
 
+        keys = [
+            self.intervention_toggle_key,
+            self.episode_success_key,
+            self.episode_failure_key,
+            self.rerecord_episode_key,
+            self.reset_episode_key,
+        ]
+        if self.enable_evorl_controls and (
+            any(len(key) != 1 for key in keys) or len({key.lower() for key in keys}) != len(keys)
+        ):
+            raise ValueError("EvoRL hotkeys must be distinct single characters.")
 
-""" --------------- record_loop() data flow --------------------------
-       [ Robot ]
-           V
-     [ robot.get_observation() ] ---> raw_obs
-           V
-     [ robot_observation_processor ] ---> processed_obs
-           V
-     [ Teleoperator ]
-     |
-     |  [teleop.get_action] -> raw_action
-     |          |
-     |          V
-     | [teleop_action_processor]
-     |          |
-     '---> processed_teleop_action
-                               V
-                  [ robot_action_processor ] --> robot_action_to_send
-                               V
-                    [ robot.send_action() ] -- (Robot Executes)
-                               V
-                    ( Save to Dataset )
-                               V
-                  ( Rerun Log / Loop Wait )
-"""
+
+def _log_record_telemetry(
+    display_mode: str,
+    observation: RobotObservation,
+    action: RobotAction,
+    compress_images: bool,
+) -> None:
+    """Log manual recording state, including its always-human intervention source."""
+    log_visualization_data(
+        display_mode,
+        observation={**observation, "intervention": True},
+        action=action,
+        compress_images=compress_images,
+    )
+
+
+def _reset_evorl_arms(
+    robot: Robot,
+    teleop: Teleoperator,
+    teleop_action_processor: RobotProcessorPipeline,
+    robot_action_processor: RobotProcessorPipeline,
+    duration_s: float = 3.0,
+) -> None:
+    """Smoothly return follower and actuated leader to calibrated action-space zero."""
+    obs = robot.get_observation()
+    raw_current = teleop.get_action()
+    action_current = teleop_action_processor((raw_current, obs))
+    robot_current = robot_action_processor((action_current, obs))
+    target = dict.fromkeys(action_current, 0.0)
+    robot_target = robot_action_processor((target, obs))
+
+    follower_smooth_move_to(robot, robot_current, robot_target, duration_s=duration_s)
+    if teleop_supports_feedback(teleop):
+        teleop_smooth_move_to(teleop, target, duration_s=duration_s)
+        teleop.disable_torque()
 
 
 @safe_stop_image_writer
@@ -297,6 +350,13 @@ def record_loop(
             events["exit_early"] = False
             break
 
+        if events.get("toggle_intervention"):
+            events["toggle_intervention"] = False
+            logging.info(
+                "Human-intervention hotkey ignored in pure-manual mode; "
+                "all recorded frames are already human-controlled."
+            )
+
         timer.tick()
 
         with timer.section("observe"):
@@ -361,11 +421,26 @@ def record_loop(
             with timer.section("record"):
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
+                if EVORL_POLICY_ACTION_FIELD in dataset.features:
+                    policy_action_names = dataset.features[EVORL_POLICY_ACTION_FIELD].get("names")
+                    if policy_action_names is None:
+                        policy_action_names = list(action_values)
+                    zero_policy_action = dict.fromkeys(policy_action_names, 0.0)
+                    frame.update(
+                        build_dataset_frame(
+                            dataset.features,
+                            zero_policy_action,
+                            prefix=EVORL_POLICY_ACTION_FIELD,
+                        )
+                    )
+                    frame[EVORL_INTERVENTION_FIELD] = np.array([0.0], dtype=np.float32)
+                    frame[EVORL_STATE_FIELD] = np.array([EVORL_STATE_POLICY], dtype=np.float32)
+                    frame[EVORL_COLLECTOR_POLICY_ID_FIELD] = "human"
                 dataset.add_frame(frame)
 
         if display_data:
             with timer.section("telemetry"):
-                log_visualization_data(
+                _log_record_telemetry(
                     display_mode,
                     observation=obs_processed,
                     action=action_values,
@@ -424,6 +499,9 @@ def record(
             use_videos=cfg.dataset.video,
         ),
     )
+    if cfg.enable_evorl_controls:
+        dataset_features.update(build_evorl_dataset_features(dataset_features[ACTION]))
+        logging.info("EvoRL recording schema: 0901-compatible complementary_info fields")
 
     dataset = None
     listener = None
@@ -483,7 +561,13 @@ def record(
             teleop.connect()
         robot.connect()
 
-        listener, events = init_keyboard_listener()
+        listener, events = init_keyboard_listener(
+            intervention_toggle_key=cfg.intervention_toggle_key if cfg.enable_evorl_controls else None,
+            episode_success_key=cfg.episode_success_key if cfg.enable_evorl_controls else None,
+            episode_failure_key=cfg.episode_failure_key if cfg.enable_evorl_controls else None,
+            rerecord_episode_key=cfg.rerecord_episode_key if cfg.enable_evorl_controls else None,
+            reset_episode_key=cfg.reset_episode_key if cfg.enable_evorl_controls else None,
+        )
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
@@ -494,6 +578,8 @@ def record(
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
+                events["episode_outcome"] = None
+                events["reset_episode"] = False
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -512,6 +598,18 @@ def record(
                     timer=timer,
                 )
 
+                # R aborts the episode, returns both arms to calibrated zero, and re-records.
+                # Clear the loop-stop flag left by the keyboard event before the homing move.
+                if events.get("reset_episode"):
+                    events["exit_early"] = False
+                    log_say("Reset arms to initial pose and re-record", cfg.play_sounds)
+                    _reset_evorl_arms(
+                        robot,
+                        teleop,
+                        teleop_action_processor,
+                        robot_action_processor,
+                    )
+
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and (
@@ -519,20 +617,25 @@ def record(
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                        display_mode=cfg.display_mode,
-                        display_compressed_images=display_compressed_images,
-                    )
+                    if not events.get("reset_episode"):
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_mode=cfg.display_mode,
+                            display_compressed_images=display_compressed_images,
+                        )
+
+                if cfg.enable_evorl_controls and events["stop_recording"]:
+                    dataset.clear_episode_buffer()
+                    break
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
@@ -543,7 +646,35 @@ def record(
                     timer.restart()
                     continue
 
-                dataset.save_episode()
+                if cfg.enable_evorl_controls and events.get("episode_outcome") is None:
+                    logging.warning(
+                        "Episode ended without %s/%s outcome; discarding it. Press %s=success or %s=failure.",
+                        cfg.episode_success_key.upper(),
+                        cfg.episode_failure_key.upper(),
+                        cfg.episode_success_key.upper(),
+                        cfg.episode_failure_key.upper(),
+                    )
+                    dataset.clear_episode_buffer()
+                    events["exit_early"] = False
+                    timer.log_episode_summary("discarded unlabeled episode")
+                    timer.restart()
+                    continue
+
+                episode_metadata = None
+                if cfg.enable_evorl_controls:
+                    episode_metadata = {
+                        "episode_success": normalize_episode_success_label(events["episode_outcome"])
+                    }
+                episode_frames = (
+                    dataset.writer.episode_buffer["size"] if dataset.writer.episode_buffer is not None else 0
+                )
+                dataset.save_episode(episode_metadata=episode_metadata)
+                logging.info(
+                    "Saved episode %d (outcome=%s, frames=%d)",
+                    episode_index,
+                    events.get("episode_outcome") or "unlabeled",
+                    episode_frames,
+                )
                 recorded_episodes += 1
                 # Close the window on the episode just saved.  The digest is emitted on
                 # the next episode's first tick, so the reset phase, `save_episode` and
@@ -553,39 +684,80 @@ def record(
                 timer.log_episode_summary(f"episode {episode_index}")
                 timer.restart()
     finally:
-        # First, and in `finally`: ^C is how most recording sessions end, and the summary
-        # is most useful before the video encoding and the hub upload scroll it away.
-        timer.log_run_summary()
+        # Cleanup must not stop after its first failure: a dataset finalization
+        # problem must never leave the robot or teleoperator connected.
+        primary_error_active = sys.exc_info()[0] is not None
+        cleanup_error = None
 
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
+        def run_cleanup(description, operation):
+            nonlocal cleanup_error
+            try:
+                return operation()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logging.exception("%s failed", description)
+                return None
+
+        # First: the timing summary is most useful before video encoding and
+        # upload messages scroll it away.
+        run_cleanup("Cycle timing summary", timer.log_run_summary)
+        run_cleanup(
+            "Stop-recording announcement",
+            lambda: log_say("Stop recording", cfg.play_sounds, blocking=True),
+        )
 
         if dataset:
-            dataset.finalize()
+            run_cleanup("Dataset finalization", dataset.finalize)
 
         if robot.is_connected:
-            robot.disconnect()
+            run_cleanup("Robot disconnect", robot.disconnect)
         if teleop and teleop.is_connected:
-            teleop.disconnect()
+            run_cleanup("Teleoperator disconnect", teleop.disconnect)
 
         if listener is not None:
-            listener.stop()
+            run_cleanup("Keyboard listener shutdown", listener.stop)
 
         if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+            run_cleanup(
+                "Visualization shutdown",
+                lambda: shutdown_visualization(cfg.display_mode),
+            )
 
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
-                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                run_cleanup(
+                    "Dataset upload",
+                    lambda: dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private),
+                )
             else:
                 logging.warning("No episodes saved — skipping push to hub")
 
-        log_say("Exiting", cfg.play_sounds)
+        run_cleanup("Exit announcement", lambda: log_say("Exiting", cfg.play_sounds))
+
+        if cleanup_error is not None and not primary_error_active:
+            raise cleanup_error
     return dataset
 
 
+def _enable_line_buffered_output() -> None:
+    """Flush console output promptly when launched through nohup or tee."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
+
+
 def main():
-    register_third_party_plugins()
-    record()
+    _enable_line_buffered_output()
+    init_logging()
+    logging.info("Starting lerobot-record")
+    try:
+        register_third_party_plugins()
+        record()
+    except Exception:
+        logging.exception("Recording failed")
+        raise
 
 
 if __name__ == "__main__":

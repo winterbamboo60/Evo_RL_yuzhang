@@ -120,12 +120,26 @@ from .train_rl import TrainRLServerPipelineConfig
 from .trainer import RLTrainer
 
 
+def _runtime_config(cfg: TrainRLServerPipelineConfig):
+    """Return algorithm-owned online settings, with SAC policy compatibility."""
+    algorithm = getattr(cfg, "algorithm", None)
+    if algorithm is not None and hasattr(algorithm, "actor_learner_config"):
+        return algorithm
+    return cfg.policy
+
+
+def _replay_state_keys(cfg: TrainRLServerPipelineConfig):
+    algorithm = getattr(cfg, "algorithm", None)
+    keys = getattr(algorithm, "state_keys", None)
+    return keys if keys is not None else cfg.policy.input_features.keys()
+
+
 @parser.wrap()
 def train_cli(cfg: TrainRLServerPipelineConfig):
     # Fail fast with a friendly error if the optional ``hilserl`` extra is missing.
     require_package("grpcio", extra="hilserl", import_name="grpc")
     if not use_threads(cfg):
-        ensure_multiprocessing_start_method(cfg.policy.concurrency.multiprocessing_context)
+        ensure_multiprocessing_start_method(_runtime_config(cfg).concurrency.multiprocessing_context)
 
     # Use the job_name from the config
     train(
@@ -303,14 +317,16 @@ def add_actor_information_and_train(
     # Extract all configuration variables at the beginning, it improve the speed performance
     # of 7%
     device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
-    storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
-    online_step_before_learning = cfg.policy.online_step_before_learning
+    storage_device = get_safe_torch_device(try_device=_runtime_config(cfg).storage_device)
+    online_step_before_learning = _runtime_config(cfg).online_step_before_learning
     fps = cfg.env.fps
     log_freq = cfg.log_freq
     save_freq = cfg.save_freq
-    policy_parameters_push_frequency = cfg.policy.actor_learner_config.policy_parameters_push_frequency
+    policy_parameters_push_frequency = (
+        _runtime_config(cfg).actor_learner_config.policy_parameters_push_frequency
+    )
     saving_checkpoint = cfg.save_checkpoint
-    online_steps = cfg.policy.online_steps
+    online_steps = _runtime_config(cfg).online_steps
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -335,7 +351,7 @@ def add_actor_information_and_train(
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        dataset_stats=cfg.policy.dataset_stats,
+        dataset_stats=getattr(cfg.policy, "dataset_stats", None),
     )
 
     # Push initial policy weights to actors
@@ -366,7 +382,7 @@ def add_actor_information_and_train(
         algorithm=algorithm,
         data_mixer=data_mixer,
         batch_size=batch_size,
-        preprocessor=preprocessor,
+        preprocessor=None if getattr(algorithm, "uses_preprocessed_replay", False) else preprocessor,
     )
 
     # If we are resuming, we need to load the training state
@@ -399,6 +415,7 @@ def add_actor_information_and_train(
             offline_replay_buffer=offline_replay_buffer,
             dataset_repo_id=dataset_repo_id,
             shutdown_event=shutdown_event,
+            algorithm=algorithm,
         )
 
         # Process all available interaction messages sent by the actor server
@@ -514,10 +531,10 @@ def start_learner(
     service = LearnerService(
         shutdown_event=shutdown_event,
         parameters_queue=parameters_queue,
-        seconds_between_pushes=cfg.policy.actor_learner_config.policy_parameters_push_frequency,
+        seconds_between_pushes=_runtime_config(cfg).actor_learner_config.policy_parameters_push_frequency,
         transition_queue=transition_queue,
         interaction_message_queue=interaction_message_queue,
-        queue_get_timeout=cfg.policy.actor_learner_config.queue_get_timeout,
+        queue_get_timeout=_runtime_config(cfg).actor_learner_config.queue_get_timeout,
     )
 
     server = grpc.server(
@@ -533,8 +550,8 @@ def start_learner(
         server,
     )
 
-    host = cfg.policy.actor_learner_config.learner_host
-    port = cfg.policy.actor_learner_config.learner_port
+    host = _runtime_config(cfg).actor_learner_config.learner_host
+    port = _runtime_config(cfg).actor_learner_config.learner_port
 
     server.add_insecure_port(f"{host}:{port}")
     server.start()
@@ -785,7 +802,7 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
     logging.info(f"{cfg.env.task=}")
-    logging.info(f"{cfg.policy.online_steps=}")
+    logging.info(f"{_runtime_config(cfg).online_steps=}")
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -806,30 +823,28 @@ def initialize_replay_buffer(
     """
     if not cfg.resume:
         return ReplayBuffer(
-            capacity=cfg.policy.online_buffer_capacity,
+            capacity=_runtime_config(cfg).online_buffer_capacity,
             device=device,
-            state_keys=cfg.policy.input_features.keys(),
+            state_keys=_replay_state_keys(cfg),
             storage_device=storage_device,
-            optimize_memory=True,
+            optimize_memory=getattr(cfg.algorithm, "type", "") != "rlt_chunk",
         )
 
     logging.info("Resume training load the online dataset")
     dataset_path = os.path.join(cfg.output_dir, "dataset")
 
     # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
+    repo_id = cfg.dataset.repo_id if cfg.dataset is not None else (cfg.env.task or "online_replay")
     dataset = LeRobotDataset(
         repo_id=repo_id,
         root=dataset_path,
     )
     return ReplayBuffer.from_lerobot_dataset(
         lerobot_dataset=dataset,
-        capacity=cfg.policy.online_buffer_capacity,
+        capacity=_runtime_config(cfg).online_buffer_capacity,
         device=device,
-        state_keys=cfg.policy.input_features.keys(),
-        optimize_memory=True,
+        state_keys=_replay_state_keys(cfg),
+        optimize_memory=getattr(cfg.algorithm, "type", "") != "rlt_chunk",
     )
 
 
@@ -864,10 +879,10 @@ def initialize_offline_replay_buffer(
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
-        state_keys=cfg.policy.input_features.keys(),
+        state_keys=_replay_state_keys(cfg),
         storage_device=storage_device,
-        optimize_memory=True,
-        capacity=cfg.policy.offline_buffer_capacity,
+        optimize_memory=getattr(cfg.algorithm, "type", "") != "rlt_chunk",
+        capacity=_runtime_config(cfg).offline_buffer_capacity,
     )
     return offline_replay_buffer
 
@@ -876,7 +891,7 @@ def initialize_offline_replay_buffer(
 
 
 def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
-    return cfg.policy.concurrency.learner == "threads"
+    return _runtime_config(cfg).concurrency.learner == "threads"
 
 
 def check_nan_in_transition(
@@ -955,6 +970,7 @@ def process_transitions(
     offline_replay_buffer: ReplayBuffer,
     dataset_repo_id: str | None,
     shutdown_event: Any,  # Event
+    algorithm: RLAlgorithm | None = None,
 ):
     """Process all available transitions from the queue.
 
@@ -968,6 +984,9 @@ def process_transitions(
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
+        ingest_payload = getattr(algorithm, "ingest_transition_payload", None)
+        if callable(ingest_payload) and ingest_payload(transition_list, replay_buffer):
+            continue
 
         for transition in transition_list:
             # Skip transitions with NaN values

@@ -164,6 +164,7 @@ Usage examples
 """
 
 import logging
+import sys
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -223,35 +224,48 @@ def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
     init_logging()
 
-    if cfg.display_data:
-        logger.info(
-            "Initializing %s visualization (ip=%s, port=%s)",
-            cfg.display_mode,
-            cfg.display_ip,
-            cfg.display_port,
-        )
-        init_visualization(cfg.display_mode, session_name="rollout", ip=cfg.display_ip, port=cfg.display_port)
-
-    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
-    shutdown_event = signal_handler.shutdown_event
-    if cfg.interactive:
-        # /reset and /stop end the control loop via the local flag; process signals still
-        # propagate through the parent event.
-        shutdown_event = LinkedEvent(shutdown_event)
-
-    logger.info("Building rollout context...")
-    ctx = build_rollout_context(cfg, shutdown_event)
-
-    strategy = create_strategy(cfg.strategy)
-    logger.info("Rollout strategy: %s", cfg.strategy.type)
-    logger.info(
-        "Robot: %s | FPS: %.0f | Duration: %s",
-        cfg.robot.type if cfg.robot else "?",
-        cfg.fps,
-        f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
-    )
+    visualization_started = False
+    ctx = None
+    strategy = None
 
     try:
+        if cfg.display_data:
+            logger.info(
+                "Initializing %s visualization (ip=%s, port=%s)",
+                cfg.display_mode,
+                cfg.display_ip,
+                cfg.display_port,
+            )
+            # A partially initialized backend still needs a best-effort shutdown.
+            visualization_started = True
+            init_visualization(
+                cfg.display_mode,
+                session_name="rollout",
+                ip=cfg.display_ip,
+                port=cfg.display_port,
+            )
+
+        signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
+        shutdown_event = signal_handler.shutdown_event
+        if cfg.interactive:
+            # /reset and /stop end the control loop via the local flag; process signals still
+            # propagate through the parent event.
+            shutdown_event = LinkedEvent(shutdown_event)
+
+        # Strategy construction has no hardware side effects, so validate it
+        # before connecting the robot.
+        strategy = create_strategy(cfg.strategy)
+        logger.info("Rollout strategy: %s", cfg.strategy.type)
+
+        logger.info("Building rollout context...")
+        ctx = build_rollout_context(cfg, shutdown_event)
+        logger.info(
+            "Robot: %s | FPS: %.0f | Duration: %s",
+            cfg.robot.type if cfg.robot else "?",
+            cfg.fps,
+            f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
+        )
+
         strategy.setup(ctx)
         if cfg.interactive:
             logger.info("Rollout setup complete — starting interactive session (robot idle until /start)")
@@ -261,16 +275,49 @@ def rollout(cfg: RolloutConfig):
             strategy.run(ctx)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+    except Exception:
+        logger.exception("Rollout failed")
+        raise
     finally:
-        strategy.teardown(ctx)
-        if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+        primary_error_active = sys.exc_info()[0] is not None
+        cleanup_error = None
+
+        if strategy is not None and ctx is not None:
+            try:
+                strategy.teardown(ctx)
+            except Exception as exc:
+                cleanup_error = exc
+                logger.exception("Rollout strategy teardown failed")
+
+        if visualization_started:
+            try:
+                shutdown_visualization(cfg.display_mode)
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.exception("Visualization shutdown failed")
+
+        # Preserve the primary rollout exception. On an otherwise successful
+        # run, make cleanup failures visible through the process exit code.
+        if cleanup_error is not None and not primary_error_active:
+            raise cleanup_error
 
     logger.info("Rollout finished")
 
 
+def _enable_line_buffered_output() -> None:
+    """Flush console output promptly when launched through nohup or tee."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
+
+
 def main():
     """CLI entry point for ``lerobot-rollout``."""
+    _enable_line_buffered_output()
+    init_logging()
+    logger.info("Starting lerobot-rollout")
     register_third_party_plugins()
     rollout()
 
