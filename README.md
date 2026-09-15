@@ -1,198 +1,445 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# Evo 0911 环境打包、上传与云端使用
 
-<div align="center">
+`evo_0911` 是基于 Ubuntu 24.04、x86_64、Python 3.12 的 uv/venv 环境，不是 Conda
+环境。它使用 `venv-pack` 生成可迁移归档，解压后不需要、也不能运行 `conda-unpack`。
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+归档内包含当前项目工作树构建出的非 editable LeRobot，因此只上传环境也能直接运行。
+云端需要修改 LeRobot 源码时，再从云端项目目录执行 editable 重装；`--no-deps` 会保留
+归档中的 PyTorch、CUDA、RealSense、Piper 等依赖版本。
 
-</div>
-
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
-
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
-
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
-
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
-
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
-
-## Quick Start
-
-LeRobot can be installed directly from PyPI.
+## 1. 本地打包
 
 ```bash
-pip install lerobot
-lerobot-info
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash scripts/ci/env/pack_evo_0911.sh \
+  --env-root /home/lenovo/code/envs/evo_0911 \
+  --project-root /home/lenovo/code/Evo-RL-loop-0911 \
+  --output-dir /home/lenovo/code/envs/artifacts/evo_0911
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+脚本不会修改源环境或项目工作树。输出目录包含：
 
-## Robots & Control
+- `evo_0911-*.tar.gz`：可以直接上传的环境归档；
+- `evo_0911-*.tar.gz.sha256`：完整性校验文件；
+- `evo_0911-*.manifest.txt`：构建主机、Python、Git 提交和 GPU 信息。
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
+完整的 `pip freeze`、Git 工作树状态和 LeRobot wheel 校验值也保存在归档内的
+`share/evo_0911/`。打包结束前会把归档解压到另一个临时路径，检查旧前缀、核心依赖、
+LeRobot 安装位置和 `pip check`。
 
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
+## 2. 上传云端
 
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
-
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1, reBot B601.
-
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3).
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, Vision-Language-Action (VLA) models, World Models, and Reward Models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+将项目目录以及 `.tar.gz`、`.sha256` 上传到云端。SSH 场景可以使用：
 
 ```bash
-lerobot-train \
-  --policy.type=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+rsync -P \
+  /home/lenovo/code/Evo-RL-loop-0911/artifacts/evo_0911/evo_0911-*.tar.gz \
+  /home/lenovo/code/Evo-RL-loop-0911/artifacts/evo_0911/evo_0911-*.tar.gz.sha256 \
+  USER@CLOUD_HOST:/cloud/uploads/
 ```
 
-| Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                    |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                                                                                                                                                                                                |
-| **VLAs Models**            | [Pi0](./docs/source/pi0.mdx), [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.7](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx), [EO-1](./docs/source/eo1.mdx), [MolmoAct2](./docs/source/molmoact2.mdx), [WALL-OSS](./docs/source/walloss.mdx), [EVO1](./docs/source/evo1.mdx) |
-| **World Models**           | [VLA-JEPA](./docs/source/vla_jepa.mdx), [LingBot-VA](./docs/source/lingbot_va.mdx), [FastWAM](./docs/source/fastwam.mdx)                                                                                                                                                                                                                                                                   |
-| **Reward Models**          | [SARM](./docs/source/sarm.mdx), [TOPReward](./docs/source/topreward.mdx), [Robometer](./docs/source/robometer.mdx)                                                                                                                                                                                                                                                                         |
+没有 SSH 的平台可直接在网页上传同样两个文件。不要只上传当前 Git 提交后重新构建环境：
+当前工作树可能包含未提交的 LeRobot 功能，归档中的非 editable wheel 才是打包时的准确快照。
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub.
+## 3. 云端解压和验证
 
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+目标目录必须尚不存在，安装脚本不会覆盖已有环境：
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+cd /cloud/code/Evo-RL-loop-0911
+bash scripts/ci/env/install_evo_0911.sh \
+  --archive /cloud/uploads/evo_0911-YYYYMMDD-HHMMSS-*.tar.gz \
+  --dest /cloud/envs/evo_0911
+
+export EVORL_ENV_ROOT=/cloud/envs/evo_0911
+source "$EVORL_ENV_ROOT/bin/activate"
+
+export EVORL_ENV_ROOT=/home/lenovo/code/envs/evo_0911
+source "$EVORL_ENV_ROOT/bin/activate"
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub).
+安装脚本会自动读取同目录的 `.sha256`、检查归档成员、防止覆盖目标目录，并在临时目录
+验证通过后再原子移动到目标路径。需要强制验证 GPU 时追加 `--require-cuda`。
 
-### Third-Party Hardware
+目标机要求：
 
-Beyond the natively supported hardware, the community maintains a growing ecosystem of plugins for other robots, teleoperators, cameras, and sensors - UFACTORY xArm, Universal Robots UR5e, Franka, AgileX Piper, Trossen WidowX, ARX5, I2RT YAM, GELLO, SpaceMouse, Meta Quest, ROS 2 bridges, tactile and depth cameras, and more.
+- Ubuntu 24.04 x86_64，且 `/usr/bin/python3.12` 存在；
+- NVIDIA 驱动能够运行归档中的 PyTorch CUDA 12.8；
+- CAN、RealSense、udev 权限、`can-utils` 和 `ethtool` 由宿主机准备。
 
-Plugins are auto-discovered by package name: LeRobot imports any installed package prefixed with `lerobot_robot_`, `lerobot_teleoperator_`, or `lerobot_camera_`. Install one and use the `type` it registers straight from the CLI:
+若系统或架构不同，不要强行使用二进制归档，应在目标机从 `uv.lock` 重建环境。
+
+## 4. 可选：重新安装云端 LeRobot 源码
 
 ```bash
-pip install lerobot_robot_<name> lerobot_teleoperator_<name>
-
-lerobot-record \
-  --robot.type=<robot_name> \
-  --teleop.type=<teleoperator_name> \
-  --dataset.repo_id=${HF_USER}/my-dataset
+cd /cloud/code/Evo-RL-loop-0911
+bash scripts/ci/env/reinstall_lerobot.sh \
+  --env-root /cloud/envs/evo_0911 \
+  --project-root /cloud/code/Evo-RL-loop-0911
 ```
 
-Browse the full list in the [Third-Party Robots & Teleoperators](https://huggingface.co/docs/lerobot/main/third_party_robots) and [Third-Party Cameras & Sensors](https://huggingface.co/docs/lerobot/main/third_party_sensors) documentation.
+也可以在解压时一次完成：
 
-## Resources
-
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
-- **[T-Shirt Folding Experiment](https://huggingface.co/spaces/lerobot/robot-folding):** An end-to-end demonstration of folding t-shirts with LeRobot.
-- **[LeLab](https://github.com/huggingface/leLab):** A web interface for LeRobot — teleoperate, calibrate, record datasets, replay, and train your SO arm from the browser, no CLI required.
-
-## Citation
-
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
-
-```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Meftah, Khalil and Ellerbach, Maxime and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
-}
+```bash
+bash scripts/ci/env/install_evo_0911.sh \
+  --archive /cloud/uploads/evo_0911-YYYYMMDD-HHMMSS-*.tar.gz \
+  --dest /cloud/envs/evo_0911 \
+  --project-root /cloud/code/Evo-RL-loop-0911 \
+  --editable
 ```
 
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
+editable 重装后，LeRobot 会从项目的 `src/` 目录加载。此后不要移动该环境目录；需要换路径时
+重新从原始归档解压。重装不会访问网络，也不会安装或升级依赖。
 
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
+## 5. 环境变量约定
 
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
+本机默认路径如下；云端只需修改一次 `EVORL_ENV_ROOT`。`RL_online.sh` 会直接读取该变量，
+数据采集和训练脚本则从已激活环境的 `PATH` 获取 Python。
+
+```bash
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/home/lenovo/code/envs/evo_0911}"
+source "$EVORL_ENV_ROOT/bin/activate"
 ```
 
-</details>
+# 找相机
+mkdir -p /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
 
-## Contribute
+source "$EVORL_ENV_ROOT/bin/activate"
+source "$EVORL_ENV_ROOT/bin/activate"; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras opencv
+source "$EVORL_ENV_ROOT/bin/activate"; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras realsense --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+调整相机参数
 
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
 
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+# 激活can口
+Step3. 初始化CAN口
+source "$EVORL_ENV_ROOT/bin/activate"
+lerobot-setup-can --mode=setup --interfaces=can0,can1
+
+默认 CAN 映射：
+左主臂 can0 -> 左从臂 can1
+右主臂 can2 -> 右从臂 can3
+source "$EVORL_ENV_ROOT/bin/activate"
+lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
+
+Step4. CAN口模式测试，需要能看到持续输出的数据
+lerobot-setup-can --mode=test --interfaces=can0
+lerobot-setup-can --mode=test --interfaces=can1
+
+# 北京5080数据采集
+## 纯人工
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data.sh \
+  --dataset.root /home/lenovo/datasets/cube_catch_rollout_v3/0911_1 \
+  --dataset.single_task "Grab the cube" \
+  --wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6
+
+## 策略模型 + 人工介入（显式启用 can0）
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data.sh \
+  --dataset.root /home/lenovo/datasets/0909_pi05_sft_cube_catch_belt_50k_test1 \
+  --dataset.single_task "Grab the moving blocks on the conveyor belt" \
+  --wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0909_pi05_sft_cube_catch_belt_50k \
+  --can0.control true
+
+
+## 合并数据集
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+python -m lerobot.scripts.lerobot_edit_dataset \
+    --repo_id /home/lenovo/datasets/v9_task123_0728_merged \
+    --operation.type merge \
+    --operation.repo_ids "['/home/lenovo/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/lenovo/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/lenovo/datasets/task2_grab_the_package_and_place_it_into_the_b']"
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+python -m lerobot.scripts.lerobot_edit_dataset \
+    --repo_id /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged \
+    --operation.type merge \
+    --operation.source_dir /home/lenovo/datasets/20260914_bipiper_cube_catch_v2
+
+source "$EVORL_ENV_ROOT/bin/activate"
+python -m lerobot.scripts.lerobot_edit_dataset \
+    --repo_id /home/lenovo/datasets/cube_catch_rollout_v3_merge_test  \
+    --operation.type merge \
+    --operation.source_dir /home/lenovo/datasets/cube_catch_rollout_v3 \
+    --operation.concatenate_videos false \
+    --operation.concatenate_data false
+
+## 查看并编辑数据集
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+python /home/lenovo/code/Evo-RL-loop-0911/scripts/ci/dataset_checker.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2/0915_1
+
+## 修改数据集task
+source "$EVORL_ENV_ROOT/bin/activate"
+python /home/lenovo/code/Evo-RL-loop-0911/scripts/ci/replace_dataset_task.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged --task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." --output-suffix "_newTask"
+
+## 数据集转化
+
+旧数据已经包含 complementary_info.policy_action、complementary_info.is_intervention、
+complementary_info.state、complementary_info.collector_policy_id 时，可以由当前训练代码直接读取，
+无需转换。缺少这些字段或使用临时 intervention bool 字段时，可非覆盖地规范化：
+
+lerobot-migrate-evorl-dataset \
+    --source-root SOURCE_DATASET \
+    --destination-root DESTINATION_DATASET \
+    --destination-repo-id local/canonical_dataset \
+    --direction to-canonical \
+    --collector-policy-id pi05-checkpoint
+
+destination-root 是新副本的实际磁盘目录，destination-repo-id 是写入 meta/info.json
+的数据集标识。转换不改源目录，输出仍使用当前 LeRobot v3 的 Parquet/MP4 存储；
+只有 EvoRL 业务字段名和 dtype 对齐 0901。to-current 和 to-0901 仅保留作历史兼容方向。
+
+
+# 模型训练
+## pi05_base训练
+需要根据机器修改环境ENV_ROOT的值
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+nohup bash scripts/RL_train.sh \
+    --DATASET_ROOT /home/lenovo/datasets/20260914_bipiper_cube_catch_v1-1_merged \
+    --ModelZoo /home/lenovo/modelZoo \
+    --history_pretrained_path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+    --OUTPUT_DIR /home/lenovo/outputs/0915_pi05_sft_cube_catch_belt_dual_v11_double_30000_needDelete \
+    --policy_type pi05 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --steps 1000 \
+    --save_freq 200 \
+    --train_expert_only true \
+    -- \
+    --policy.compile_model=false \
+    > /home/lenovo/outputs/logs/0915_pi05_sft_cube_catch_belt_dual_v11_double_30000_needDelete.log 2>&1 &
+
+### 单机多卡 DDP 训练
+
+当前 `lerobot_train.py` 使用 `torchrun`/PyTorch Distributed 作为多卡启动方式。`RL_train.sh`
+增加 `--num_gpus N` 后会自动改用同一 Python 环境里的
+`python -m torch.distributed.run --standalone`，并让当前 LeRobot 将默认并行拓扑解析为 DDP。
+不要再套用 0901 的 `accelerate launch`：当前版本要求 Accelerate 参数统一来自
+`TrainPipelineConfig`，外部 Accelerate 配置环境变量可能被拒绝。
+
+两卡 PI0.5 示例（只需在单卡命令中选择显卡并增加 `--num_gpus 2`）：
+
+```bash
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/RL_train.sh \
+    --DATASET_ROOT /home/lenovo/datasets/20260914_bipiper_cube_catch_v1-1_merged \
+    --history_pretrained_path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+    --OUTPUT_DIR /home/lenovo/outputs/0915_pi05_sft_cube_catch_belt_dual_v11_ddp2 \
+    --policy_type pi05 \
+    --num_gpus 2 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --steps 1000 \
+    --save_freq 200 \
+    --train_expert_only true \
+    --tensorboard \
+    -- \
+    --policy.compile_model=false
+```
+
+四卡时改为 `CUDA_VISIBLE_DEVICES=0,1,2,3` 和 `--num_gpus 4`。显卡编号的数量必须不小于
+`--num_gpus`；多卡时 `--device` 必须保持为 `cuda`，不能写成 `cuda:0`。脚本仍只由主 rank
+保存 checkpoint 和 TensorBoard 事件；所有进程的标准输出和报错会汇总到
+`OUTPUT_DIR/RL_train.log`，训练器主日志同时位于 `OUTPUT_DIR/train/RL_train.log`，TensorBoard
+目录仍为 `OUTPUT_DIR/tensoborad`。
+
+全局有效 batch size 为：
+
+```text
+batch_size（每卡） × num_gpus × gradient_accumulation_steps
+```
+
+因此，从单卡 `batch_size=1、gradient_accumulation_steps=16` 切换到两卡且希望维持相同的
+有效 batch size，应改成 `gradient_accumulation_steps=8`；如果仍设为 16，则有效 batch size
+会由 16 增加到 32。`steps` 在当前训练器中是每个 data-parallel worker 消耗的 micro-step 数，
+不会因为 GPU 数量增加而自动缩短。
+
+可在不启动训练的情况下检查数据、checkpoint 并查看最终多卡命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/RL_train.sh \
+    --DATASET_ROOT /path/to/dataset \
+    --history_pretrained_path /path/to/checkpoint \
+    --OUTPUT_DIR /path/to/output \
+    --policy_type pi05 \
+    --num_gpus 2 \
+    --dry_run
+```
+
+当前 PI0.5、PI0.5-RLT 和 SmolVLA 未声明经过验证的 FSDP 包装单元，所以这里开放的是权重复制的
+DDP：它能提高吞吐，但不会降低每张卡保存完整模型所需的显存。底层虽有 FSDP2 配置入口，暂不建议
+对这三种策略直接启用；应先为具体策略确定并验证 `accelerator.fsdp.wrap_modules` 后再开放。
+
+## pi05+rlt训练
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+nohup bash scripts/RL_train.sh \
+    --DATASET_ROOT /home/lenovo/datasets/20260914_bipiper_cube_catch_v1-1_merged \
+    --ModelZoo /home/lenovo/modelZoo \
+    --history_pretrained_path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+    --OUTPUT_DIR /home/lenovo/outputs/0914_pi05_rlt_sft_cube_catch_belt_dual_double_30000_needDelete \
+    --policy_type pi05_rlt \
+    --batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --steps 1000 \
+    --save_freq 200 \
+    --train_expert_only false \
+    > /home/lenovo/outputs/logs/0914_pi05_rlt_sft_cube_catch_belt_dual_double_30000_needDelete.log 2>&1 &
+
+# 模型推理
+## 单臂 VLA 仅推理：
+不连接 can0，C 键禁用；需要人工介入时追加 --can0.control true
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data.sh \
+  --dataset.root /home/lenovo/datasets/0910_pi05_sft_cube_catch_belt_50000_needDelete \
+  --dataset.single_task "Grab the moving blocks on the conveyor belt" \
+  --wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0910_pi05_sft_cube_catch_belt_50000
+
+## 单臂 VLA + 人工介入
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data.sh \
+    --dataset.root /home/lenovo/datasets/0910_pi05_sft_cube_catch_belt_50000_needDelete \
+    --dataset.single_task "Grab the moving blocks on the conveyor belt" \
+    --wrist_camera.index_or_path 260422275792 \
+    --top_camera.index_or_path 6 \
+    --policy.path /home/lenovo/outputs/0910_pi05_sft_cube_catch_belt_50000 \
+    --can0.control true
+
+## 单臂 VLA + 人工介入 + RTC
+
+RTC 使用 guided 模式异步生成动作块。按 C 后会立刻暂停 RTC、废弃队列中以及正在生成的旧
+VLA 动作，并在当前控制周期交给 can0 主臂；再次按 C 后重置推理状态并恢复 VLA。
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data.sh \
+    --dataset.root /home/lenovo/datasets/0910_pi05_sft_cube_catch_belt_50000_needDelete \
+    --dataset.single_task "Grab the moving blocks on the conveyor belt" \
+    --wrist_camera.index_or_path 260422275792 \
+    --top_camera.index_or_path 6 \
+    --policy.path /home/lenovo/outputs/0910_pi05_sft_cube_catch_belt_50000 \
+    --can0.control true \
+    --rtc.enabled true \
+    --rtc.execution_horizon 25 \
+    --rtc_action_queue_threshold 32
+
+`--rtc.execution_horizon` 是每次 RTC 融合保留的动作窗口长度，必须为正整数；
+`--rtc_action_queue_threshold` 是触发后台补充动作块的队列阈值，必须为非负整数。
+不传 `--rtc.enabled true` 时仍使用默认同步推理。
+
+## 双臂 VLA 仅推理
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data_bimanual.sh \
+  --dataset.root /home/lenovo/datasets/0915_pi05_sft_cube_catch_belt_dual_v11_double_30000_needDelete_needDelete \
+  --dataset.single_task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." \
+  --left_wrist_camera.index_or_path 260422275773 \
+  --right_wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0915_pi05_sft_cube_catch_belt_dual_v11_double_30000_needDelete/train/checkpoints/001000/pretrained_model
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data_bimanual.sh \
+  --dataset.root /home/lenovo/datasets/0914_pi05_sft_cube_catch_belt_dual_double_30000_needDelete \
+  --dataset.single_task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." \
+  --left_wrist_camera.index_or_path 260422275773 \
+  --right_wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+  --rtc.enabled true \
+  --rtc.execution_horizon 25 \
+  --rtc_action_queue_threshold 32
+
+## 双臂 VLA + 人工介入
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data_bimanual.sh \
+  --dataset.root /home/lenovo/datasets/0914_pi05_sft_cube_catch_belt_dual_double_30000_needDelete \
+  --dataset.single_task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." \
+  --left_wrist_camera.index_or_path 260422275773 \
+  --right_wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+  --can0.control true
+
+### 双臂 VLA + 人工介入 + RTC
+
+`--can0.control true` 会同时启用 can0 左主臂和 can2 右主臂。VLA 阶段两只主臂随从臂
+同步移动；按 C 后两只主臂立即接管，同时清除 RTC 中尚未执行及正在生成的旧动作。
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash /home/lenovo/code/Evo-RL-loop-0911/scripts/RL_data_bimanual.sh \
+  --dataset.root /home/lenovo/datasets/0914_pi05_sft_cube_catch_belt_dual_double_30000_needDelete \
+  --dataset.single_task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." \
+  --left_wrist_camera.index_or_path 260422275773 \
+  --right_wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
+  --can0.control true \
+  --rtc.enabled true \
+  --rtc.execution_horizon 25 \
+  --rtc_action_queue_threshold 32
+
+## 在线 RL：actor_new + 人工介入 + RTC
+
+在线 Actor 只从 `actor_new` 启动；learner 和传输协议仍使用当前 LeRobot 实现。单臂或双臂由
+JSON 中的 `env.robot.type` / `env.teleop.type` 决定。双臂主臂配置应为 `bi_piper_leader`，
+其中左、右端口分别配置 can0、can2。
+
+```bash
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+PIPER_ONLINE_RL_ACTOR_CONFIG=src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
+bash scripts/RL_online.sh actor \
+  --can0.control=true \
+  --rtc.enabled=true \
+  --rtc.mode=guided \
+  --rtc.execution_horizon=25 \
+  --rtc_action_queue_threshold=32
+```
+
+同时启动 learner 和 actor：
+
+```bash
+source "$EVORL_ENV_ROOT/bin/activate"
+cd /home/lenovo/code/Evo-RL-loop-0911
+PIPER_ONLINE_RL_ACTOR_CONFIG=src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
+PIPER_ONLINE_RL_LEARNER_CONFIG=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
+bash scripts/RL_online.sh both \
+  --can0.control=true \
+  --rtc.enabled=true \
+  --rtc.mode=guided
+```
+
+`both` 模式后面的命令行覆盖只传给 `actor_new`，避免 `can0`、RTC 等硬件参数被 learner
+误解析。learner 参数应修改 learner JSON，或者用 `RL_online.sh learner --参数=值` 单独启动。
+不设置上述两个变量时，脚本默认使用这套 0901-40k 的 0911 适配配置。
+
+统一按键：`C` 人工介入/释放、`B` 成功、`F` 失败、`A` 放弃并重录、`R` 回初始位并重录、
+`Esc` 退出；`V` 切换 VLA/Online Actor。`can0.control=false` 时完全不连接主臂并禁用 `C`，
+但 VLA/Actor + RTC 仍可近推理。policy 阶段若启用主臂，单臂 can0 或双臂 can0+can2 会随
+从臂目标移动；按 `C` 后立即清空 RTC 队列并由主臂动作接管。
+
+日志默认写入配置的 `output_dir/logs/actor_<job_name>.log`；若环境中的
+`processor.observation.display_cameras=true`，会继续启动 Rerun。
