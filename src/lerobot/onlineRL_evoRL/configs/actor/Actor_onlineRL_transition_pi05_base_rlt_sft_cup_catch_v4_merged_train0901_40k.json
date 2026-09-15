@@ -1,8 +1,12 @@
 {
   "actor_mode": "online_actor",
   "save_format": "transition",
+  "can0": {
+    "control": true
+  },
   "rtc": {
     "enabled": true,
+    "mode": "guided",
     "prefix_attention_schedule": "LINEAR",
     "max_guidance_weight": 10.0,
     "execution_horizon": 25,
@@ -12,24 +16,24 @@
   "rtc_action_queue_threshold": 32,
   "dataset": {
     "repo_id": "local_data",
-    "root": "/home/lenovo/datasets/cup_catch_v4_merged_checked"
+    "root": "/home/lenovo/datasets/cup_catch_v4_merged_checked",
+    "streaming": false
   },
   "env": {
     "type": "gym_manipulator",
+    "task": "Grab the left cup",
     "fps": 30,
     "features": {
-      "agent_pos": {
-        "type": "STATE",
-        "shape": [7]
-      },
-      "action": {
-        "type": "ACTION",
-        "shape": [7]
-      }
+      "agent_pos": {"type": "STATE", "shape": [7]},
+      "action": {"type": "ACTION", "shape": [7]},
+      "wrist": {"type": "VISUAL", "shape": [480, 640, 3]},
+      "top": {"type": "VISUAL", "shape": [480, 640, 3]}
     },
     "features_map": {
       "agent_pos": "observation.state",
-      "action": "action"
+      "action": "action",
+      "wrist": "observation.images.wrist",
+      "top": "observation.images.top"
     },
     "name": "real_robot",
     "robot": {
@@ -39,6 +43,7 @@
       "speed_ratio": 50,
       "require_calibration": true,
       "enable_on_connect": true,
+      "disable_on_disconnect": false,
       "cameras": {
         "wrist": {
           "type": "intelrealsense",
@@ -46,12 +51,13 @@
           "width": 640,
           "height": 480,
           "fps": 30,
-          "use_depth":false,
-          "warmup_s":2,
-          "exposure_mode":"manual",
-          "manual_exposure_us":14000,
-          "manual_gain":16,
-          "white_balance_kelvin":3860
+          "use_rgb": true,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "exposure": 14000,
+          "gain": 16,
+          "white_balance": 3860
         },
         "top": {
           "type": "intelrealsense",
@@ -59,12 +65,13 @@
           "width": 640,
           "height": 480,
           "fps": 30,
-          "use_depth":false,
-          "warmup_s":2,
-          "exposure_mode":"manual",
-          "manual_exposure_us":9000,
-          "manual_gain":76,
-          "white_balance_kelvin":3850
+          "use_rgb": true,
+          "use_depth": false,
+          "warmup_s": 2,
+          "exposure_mode": "manual",
+          "exposure": 9000,
+          "gain": 76,
+          "white_balance": 3850
         }
       }
     },
@@ -73,9 +80,12 @@
       "id": "my_piper_leader",
       "port": "can0",
       "manual_control": false,
-      "command_speed_ratio": 50
+      "command_speed_ratio": 50,
+      "require_calibration": true,
+      "disable_on_disconnect": false
     },
     "processor": {
+      "control_mode": "piper_leader",
       "observation": {
         "add_joint_velocity_to_observation": false,
         "add_current_to_observation": false,
@@ -83,10 +93,7 @@
         "display_cameras": true
       },
       "image_preprocessing": null,
-      "gripper": {
-        "use_gripper": true,
-        "gripper_penalty": 0.0
-      },
+      "gripper": {"use_gripper": true, "gripper_penalty": 0.0},
       "reset": {
         "fixed_reset_joint_positions": null,
         "reset_time_s": 1.0,
@@ -99,57 +106,93 @@
     }
   },
   "policy": {
-    "type": "pi05_online_rl",
+    "type": "pi05_rlt",
+    "input_features": {
+      "observation.state": {"type": "STATE", "shape": [7]},
+      "observation.images.wrist": {"type": "VISUAL", "shape": [3, 480, 640]},
+      "observation.images.top": {"type": "VISUAL", "shape": [3, 480, 640]}
+    },
+    "output_features": {
+      "action": {"type": "ACTION", "shape": [7]}
+    },
     "pretrained_path": "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k",
-    "tokenizer_name": "/home/lenovo/modelZoo/paligemma-3b-pt-224",
     "device": "cuda",
     "dtype": "bfloat16",
-    "use_rlt": true,
     "chunk_size": 50,
     "n_action_steps": 50,
-    "z_dim": 2048,
-    "proprio_dim": 7,
+    "text_tokenizer_name": "/home/lenovo/modelZoo/paligemma-3b-pt-224",
+    "compile_model": false,
+    "train_expert_only": false,
+    "rlt_alpha": 1.0,
+    "rlt_input_dim": 2048,
+    "rlt_embed_dim": 2048,
+    "rlt_num_rl_tokens": 1,
+    "rlt_prefix_seq_len": 1024,
+    "rlt_num_layers": 2,
+    "rlt_num_heads": 8,
+    "rlt_mlp_ratio": 4.0,
+    "rlt_dropout_rate": 0.0,
+    "rlt_image_only": false,
+    "rlt_use_mask": true,
+    "push_to_hub": false,
+    "repo_id": "local_policy_model"
+  },
+  "algorithm": {
+    "type": "rlt_chunk",
     "actor_hidden_dims": [256, 256, 256],
     "critic_hidden_dims": [256, 256, 256],
     "num_critics": 2,
     "fixed_std": 0.002,
     "reference_dropout_prob": 0.5,
-    "use_backup_entropy": false,
+    "q_weight": 0.1,
+    "bc_weight": 5.0,
+    "discount": 0.96,
+    "critic_target_update_weight": 0.005,
+    "actor_update_interval": 4,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "grad_clip_norm": 10.0,
     "online_steps": 1000000,
+    "online_step_before_learning": 100,
+    "online_buffer_capacity": 100000,
+    "offline_buffer_capacity": 100000,
+    "storage_device": "cpu",
     "actor_rollout_deterministic": false,
     "actor_learner_config": {
       "learner_host": "127.0.0.1",
       "learner_port": 50051,
-      "queue_get_timeout": 2.0,
-      "online_episode_batch_size": 2,
-      "parameter_sync_wait_timeout_s": 120.0
+      "policy_parameters_push_frequency": 4,
+      "queue_get_timeout": 2.0
     },
     "concurrency": {
-      "actor": "threads"
-    },
-    "push_to_hub": false
+      "actor": "threads",
+      "learner": "threads",
+      "multiprocessing_context": "spawn"
+    }
   },
-  "output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/actor_onlineRL_transition/output",
-  "job_name": "pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_actor_onlineRL_transition",
+  "output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/actor/output",
+  "job_name": "pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911_actor",
   "resume": false,
   "seed": 1000,
+  "wandb": {"enable": false},
+  "tensorboard": {"enable": false},
   "actor_vla_policy": {
     "enabled": true,
     "policy_path": "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k",
     "policy_poll_s": 5.0,
-    "reload_on_episode_boundary": true
+    "reload_on_episode_boundary": false
   },
   "actor_only": {
-    "episode_output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/actor_actorOnly_transition/episodes",
-    "save_episode_images": true,
-    "save_episode_viewer": true
+    "enabled": false,
+    "save_format": "transition"
   },
   "online_transition": {
+    "enabled": true,
     "save_local_copy": true,
-    "episode_output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/actor_onlineRL_transition/episodes",
+    "episode_output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/actor/episodes",
     "feature_batch_size": 16,
     "sliding_window_stride": 2
   },
-  "actor_checkpoint_path": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output",
-  "task_hotkeys_path": "/home/lenovo/code/Evo-RL-loop-0901/src/lerobot/onlineRL_evoRL/configs/hotkeys/piper_cup_catch_task_hotkeys.json"
+  "actor_checkpoint_path": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/learner",
+  "task_hotkeys_path": "/home/lenovo/code/Evo-RL-loop-0911/src/lerobot/onlineRL_evoRL/configs/hotkeys/piper_cup_catch_task_hotkeys.json"
 }

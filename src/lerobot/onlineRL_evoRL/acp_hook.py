@@ -16,12 +16,19 @@
 
 import random
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from lerobot.configs.train import ACPConfig
 from lerobot.onlineRL_evoRL.acp_tags import build_acp_tagged_task
+
+
+@dataclass
+class ACPConfig:
+    enable: bool = False
+    indicator_field: str = "acp_indicator"
+    indicator_dropout_prob: float = 0.0
 
 
 def _extract_indicators(values: Any, batch_size: int) -> list[bool]:

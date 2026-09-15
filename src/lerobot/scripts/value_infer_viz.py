@@ -8,8 +8,10 @@ from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import savgol_filter
 from tqdm.auto import tqdm
 
+from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames, encode_video_frames
+from lerobot.utils.recording_annotations import resolve_episode_success_from_mapping
 
 
 def _smooth_1d(arr: np.ndarray, window: int = 1) -> np.ndarray:
@@ -399,11 +401,12 @@ def _build_episode_success_map(dataset: LeRobotDataset) -> dict[int, str]:
     if "episode_index" not in eps_raw.column_names:
         return {}
     ep_indices = np.asarray(eps_raw["episode_index"], dtype=np.int64).reshape(-1)
-    if "episode_success" in eps_raw.column_names:
-        success_values = eps_raw["episode_success"]
-    else:
-        success_values = [None] * len(ep_indices)
-    return {int(idx): _success_tag(val) for idx, val in zip(ep_indices, success_values)}
+    result: dict[int, str] = {}
+    for row_idx, ep_idx in enumerate(ep_indices):
+        row = {name: eps_raw[name][row_idx] for name in eps_raw.column_names}
+        label = resolve_episode_success_from_mapping(row, default_label=None, require_label=False)
+        result[int(ep_idx)] = _success_tag(label)
+    return result
 
 
 def _build_output_video_path(
@@ -499,6 +502,23 @@ def _get_video_encode_options(vcodec: str) -> tuple[dict[str, str], str]:
             "g": "60",
         }, "yuv420p"
     return {"g": "2", "crf": "30"}, "yuv420p"
+
+
+def _make_video_encoder_config(vcodec: str) -> RGBEncoderConfig:
+    options, pix_fmt = _get_video_encode_options(vcodec)
+    options = dict(options)
+    g = int(options.pop("g")) if "g" in options else None
+    crf_raw = options.pop("crf", None)
+    crf = float(crf_raw) if crf_raw is not None else None
+    preset = options.pop("preset", None)
+    return RGBEncoderConfig(
+        vcodec=vcodec,
+        pix_fmt=pix_fmt,
+        g=g,
+        crf=crf,
+        preset=preset,
+        extra_options=options,
+    )
 
 
 def _get_episode_value_bounds(ep_values: np.ndarray) -> tuple[float, float]:
@@ -614,7 +634,7 @@ def _export_single_episode(
                 imgs_dir=temp_path,
                 video_path=dst_video_path,
                 fps=fps,
-                vcodec=vcodec,
+                video_encoder=_make_video_encoder_config(vcodec),
                 overwrite=True,
             )
         return dst_video_path
@@ -735,7 +755,7 @@ def _export_single_episode_multiview(
                 imgs_dir=temp_path,
                 video_path=dst_video_path,
                 fps=fps,
-                vcodec=vcodec,
+                video_encoder=_make_video_encoder_config(vcodec),
                 overwrite=True,
             )
         return dst_video_path

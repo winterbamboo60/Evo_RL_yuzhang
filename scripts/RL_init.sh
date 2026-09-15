@@ -1,6 +1,9 @@
 ```bash
 # 此处对外仅暴露lerobot-setup-can
 
+# 自动执行，但只允许修改当前项目
+codex --sandbox workspace-write --ask-for-approval never
+
 Step0. 主从臂都设置成从动模式
 
 Step1. 切换环境
@@ -10,11 +13,19 @@ Step1. 切换环境
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
 /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
 
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-/home/lenovo/code/envs/package_sorting_env/bin/conda-unpack
+source /home/lenovo/code/envs/evo_0911/bin/activate
+/home/lenovo/code/envs/evo_0911/bin/conda-unpack
 
 source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
 /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/conda-unpack
+
+# lerobot 0.6.1环境
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
+
+# 百度云激活环境
+export CONDA_PREFIX=/mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw; export PATH="$CONDA_PREFIX/bin:$PATH"
+
 
 # 适配固件版本：PIPER合并固件_MC(S-V1.9-0)_DRV(V2.0.7 ).bin
 # 卸载当前 0.6.1
@@ -89,7 +100,7 @@ done
 
 
 Step3. 初始化CAN口
-
+source /home/lenovo/code/envs/evo_0911/bin/activate
 lerobot-setup-can --mode=setup --interfaces=can0,can1
 
 默认 CAN 映射：
@@ -117,25 +128,25 @@ conda activate lerobot; cd ~/VLA/lerobot/src/; PYTHONPATH=. python lerobot/find_
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
 source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate; cd /home/hpc/yuzhang/Evo-RL-loop-0817/src; PYTHONPATH=. python lerobot/find_cameras.py realsense
 
-rm -r /home/lenovo/code/Evo-RL-loop-0901/src/outputs/captured_images
-source /home/lenovo/code/envs/package_sorting_env/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0901/src; PYTHONPATH=. python lerobot/find_cameras.py opencv
-source /home/lenovo/code/envs/package_sorting_env/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0901/src; PYTHONPATH=. python lerobot/find_cameras.py realsense --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check
+mkdir -p /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
+source /home/lenovo/code/envs/evo_0911/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras opencv
+source /home/lenovo/code/envs/evo_0911/bin/activate; cd /home/lenovo/code/Evo-RL-loop-0911; lerobot-find-cameras realsense --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check
 
 # Step6. 使用与 RL_data.sh 相同的双 RealSense 参数抓取彩色快照
 (
-  source /home/lenovo/code/envs/package_sorting_env/bin/activate
-  cd /home/lenovo/code/Evo-RL-loop-0901/src
-  PYTHONPATH=. python lerobot/find_cameras.py realsense \
+  source /home/lenovo/code/envs/evo_0911/bin/activate
+  cd /home/lenovo/code/Evo-RL-loop-0911
+  lerobot-find-cameras realsense \
     --camera-configs '{"260422275773":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"260422275792":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":14000,"manual_gain":16,"white_balance_kelvin":3860},"261822303677":{"width":640,"height":480,"fps":30,"use_depth":false,"warmup_s":2,"exposure_mode":"manual","manual_exposure_us":9000,"manual_gain":76,"white_balance_kelvin":3800}}' \
     --record-time-s 2 \
-    --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check_2
+    --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check_2
 )
 
 (
-    source /home/lenovo/code/envs/package_sorting_env/bin/activate
-    cd /home/lenovo/code/Evo-RL-loop-0901/src
+    source /home/lenovo/code/envs/evo_0911/bin/activate
+    cd /home/lenovo/code/Evo-RL-loop-0911
 
-    PYTHONPATH=. python lerobot/find_cameras.py realsense \
+    lerobot-find-cameras realsense \
       --camera-configs '{
         "260422275773": {
           "width": 640,
@@ -172,5 +183,5 @@ source /home/lenovo/code/envs/package_sorting_env/bin/activate; cd /home/lenovo/
         }
       }' \
       --record-time-s 2 \
-      --output-dir /home/lenovo/code/Evo-RL-loop-0901/outputs/camera_check_2
+      --output-dir /home/lenovo/code/Evo-RL-loop-0911/outputs/camera_check_2
 )

@@ -32,8 +32,9 @@ from tqdm.auto import tqdm
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.value import ValueInferencePipelineConfig
+from lerobot.datasets.io_utils import load_info, write_info, write_table_one_row_group_per_episode
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import load_info, write_info
+from lerobot.datasets.storage import DEFAULT_STORAGE_FORMAT
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.scripts.value_infer_viz import (
     _export_overlay_videos,
@@ -47,7 +48,11 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.recording_annotations import EPISODE_SUCCESS, resolve_episode_success_label
+from lerobot.utils.recording_annotations import (
+    EPISODE_SUCCESS,
+    INTERVENTION_FIELD_ALIASES,
+    resolve_episode_success_from_mapping,
+)
 from lerobot.utils.utils import init_logging, inside_slurm
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
 from lerobot.values.pistar06.modeling_pistar06 import (
@@ -139,7 +144,10 @@ def _load_dataset_distributed(cfg: ValueInferencePipelineConfig, accelerator: Ac
         "root": cfg.dataset.root,
         "episodes": cfg.dataset.episodes,
         "revision": cfg.dataset.revision,
+        "repo_type": cfg.dataset.repo_type,
         "download_videos": cfg.dataset.download_videos,
+        "video_backend": cfg.dataset.video_backend,
+        "return_uint8": cfg.dataset.return_uint8,
     }
 
     if accelerator.is_main_process:
@@ -185,22 +193,23 @@ def _build_episode_info(
     episodes_ds = dataset.meta.episodes.with_format(None)
     episodes = episodes_ds[:]
     n_episodes = len(episodes_ds)
-    has_success = success_field in episodes_ds.column_names
-
     episode_info: dict[int, EpisodeTargetInfo] = {}
     task_max_length: dict[int, int] = {}
     for i in range(n_episodes):
         ep_idx = int(episodes["episode_index"][i])
         ep_length = int(episodes["length"][i])
         tasks = episodes["tasks"][i]
-        task_name = tasks[0] if isinstance(tasks, list) else tasks
+        if hasattr(tasks, "tolist") and not isinstance(tasks, str):
+            tasks = tasks.tolist()
+        task_name = tasks[0] if isinstance(tasks, (list, tuple)) else tasks
         if task_name not in dataset.meta.tasks.index:
             raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.")
         task_index = int(dataset.meta.tasks.loc[task_name].task_index)
 
-        explicit_success = episodes[success_field][i] if has_success else None
-        resolved_success = resolve_episode_success_label(
-            explicit_success,
+        episode_row = {name: episodes[name][i] for name in episodes_ds.column_names}
+        resolved_success = resolve_episode_success_from_mapping(
+            episode_row,
+            preferred_field=success_field,
             default_label=default_success,
             require_label=True,
         )
@@ -324,7 +333,7 @@ def _binarize_advantages(
 def _update_feature_metadata(dataset_root: Path, feature_infos: dict[str, dict[str, Any]]) -> None:
     info = load_info(dataset_root)
     for feature_name, feature_info in feature_infos.items():
-        info["features"][feature_name] = {
+        info.features[feature_name] = {
             "dtype": feature_info["dtype"],
             "shape": tuple(feature_info["shape"]),
             "names": feature_info.get("names"),
@@ -394,7 +403,12 @@ def _write_columns_in_place(
             else:
                 new_table = new_table.append_column(field, array)
 
-        pq.write_table(new_table, parquet_path, compression="snappy")
+        tmp_path = parquet_path.with_suffix(parquet_path.suffix + ".tmp")
+        try:
+            write_table_one_row_group_per_episode(new_table, tmp_path)
+            tmp_path.replace(parquet_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     _update_feature_metadata(dataset_root=dataset_root, feature_infos=feature_infos)
 
@@ -471,13 +485,19 @@ def run_value_inference_pipeline(
 
     # 分布式安全加载
     dataset = _load_dataset_distributed(cfg, accelerator)
+    storage_format = getattr(dataset.meta, "storage_format", DEFAULT_STORAGE_FORMAT)
+    if storage_format != DEFAULT_STORAGE_FORMAT:
+        raise NotImplementedError(
+            "In-place value annotation currently supports the standard parquet dataset layout only; "
+            f"got storage_format={storage_format!r}. Export to the standard LeRobot layout first."
+        )
     raw_frames = dataset.hf_dataset.with_format(None)
     frame_count = len(raw_frames)
     if frame_count == 0:
         raise ValueError("Dataset has no frames.")
 
     if not cfg.acp.enable:
-        # 
+        #
         viz_outputs: list[str] = []
         if accelerator.is_main_process:
             logging.info(
@@ -590,8 +610,16 @@ def run_value_inference_pipeline(
     episode_indices = np.asarray(raw_frames["episode_index"], dtype=np.int64)
     frame_indices = np.asarray(raw_frames["frame_index"], dtype=np.int64)
 
-    if cfg.acp.intervention_field in raw_frames.column_names:
-        interventions = np.asarray(raw_frames[cfg.acp.intervention_field], dtype=np.float32)
+    intervention_field = next(
+        (
+            field
+            for field in dict.fromkeys((cfg.acp.intervention_field, *INTERVENTION_FIELD_ALIASES))
+            if field in raw_frames.column_names
+        ),
+        None,
+    )
+    if intervention_field is not None:
+        interventions = np.asarray(raw_frames[intervention_field], dtype=np.float32).reshape(-1)
     else:
         interventions = np.zeros(frame_count, dtype=np.float32)
 
@@ -750,12 +778,20 @@ def run_value_inference_pipeline(
 
         logging.info("Wrote value annotations to dataset root: %s", dataset.root)
 
-        # Sync computed columns into the in-memory hf_dataset so viz can read them
-        # 将价值分数叠加到视频帧上，导出 overlay 视频便于人工审查
-        for field, values in columns.items():
-            if field in dataset.hf_dataset.column_names:
-                dataset.hf_dataset = dataset.hf_dataset.remove_columns([field])
-            dataset.hf_dataset = dataset.hf_dataset.add_column(field, values.tolist())
+        # The current LeRobotDataset exposes ``hf_dataset`` as a read-only facade
+        # property. Reload after the atomic parquet rewrites so visualization reads
+        # the updated schema instead of assigning to that property (the 0901 API).
+        if cfg.viz.enable:
+            dataset = LeRobotDataset(
+                repo_id=dataset.repo_id,
+                root=dataset.root,
+                episodes=cfg.dataset.episodes,
+                revision=cfg.dataset.revision,
+                repo_type=cfg.dataset.repo_type,
+                download_videos=cfg.dataset.download_videos,
+                video_backend=cfg.dataset.video_backend,
+                return_uint8=cfg.dataset.return_uint8,
+            )
 
         viz_outputs: list[str] = []
         if cfg.viz.enable:

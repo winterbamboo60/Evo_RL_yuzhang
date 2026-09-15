@@ -17,122 +17,263 @@
 """
 Edit LeRobot datasets using various transformation tools.
 
+Requires: pip install 'lerobot[dataset]'
+
 This script allows you to delete episodes, split datasets, merge datasets,
-remove features, modify tasks, and convert image datasets to video format.
+remove features, modify tasks, recompute stats, and convert image datasets to video format.
 When new_repo_id is specified, creates a new dataset.
+
+Path semantics (v2): --root and --new_root are exact dataset folders containing
+meta/, data/, videos/. When omitted, defaults to $HF_LEROBOT_HOME/{repo_id}.
 
 Usage Examples:
 
 Delete episodes 0, 2, and 5 from a dataset:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
 
-Delete episodes and save to a new dataset:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+Delete episodes from a local dataset at a specific path:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --root /path/to/pusht \
+        --operation.type delete_episodes \
+        --operation.episode_indices "[0, 2, 5]"
+
+Delete episodes and save to a new dataset at a specific path and with a new repo_id:
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --new_repo_id lerobot/pusht_filtered \
+        --new_root /path/to/pusht_filtered \
         --operation.type delete_episodes \
         --operation.episode_indices "[0, 2, 5]"
 
-Split dataset by fractions:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+Split dataset by fractions (pusht_train, pusht_val):
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type split \
         --operation.splits '{"train": 0.8, "val": 0.2}'
 
+Split dataset by fractions and save split datasets to a specific folder (base_folder/train, base_folder/val):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_root /path/to/base_folder \
+        --operation.type split \
+        --operation.splits '{"train": 0.8, "val": 0.2}'
+
 Split dataset by episode indices:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type split \
         --operation.splits '{"train": [0, 1, 2, 3], "val": [4, 5]}'
 
 Split into more than two splits:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type split \
         --operation.splits '{"train": 0.6, "val": 0.2, "test": 0.2}'
 
 Merge multiple datasets:
-    python -m lerobot.scripts.lerobot_edit_dataset \
-        --repo_id lerobot/pusht_merged \
+    lerobot-edit-dataset \
+        --new_repo_id lerobot/pusht_merged \
         --operation.type merge \
         --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']"
 
-Merge all datasets found recursively under a local directory:
-    python -m lerobot.scripts.lerobot_edit_dataset \
-        --repo_id pusht_merged \
+Merge multiple datasets to a specific output path:
+    lerobot-edit-dataset \
+        --new_repo_id lerobot/pusht_merged \
+        --new_root /path/to/pusht_merged \
+        --operation.type merge \
+        --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']"
+
+Merge multiple datasets from a list of local dataset paths:
+    lerobot-edit-dataset \
+        --new_repo_id lerobot/pusht_merged \
+        --operation.type merge \
+        --operation.repo_ids "['pusht_train', 'pusht_val']" \
+        --operation.roots "['/path/to/pusht_train', '/path/to/pusht_val']"
+
+Merge multiple datasets while keeping one file per source file (no video/data stitching):
+    lerobot-edit-dataset \
+        --new_repo_id lerobot/pusht_merged \
+        --operation.type merge \
+        --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']" \
+        --operation.concatenate_videos false \
+        --operation.concatenate_data false
+
+Evo-RL 0901 compatibility: recursively merge all datasets below a local directory:
+    lerobot-edit-dataset \
+        --repo_id /path/to/pusht_merged \
         --operation.type merge \
         --operation.source_dir /path/to/datasets_parent
 
+For new scripts, prefer the explicit --new_repo_id/--new_root/--operation.roots form above.
+
 Remove camera feature:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type remove_feature \
-        --operation.feature_names "['observation.images.top']"
+        --operation.feature_names "['observation.image']"
 
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type modify_tasks \
         --operation.new_task "Pick up the cube and place it"
 
 Modify tasks - set different tasks for specific episodes (WARNING: modifies in-place):
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type modify_tasks \
         --operation.episode_tasks '{"0": "Task A", "1": "Task B", "2": "Task A"}'
 
 Modify tasks - set default task with overrides for specific episodes (WARNING: modifies in-place):
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type modify_tasks \
         --operation.new_task "Default task" \
         --operation.episode_tasks '{"5": "Special task for episode 5"}'
 
+Modify tasks - replace existing task strings in-place (WARNING: modifies in-place):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type modify_tasks \
+        --operation.task_replacements '{"Pick up the red cube": "Lift the red cube"}'
+
 Convert image dataset to video format and save locally:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
+        --new_root /path/to/output/pusht_video \
+        --operation.type convert_image_to_video
+
+Convert image dataset (with depth maps) to video format, customizing the depth encoder:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht_image \
+        --new_root /path/to/output/pusht_video \
         --operation.type convert_image_to_video \
-        --operation.output_dir /path/to/output/pusht_video
+        --operation.depth_encoder.depth_min 0.01 \
+        --operation.depth_encoder.depth_max 10.0 \
+        --operation.depth_encoder.use_log true
 
 Convert image dataset to video format and save with new repo_id:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
         --new_repo_id lerobot/pusht_video \
         --operation.type convert_image_to_video
 
 Convert image dataset to video format and push to hub:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
         --new_repo_id lerobot/pusht_video \
         --operation.type convert_image_to_video \
         --push_to_hub true
 
+Show dataset information:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht_image \
+        --operation.type info \
+        --operation.show_features true
+
+Show dataset information without feature details:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht_image \
+        --operation.type info \
+        --operation.show_features false
+
+Recompute dataset statistics (saves to lerobot/pusht_recomputed_stats by default):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type recompute_stats
+
+Recompute stats and save to a specific new repo_id:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_new_stats \
+        --operation.type recompute_stats
+
+Recompute stats in-place (overwrites original dataset stats):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht \
+        --operation.type recompute_stats \
+        --operation.overwrite true
+
+Recompute stats for relative actions and push to hub:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type recompute_stats \
+        --operation.relative_action true \
+        --operation.chunk_size 50 \
+        --operation.relative_exclude_joints "['gripper']" \
+        --operation.num_workers 4 \
+        --push_to_hub true
+
+Re-encode all videos in a dataset (saves to lerobot/pusht_reencoded by default):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.rgb_encoder.pix_fmt yuv420p \
+        --operation.rgb_encoder.crf 23
+
+Re-encode videos into a new dataset using 4 parallel processes:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_h264 \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.rgb_encoder.crf 23 \
+        --operation.num_workers 4
+
+Re-encode videos in-place (overwrites original dataset):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.overwrite true
+
+Re-encode both RGB and depth videos in a dataset (depth quantization params are preserved):
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht_depth \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.depth_encoder.extra_options '{"x265-params": "lossless=1"}'
+
 Using JSON config file:
-    python -m lerobot.scripts.lerobot_edit_dataset \
+    lerobot-edit-dataset \
         --config_path path/to/edit_config.json
 """
 
 import abc
 import logging
+import os
 import shutil
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import draccus
 
-from lerobot.configs import parser
-from lerobot.datasets.dataset_tools import (
+from lerobot.configs import (
+    DepthEncoderConfig,
+    RGBEncoderConfig,
+    depth_encoder_defaults,
+    parser,
+    rgb_encoder_defaults,
+)
+from lerobot.datasets import (
+    LeRobotDataset,
     convert_image_to_video_dataset,
     delete_episodes,
     merge_datasets,
     modify_tasks,
+    recompute_stats,
+    reencode_dataset,
     remove_feature,
     split_dataset,
 )
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
 
@@ -160,7 +301,12 @@ class SplitConfig(OperationConfig):
 @dataclass
 class MergeConfig(OperationConfig):
     repo_ids: list[str] | None = None
+    roots: list[str] | None = None
+    # Evo-RL 0901 compatibility: recursively discover datasets below a local parent directory.
     source_dir: str | None = None
+    # When False, keep one file per source file instead of packing into shards.
+    concatenate_videos: bool = True
+    concatenate_data: bool = True
 
 
 @OperationConfig.register_subclass("remove_feature")
@@ -174,39 +320,74 @@ class RemoveFeatureConfig(OperationConfig):
 class ModifyTasksConfig(OperationConfig):
     new_task: str | None = None
     episode_tasks: dict[str, str] | None = None
+    task_replacements: dict[str, str] | None = None
 
 
 @OperationConfig.register_subclass("convert_image_to_video")
 @dataclass
 class ConvertImageToVideoConfig(OperationConfig):
     output_dir: str | None = None
-    vcodec: str = "libsvtav1"
-    pix_fmt: str = "yuv420p"
-    g: int = 2
-    crf: int = 30
-    fast_decode: int = 0
+    rgb_encoder: RGBEncoderConfig = field(default_factory=rgb_encoder_defaults)
+    depth_encoder: DepthEncoderConfig = field(default_factory=depth_encoder_defaults)
     episode_indices: list[int] | None = None
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
 
 
+@OperationConfig.register_subclass("recompute_stats")
+@dataclass
+class RecomputeStatsConfig(OperationConfig):
+    skip_image_video: bool = True
+    relative_action: bool = False
+    relative_exclude_joints: list[str] | None = None
+    chunk_size: int = 50
+    num_workers: int = 0
+    overwrite: bool = False
+
+
+@OperationConfig.register_subclass("reencode_videos")
+@dataclass
+class ReencodeVideosConfig(OperationConfig):
+    rgb_encoder: RGBEncoderConfig = field(default_factory=rgb_encoder_defaults)
+    depth_encoder: DepthEncoderConfig = field(default_factory=depth_encoder_defaults)
+    num_workers: int = 0
+    encoder_threads: int | None = None
+    overwrite: bool = False
+
+
+@OperationConfig.register_subclass("info")
+@dataclass
+class InfoConfig(OperationConfig):
+    show_features: bool = False
+
+
 @dataclass
 class EditDatasetConfig:
-    repo_id: str
+    # Operation configuration.
     operation: OperationConfig
+    # Input dataset identifier. Always required unless for Merge operation.
+    repo_id: str | None = None
+    # Root directory where the input dataset is stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | None = None
+    # Edited dataset identifier. When both new_repo_id (resp. new_root) and repo_id (resp. root) are identical, modifications are applied in-place and a backup of the original dataset is created. Required for Merge operation.
     new_repo_id: str | None = None
+    # Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/new_repo_id. For Split operation, this is the base directory for the split datasets.
+    new_root: str | None = None
+    # Upload dataset to Hugging Face hub.
     push_to_hub: bool = False
 
 
 def _discover_lerobot_dataset_dirs(source_dir: str | Path) -> list[Path]:
+    """Return all LeRobot dataset roots below a local parent, in stable path order."""
     parent = Path(source_dir).expanduser().resolve()
     if not parent.is_dir():
         raise FileNotFoundError(f"Merge source_dir does not exist or is not a directory: {parent}")
 
-    dataset_dirs = {info_path.parent.parent for info_path in parent.rglob("meta/info.json")}
-    dataset_dirs = sorted(dataset_dirs, key=lambda p: p.relative_to(parent).as_posix())
+    dataset_dirs = sorted(
+        {info_path.parent.parent for info_path in parent.rglob("meta/info.json")},
+        key=lambda path: path.relative_to(parent).as_posix(),
+    )
     if not dataset_dirs:
         raise FileNotFoundError(
             f"No LeRobot datasets found under {parent}. "
@@ -217,31 +398,67 @@ def _discover_lerobot_dataset_dirs(source_dir: str | Path) -> list[Path]:
 
 def _repo_id_from_dataset_dir(dataset_dir: Path, source_dir: str | Path) -> str:
     parent = Path(source_dir).expanduser().resolve()
-    rel = dataset_dir.resolve().relative_to(parent).as_posix()
-    return dataset_dir.name if rel == "." else rel
+    relative = dataset_dir.resolve().relative_to(parent).as_posix()
+    return dataset_dir.name if relative == "." else relative
 
 
-def _same_path(left: Path, right: Path) -> bool:
-    return left.expanduser().resolve() == right.expanduser().resolve()
+def _resolve_legacy_merge_output(repo_id: str, root: str | Path | None) -> tuple[str, Path]:
+    """Map the Evo-RL 0901 merge output syntax onto the current output fields."""
+    candidate = Path(repo_id).expanduser()
+    if candidate.is_absolute():
+        output_dir = candidate.resolve()
+        return f"local/{output_dir.name}", output_dir
+
+    output_dir = (Path(root) / repo_id if root else HF_LEROBOT_HOME / repo_id).expanduser().resolve()
+    return repo_id, output_dir
 
 
-def get_output_path(repo_id: str, new_repo_id: str | None, root: Path | None) -> tuple[str, Path]:
-    if new_repo_id:
-        output_repo_id = new_repo_id
-        output_dir = root / new_repo_id if root else HF_LEROBOT_HOME / new_repo_id
-    else:
-        output_repo_id = repo_id
-        dataset_path = root / repo_id if root else HF_LEROBOT_HOME / repo_id
-        old_path = Path(str(dataset_path) + "_old")
+def _resolve_io_paths(
+    repo_id: str,
+    new_repo_id: str | None,
+    root: Path | str | None,
+    new_root: Path | str | None,
+    default_new_repo_id: str | None = None,
+) -> tuple[str, Path, Path]:
+    """Resolve input/output paths and repo_id for dataset operations.
 
-        if dataset_path.exists():
-            if old_path.exists():
-                shutil.rmtree(old_path)
-            shutil.move(str(dataset_path), str(old_path))
+    Returns (output_repo_id, input_path, output_path) with resolved (symlink-safe) paths.
+    """
+    input_path = (Path(root) if root else HF_LEROBOT_HOME / repo_id).resolve()
+    output_repo_id = new_repo_id or default_new_repo_id or repo_id
+    output_path = (Path(new_root) if new_root else HF_LEROBOT_HOME / output_repo_id).resolve()
+    return output_repo_id, input_path, output_path
 
-        output_dir = dataset_path
 
-    return output_repo_id, output_dir
+def _is_in_place(input_path: Path, output_path: Path) -> bool:
+    """Whether both paths point to the same dataset directory.
+
+    Uses os.path.samefile (device+inode) which is robust to case-insensitive filesystems, hardlinks
+    and symlinks.
+    """
+    try:
+        return os.path.samefile(input_path, output_path)
+    except OSError:
+        return False
+
+
+def get_output_path(
+    repo_id: str,
+    new_repo_id: str | None,
+    root: Path | str | None,
+    new_root: Path | str | None,
+) -> tuple[str, Path, Path | None]:
+    output_repo_id, input_path, output_path = _resolve_io_paths(repo_id, new_repo_id, root, new_root)
+
+    # In case of in-place modification, create a backup of the original dataset (if it exists).
+    backup_path: Path | None = None
+    if _is_in_place(input_path, output_path):
+        backup_path = input_path.with_name(input_path.name + "_old")
+        if backup_path.exists():
+            shutil.rmtree(backup_path)
+        shutil.move(input_path, backup_path)
+
+    return output_repo_id, output_path, backup_path
 
 
 def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
@@ -252,12 +469,16 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
         raise ValueError("episode_indices must be specified for delete_episodes operation")
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
-    output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    output_repo_id, output_dir, backup_path = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
     )
 
-    if cfg.new_repo_id is None:
-        dataset.root = Path(str(dataset.root) + "_old")
+    # In case of in-place modification, make the dataset point to the backup directory
+    if backup_path is not None:
+        dataset.root = backup_path
 
     logging.info(f"Deleting episodes {cfg.operation.episode_indices} from {cfg.repo_id}")
     new_dataset = delete_episodes(
@@ -284,19 +505,27 @@ def handle_split(cfg: EditDatasetConfig) -> None:
             "splits dict must be specified with split names as keys and fractions/episode lists as values"
         )
 
+    if cfg.new_repo_id is not None:
+        logging.warning(
+            "split uses the original dataset identifier --repo_id to generate split names. The --new_repo_id parameter is ignored."
+        )
+
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
 
     logging.info(f"Splitting dataset {cfg.repo_id} with splits: {cfg.operation.splits}")
-    split_datasets = split_dataset(dataset, splits=cfg.operation.splits)
+    split_datasets = split_dataset(
+        dataset,
+        splits=cfg.operation.splits,
+        output_dir=cfg.new_root,
+    )
 
     for split_name, split_ds in split_datasets.items():
-        split_repo_id = f"{cfg.repo_id}_{split_name}"
         logging.info(
             f"{split_name}: {split_ds.meta.total_episodes} episodes, {split_ds.meta.total_frames} frames"
         )
 
         if cfg.push_to_hub:
-            logging.info(f"Pushing {split_name} split to hub as {split_repo_id}")
+            logging.info(f"Pushing {split_name} split to hub as {split_ds.repo_id}")
             LeRobotDataset(split_ds.repo_id, root=split_ds.root).push_to_hub()
 
 
@@ -307,25 +536,49 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     if not cfg.operation.repo_ids and not cfg.operation.source_dir:
         raise ValueError("Either repo_ids or source_dir must be specified for merge operation")
 
-    if not cfg.repo_id:
-        raise ValueError("repo_id must be specified as the output repository for merged dataset")
+    if cfg.new_repo_id is None:
+        if not cfg.repo_id:
+            raise ValueError(
+                "Legacy source_dir merge requires --repo_id as its output path or repository identifier"
+            )
+        output_repo_id, output_dir = _resolve_legacy_merge_output(cfg.repo_id, cfg.root)
+        logging.warning(
+            "Using Evo-RL 0901 merge compatibility: --repo_id selects the output. "
+            "Prefer --new_repo_id and --new_root for new commands."
+        )
+    else:
+        output_repo_id = cfg.new_repo_id
+        output_dir = Path(cfg.new_root) if cfg.new_root else HF_LEROBOT_HOME / output_repo_id
+        if cfg.repo_id is not None or cfg.root is not None:
+            logging.warning(
+                "merge uses --new_repo_id and --new_root for the merged dataset. "
+                "The --repo_id and --root parameters are ignored."
+            )
 
-    output_dir = Path(cfg.root) / cfg.repo_id if cfg.root else HF_LEROBOT_HOME / cfg.repo_id
+    output_dir = output_dir.expanduser().resolve()
+    if output_dir.exists():
+        raise FileExistsError(
+            f"Merge output directory already exists: {output_dir}. "
+            "Choose a new output directory to avoid duplicate or partial merges."
+        )
 
     merge_sources: list[tuple[str, str | Path | None]] = []
-    if cfg.operation.repo_ids:
-        merge_sources.extend((repo_id, cfg.root) for repo_id in cfg.operation.repo_ids)
+    if cfg.operation.repo_ids and cfg.operation.roots:
+        if len(cfg.operation.roots) != len(cfg.operation.repo_ids):
+            raise ValueError("repo_ids and roots must have the same length for merge operation")
+        merge_sources.extend(zip(cfg.operation.repo_ids, cfg.operation.roots, strict=True))
+    elif cfg.operation.repo_ids:
+        merge_sources.extend((repo_id, None) for repo_id in cfg.operation.repo_ids)
 
     if cfg.operation.source_dir:
         source_dir = Path(cfg.operation.source_dir).expanduser().resolve()
         discovered_dirs = _discover_lerobot_dataset_dirs(source_dir)
         logging.info(f"Found {len(discovered_dirs)} datasets under {source_dir}")
         for dataset_dir in discovered_dirs:
-            if _same_path(dataset_dir, output_dir):
+            if dataset_dir.resolve() == output_dir:
                 logging.info(f"Skipping output dataset directory discovered in source_dir: {dataset_dir}")
                 continue
-            repo_id = _repo_id_from_dataset_dir(dataset_dir, source_dir)
-            merge_sources.append((repo_id, dataset_dir))
+            merge_sources.append((_repo_id_from_dataset_dir(dataset_dir, source_dir), dataset_dir))
 
     if not merge_sources:
         raise ValueError("No input datasets found for merge operation")
@@ -333,13 +586,15 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     logging.info(f"Loading {len(merge_sources)} datasets to merge")
     for repo_id, root in merge_sources:
         logging.info(f"  source: repo_id={repo_id}, root={root}")
-    datasets = [LeRobotDataset(repo_id, root=root) for repo_id, root in merge_sources]
+    datasets = [LeRobotDataset(repo_id=repo_id, root=root) for repo_id, root in merge_sources]
 
-    logging.info(f"Merging datasets into {cfg.repo_id}")
+    logging.info(f"Merging datasets into {output_repo_id}")
     merged_dataset = merge_datasets(
         datasets,
-        output_repo_id=cfg.repo_id,
+        output_repo_id=output_repo_id,
         output_dir=output_dir,
+        concatenate_videos=cfg.operation.concatenate_videos,
+        concatenate_data=cfg.operation.concatenate_data,
     )
 
     logging.info(f"Merged dataset saved to {output_dir}")
@@ -348,7 +603,7 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     )
 
     if cfg.push_to_hub:
-        logging.info(f"Pushing to hub as {cfg.repo_id}")
+        logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(merged_dataset.repo_id, root=output_dir).push_to_hub()
 
 
@@ -360,12 +615,16 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
         raise ValueError("feature_names must be specified for remove_feature operation")
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
-    output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    output_repo_id, output_dir, backup_path = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
     )
 
-    if cfg.new_repo_id is None:
-        dataset.root = Path(str(dataset.root) + "_old")
+    # In case of in-place modification, make the dataset point to the backup directory
+    if backup_path is not None:
+        dataset.root = backup_path
 
     logging.info(f"Removing features {cfg.operation.feature_names} from {cfg.repo_id}")
     new_dataset = remove_feature(
@@ -389,13 +648,17 @@ def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
 
     new_task = cfg.operation.new_task
     episode_tasks_raw = cfg.operation.episode_tasks
+    task_replacements = cfg.operation.task_replacements
 
-    if new_task is None and episode_tasks_raw is None:
-        raise ValueError("Must specify at least one of new_task or episode_tasks for modify_tasks operation")
+    if new_task is None and episode_tasks_raw is None and task_replacements is None:
+        raise ValueError(
+            "Must specify at least one of new_task, episode_tasks, or task_replacements for modify_tasks operation"
+        )
 
-    # Warn about in-place modification behavior
-    if cfg.new_repo_id is not None:
-        logging.warning("modify_tasks modifies datasets in-place. The --new_repo_id parameter is ignored.")
+    if cfg.new_repo_id is not None or cfg.new_root is not None:
+        logging.warning(
+            "modify_tasks modifies datasets in-place. The --new_repo_id and --new_root parameters are ignored."
+        )
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
     logging.warning(f"Modifying dataset in-place at {dataset.root}. Original data will be overwritten.")
@@ -410,11 +673,14 @@ def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
         logging.info(f"  Default task: '{new_task}'")
     if episode_tasks:
         logging.info(f"  Episode-specific tasks: {episode_tasks}")
+    if task_replacements:
+        logging.info(f"  Task replacements: {task_replacements}")
 
     modified_dataset = modify_tasks(
         dataset,
         new_task=new_task,
         episode_tasks=episode_tasks,
+        task_replacements=task_replacements,
     )
 
     logging.info(f"Dataset modified at {dataset.root}")
@@ -431,32 +697,30 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
 
     # Determine output directory and repo_id
-    # Priority: 1) new_repo_id, 2) operation.output_dir, 3) auto-generated name
+    # Priority: 1) new_root, 2) new_repo_id, 3) operation.output_dir, 4) auto-generated name
     output_dir_config = getattr(cfg.operation, "output_dir", None)
+    if output_dir_config:
+        logging.warning(
+            "--operation.output_dir is deprecated and will be removed in future versions. "
+            "Please use --new_root instead."
+        )
 
-    if cfg.new_repo_id:
-        # Use new_repo_id for both local storage and hub push
+    if cfg.new_root:
+        output_dir = Path(cfg.new_root)
+        output_repo_id = cfg.new_repo_id or f"{cfg.repo_id}_video"
+        logging.info(f"Saving to new_root: {output_dir} as {output_repo_id}")
+    elif cfg.new_repo_id:
         output_repo_id = cfg.new_repo_id
-        # Place new dataset as a sibling to the original dataset
-        # Get the parent of the actual dataset root (not cfg.root which might be the lerobot cache dir)
-        # Extract just the dataset name (after last slash) for the local directory
-        local_dir_name = cfg.new_repo_id.split("/")[-1]
-        output_dir = dataset.root.parent / local_dir_name
+        output_dir = HF_LEROBOT_HOME / cfg.new_repo_id
         logging.info(f"Saving to new dataset: {cfg.new_repo_id} at {output_dir}")
     elif output_dir_config:
-        # Use custom output directory for local-only storage
         output_dir = Path(output_dir_config)
-        # Extract repo name from output_dir for the dataset
         output_repo_id = output_dir.name
-        logging.info(f"Saving to local directory: {output_dir}")
+        logging.info(f"Saving to local directory: {output_dir} as {output_repo_id}")
     else:
-        # Auto-generate name: append "_video" to original repo_id
         output_repo_id = f"{cfg.repo_id}_video"
-        # Place new dataset as a sibling to the original dataset
-        # Extract just the dataset name (after last slash) for the local directory
-        local_dir_name = output_repo_id.split("/")[-1]
-        output_dir = dataset.root.parent / local_dir_name
-        logging.info(f"Saving to auto-generated location: {output_dir}")
+        output_dir = HF_LEROBOT_HOME / output_repo_id
+        logging.info(f"Saving to auto-generated location: {output_dir} as {output_repo_id}")
 
     logging.info(f"Converting dataset {cfg.repo_id} to video format")
 
@@ -464,11 +728,8 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
         dataset=dataset,
         output_dir=output_dir,
         repo_id=output_repo_id,
-        vcodec=getattr(cfg.operation, "vcodec", "libsvtav1"),
-        pix_fmt=getattr(cfg.operation, "pix_fmt", "yuv420p"),
-        g=getattr(cfg.operation, "g", 2),
-        crf=getattr(cfg.operation, "crf", 30),
-        fast_decode=getattr(cfg.operation, "fast_decode", 0),
+        rgb_encoder=getattr(cfg.operation, "rgb_encoder", None) or rgb_encoder_defaults(),
+        depth_encoder=getattr(cfg.operation, "depth_encoder", None) or depth_encoder_defaults(),
         episode_indices=getattr(cfg.operation, "episode_indices", None),
         num_workers=getattr(cfg.operation, "num_workers", 4),
         max_episodes_per_batch=getattr(cfg.operation, "max_episodes_per_batch", None),
@@ -488,8 +749,184 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
         logging.info("Dataset saved locally (not pushed to hub)")
 
 
+def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RecomputeStatsConfig):
+        raise ValueError("Operation config must be RecomputeStatsConfig")
+
+    # Determine whether this is an in-place operation
+    output_repo_id, input_root, output_root = _resolve_io_paths(
+        cfg.repo_id,
+        cfg.new_repo_id,
+        cfg.root,
+        cfg.new_root,
+        default_new_repo_id=f"{cfg.repo_id}_recomputed_stats",
+    )
+    in_place = _is_in_place(input_root, output_root)
+
+    if in_place and not cfg.operation.overwrite:
+        raise ValueError(
+            f"recompute_stats would overwrite the dataset in-place at {input_root}. "
+            "Pass --operation.overwrite true to allow in-place modification, "
+            "or use --new_repo_id / --new_root to write to a different location. "
+            f"Default output repo_id when neither is set: '{cfg.repo_id}_recomputed_stats'."
+        )
+
+    if in_place:
+        logging.warning(
+            f"Overwriting dataset stats in-place at {input_root}. The original stats will be lost."
+        )
+        dataset = LeRobotDataset(cfg.repo_id, root=input_root)
+    else:
+        logging.info(f"Copying dataset from {input_root} to {output_root}")
+        if output_root.exists():
+            backup_path = output_root.with_name(output_root.name + "_old")
+            logging.warning(f"Output directory {output_root} already exists. Moving to {backup_path}")
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            shutil.move(output_root, backup_path)
+        shutil.copytree(input_root, output_root)
+        dataset = LeRobotDataset(output_repo_id, root=output_root)
+
+    logging.info(f"Recomputing stats for {cfg.repo_id}")
+    if cfg.operation.relative_action:
+        logging.info(
+            f"Relative action stats enabled (chunk_size={cfg.operation.chunk_size}, "
+            f"exclude_joints={cfg.operation.relative_exclude_joints})"
+        )
+
+    recompute_stats(
+        dataset,
+        skip_image_video=cfg.operation.skip_image_video,
+        relative_action=cfg.operation.relative_action,
+        relative_exclude_joints=cfg.operation.relative_exclude_joints,
+        chunk_size=cfg.operation.chunk_size,
+        num_workers=cfg.operation.num_workers,
+    )
+
+    logging.info(f"Stats written to {dataset.root}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {dataset.repo_id}...")
+        dataset.push_to_hub()
+
+
+def handle_reencode_videos(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ReencodeVideosConfig):
+        raise ValueError("Operation config must be ReencodeVideosConfig")
+
+    output_repo_id, input_root, output_root = _resolve_io_paths(
+        cfg.repo_id,
+        cfg.new_repo_id,
+        cfg.root,
+        cfg.new_root,
+        default_new_repo_id=f"{cfg.repo_id}_reencoded",
+    )
+    in_place = _is_in_place(input_root, output_root)
+
+    if in_place and not cfg.operation.overwrite:
+        raise ValueError(
+            f"reencode_videos would overwrite the dataset in-place at {input_root}. "
+            "Pass --operation.overwrite true to allow in-place modification, "
+            "or use --new_repo_id / --new_root to write to a different location. "
+            f"Default output repo_id when neither is set: '{cfg.repo_id}_reencoded'."
+        )
+
+    if in_place:
+        logging.warning(
+            f"Overwriting dataset videos in-place at {input_root}. The original videos will be lost."
+        )
+        dataset = LeRobotDataset(cfg.repo_id, root=input_root)
+    else:
+        logging.info(f"Copying dataset from {input_root} to {output_root}")
+        if output_root.exists():
+            backup_path = output_root.with_name(output_root.name + "_old")
+            logging.warning(f"Output directory {output_root} already exists. Moving to {backup_path}")
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            shutil.move(output_root, backup_path)
+        shutil.copytree(input_root, output_root)
+        dataset = LeRobotDataset(output_repo_id, root=output_root)
+
+    logging.info(
+        f"Re-encoding videos in {output_repo_id} with RGB encoder {cfg.operation.rgb_encoder} "
+        f"and depth encoder {cfg.operation.depth_encoder}"
+    )
+    reencode_dataset(
+        dataset,
+        rgb_encoder=cfg.operation.rgb_encoder,
+        depth_encoder=cfg.operation.depth_encoder,
+        encoder_threads=cfg.operation.encoder_threads,
+        num_workers=cfg.operation.num_workers,
+    )
+
+    logging.info(f"All videos re-encoded at {dataset.root}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}...")
+        dataset.push_to_hub()
+
+
+def _get_dataset_size(repo_path):
+    import os
+
+    total = 0
+    with os.scandir(repo_path) as it:
+        for entry in it:
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += _get_dataset_size(entry.path)
+    return total
+
+
+def handle_info(cfg: EditDatasetConfig):
+    if not isinstance(cfg.operation, InfoConfig):
+        raise ValueError("Operation config must be InfoConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    sys.stdout.write(f"======Info {dataset.meta.repo_id}\n")
+    sys.stdout.write(f"Repository ID: {dataset.meta.repo_id} \n")
+    sys.stdout.write(f"Total episode: {dataset.meta.total_episodes} \n")
+    sys.stdout.write(f"Total task: {dataset.meta.total_tasks} \n")
+    sys.stdout.write(f"Total frame(Actual Count): {dataset.meta.total_frames}({len(dataset)}) \n")
+    sys.stdout.write(
+        f"Average frame per episode: {dataset.meta.total_frames / dataset.meta.total_episodes:.1f}\n"
+    )
+    sys.stdout.write(
+        f"Average episode time(sec): {(dataset.meta.total_frames / dataset.meta.total_episodes) / dataset.meta.fps:.1f}\n"
+    )
+    sys.stdout.write(f"FPS: {dataset.meta.fps}\n")
+
+    total_file_size = _get_dataset_size(dataset.root)
+    sys.stdout.write(f"Size: {total_file_size / (1024 * 1024):.1f} MB\n")
+    if cfg.operation.show_features:
+        import json
+
+        feature_dump_str = json.dumps(
+            dataset.meta.features, ensure_ascii=False, indent=4, sort_keys=True, separators=(",", ": ")
+        )
+        sys.stdout.write("Features:\n")
+        sys.stdout.write(f"{feature_dump_str}\n")
+
+
+def _validate_config(cfg: EditDatasetConfig) -> None:
+    if isinstance(cfg.operation, MergeConfig):
+        legacy_source_dir_output = bool(cfg.operation.source_dir and cfg.repo_id)
+        if not cfg.new_repo_id and not legacy_source_dir_output:
+            raise ValueError(
+                "--new_repo_id is required for merge operation, except for the Evo-RL 0901 "
+                "compatibility form using --repo_id with --operation.source_dir"
+            )
+    else:
+        if not cfg.repo_id:
+            raise ValueError(
+                f"--repo_id is required for {cfg.operation.type} operation (the input dataset identifier)"
+            )
+
+
 @parser.wrap()
 def edit_dataset(cfg: EditDatasetConfig) -> None:
+    _validate_config(cfg)
     operation_type = cfg.operation.type
 
     if operation_type == "delete_episodes":
@@ -504,6 +941,12 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "recompute_stats":
+        handle_recompute_stats(cfg)
+    elif operation_type == "reencode_videos":
+        handle_reencode_videos(cfg)
+    elif operation_type == "info":
+        handle_info(cfg)
     else:
         available = ", ".join(OperationConfig.get_known_choices())
         raise ValueError(f"Unknown operation: {operation_type}\nAvailable operations: {available}")

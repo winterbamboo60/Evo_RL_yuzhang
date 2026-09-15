@@ -17,7 +17,7 @@
 import logging
 from functools import cached_property
 
-from lerobot.processor import RobotAction, RobotObservation
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.robots.piper_follower import (
     PiperFollower,
     PiperFollowerConfig,

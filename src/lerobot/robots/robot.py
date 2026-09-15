@@ -18,8 +18,8 @@ from pathlib import Path
 
 import draccus
 
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.motors import MotorCalibration
-from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 
 from .config import RobotConfig
@@ -177,10 +177,6 @@ class Robot(abc.ABC):
         This may include setting motor parameters, control modes, or initial state.
         """
         pass
-
-    def set_teleop_send_only_mode(self, enabled: bool) -> None:
-        """Optionally let robots skip observation-side work during pure teleoperation send loops."""
-        del enabled
 
     @abc.abstractmethod
     def get_observation(self) -> RobotObservation:

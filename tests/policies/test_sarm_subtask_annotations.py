@@ -14,22 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-
 import pytest
 
-transformers = pytest.importorskip("transformers")
-if not hasattr(transformers, "Qwen3VLMoeForConditionalGeneration"):
-    pytest.skip(
-        "requires transformers with Qwen3VLMoeForConditionalGeneration",
-        allow_module_level=True,
-    )
+pytest.importorskip("transformers")
 
-subtask_annotation = importlib.import_module("lerobot.data_processing.sarm_annotations.subtask_annotation")
-Subtask = subtask_annotation.Subtask
-SubtaskAnnotation = subtask_annotation.SubtaskAnnotation
-Timestamp = subtask_annotation.Timestamp
-compute_temporal_proportions = subtask_annotation.compute_temporal_proportions
+from lerobot.data_processing.sarm_annotations.subtask_annotation import (
+    Subtask,
+    SubtaskAnnotation,
+    Timestamp,
+    compute_temporal_proportions,
+)
 
 
 def make_annotation(subtasks: list[tuple[str, int, int]]) -> SubtaskAnnotation:

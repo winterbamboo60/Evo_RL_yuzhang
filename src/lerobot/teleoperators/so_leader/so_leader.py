@@ -16,7 +16,6 @@
 
 import logging
 import time
-from typing import TypeAlias
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -40,7 +39,6 @@ class SOLeader(Teleoperator):
     def __init__(self, config: SOLeaderTeleopConfig):
         super().__init__(config)
         self.config = config
-        self._manual_control_enabled = True
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
             port=self.config.port,
@@ -61,7 +59,7 @@ class SOLeader(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        return self.action_features
 
     @property
     def is_connected(self) -> bool:
@@ -128,22 +126,15 @@ class SOLeader(Teleoperator):
 
     def configure(self) -> None:
         self.bus.disable_torque()
-        self._manual_control_enabled = True
         self.bus.configure_motors()
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
-    @check_if_not_connected
-    def set_manual_control(self, enabled: bool) -> None:
-        if enabled:
-            if not self._manual_control_enabled:
-                self.bus.disable_torque()
-                self._manual_control_enabled = True
-            return
+    def enable_torque(self) -> None:
+        self.bus.enable_torque()
 
-        if self._manual_control_enabled:
-            self.bus.enable_torque()
-            self._manual_control_enabled = False
+    def disable_torque(self) -> None:
+        self.bus.disable_torque()
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
@@ -154,7 +145,7 @@ class SOLeader(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        action = self.bus.sync_read("Present_Position", num_retry=self.config.num_read_retries)
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
@@ -162,13 +153,9 @@ class SOLeader(Teleoperator):
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # For phase-A dual-arm execution, reuse leader as a commanded arm by
-        # mapping `{joint}.pos` to motor goal positions.
-        self.set_manual_control(False)
-        goal_pos = {key.removesuffix(".pos"): val for key, val in feedback.items() if key.endswith(".pos")}
-        if not goal_pos:
-            return
-        self.bus.sync_write("Goal_Position", goal_pos)
+        goals = {k.removesuffix(".pos"): v for k, v in feedback.items() if k.endswith(".pos")}
+        if goals:
+            self.bus.sync_write("Goal_Position", goals)
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -176,5 +163,5 @@ class SOLeader(Teleoperator):
         logger.info(f"{self} disconnected.")
 
 
-SO100Leader: TypeAlias = SOLeader
-SO101Leader: TypeAlias = SOLeader
+SO100Leader = SOLeader
+SO101Leader = SOLeader

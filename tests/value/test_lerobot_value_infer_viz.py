@@ -46,6 +46,7 @@ class _FakeAccelerator:
 
 class _FakeMeta:
     camera_keys = ["observation.images.front"]
+    info = type("Info", (), {"storage_format": None})()
 
     def get_video_file_path(self, ep_idx: int, vid_key: str) -> str:
         return f"videos/{vid_key}/episode-{ep_idx:06d}.mp4"
@@ -97,6 +98,8 @@ def test_export_overlay_videos_uses_episode_index_for_subset_alignment(monkeypat
         frame_storage_mode,
         temp_dir_root,
         smooth_window=1,
+        fixed_bounds=None,
+        ep_targets=None,
     ):
         assert isinstance(src, Path)
         assert isinstance(dst, Path)
@@ -150,6 +153,8 @@ def test_export_overlay_videos_passes_disk_storage_mode(monkeypatch, tmp_path: P
         frame_storage_mode,
         temp_dir_root,
         smooth_window=1,
+        fixed_bounds=None,
+        ep_targets=None,
     ):
         assert isinstance(episode_timestamps_s, np.ndarray)
         assert tolerance_s > 0
@@ -204,6 +209,11 @@ def test_acp_disabled_skips_value_inference_and_uses_default_viz_dir(monkeypatch
         captured["output_dir"] = out_dir
         return [out_dir / "dummy.mp4"]
 
+    def _fake_export_indicator_overlay_videos(**kwargs):
+        out_dir = kwargs["output_dir"]
+        captured["indicator_output_dir"] = out_dir
+        return [out_dir / "indicator.mp4"]
+
     def _fail_resolve_pretrained(*args, **kwargs):
         raise AssertionError("checkpoint resolution should be skipped when acp.enable=false")
 
@@ -216,6 +226,9 @@ def test_acp_disabled_skips_value_inference_and_uses_default_viz_dir(monkeypatch
     monkeypatch.setattr(value_infer, "_load_dataset_distributed", lambda cfg, accelerator: dataset)
     monkeypatch.setattr(value_infer, "_resolve_pretrained_model_dir", _fail_resolve_pretrained)
     monkeypatch.setattr(value_infer, "_export_overlay_videos", _fake_export_overlay_videos)
+    monkeypatch.setattr(
+        value_infer, "export_indicator_overlay_videos", _fake_export_indicator_overlay_videos
+    )
 
     cfg = ValueInferencePipelineConfig(
         dataset=ValueInferenceDatasetConfig(repo_id="dummy/repo"),
@@ -229,12 +242,17 @@ def test_acp_disabled_skips_value_inference_and_uses_default_viz_dir(monkeypatch
     result = value_infer.run_value_inference_pipeline(cfg)
 
     expected_viz_dir = tmp_path / "runtime" / "value" / "viz"
+    expected_indicator_dir = tmp_path / "runtime" / "value" / "indicator_viz"
     assert captured["output_dir"] == expected_viz_dir
+    assert captured["indicator_output_dir"] == expected_indicator_dir
     assert result["main_process"] is True
     assert result["acp_enabled"] is False
     assert result["value_inference_skipped"] is True
     assert result["checkpoint"] is None
-    assert result["viz_outputs"] == [str(expected_viz_dir / "dummy.mp4")]
+    assert result["viz_outputs"] == [
+        str(expected_viz_dir / "dummy.mp4"),
+        str(expected_indicator_dir / "indicator.mp4"),
+    ]
 
 
 def test_decode_frames_at_timestamps_scales_float_frames_to_uint8(monkeypatch, tmp_path: Path):

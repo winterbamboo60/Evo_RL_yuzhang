@@ -14,28 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
+from .configuration_pi05 import PI05Config
+from .modeling_pi05 import PI05Policy
+from .processor_pi05 import make_pi05_pre_post_processors
 
-from importlib import import_module
-from typing import Any
-
-_LAZY_ATTRS = {
-    "PI05Config": ".configuration_pi05",
-    "PI05Policy": ".modeling_pi05",
-    "make_pi05_pre_post_processors": ".processor_pi05",
-}
-
-__all__ = list(_LAZY_ATTRS)
-
-
-def __getattr__(name: str) -> Any:
-    if name not in _LAZY_ATTRS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = import_module(_LAZY_ATTRS[name], __name__)
-    value = getattr(module, name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    return sorted([*globals(), *_LAZY_ATTRS])
+__all__ = ["PI05Config", "PI05Policy", "make_pi05_pre_post_processors"]

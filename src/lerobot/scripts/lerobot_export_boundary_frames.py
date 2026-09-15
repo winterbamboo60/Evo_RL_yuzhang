@@ -46,9 +46,10 @@ from typing import TYPE_CHECKING, Any
 
 from torchvision.transforms.functional import to_pil_image
 
-from lerobot.datasets.utils import load_info
+from lerobot.datasets.io_utils import load_info
 from lerobot.scripts.lerobot_dataset_report import resolve_dataset_root
 from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.utils.recording_annotations import resolve_episode_success_from_mapping
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -172,20 +173,31 @@ def _format_episode_spec(episode_indices: list[int]) -> str:
 
 
 def export_episode_boundary_frames(
-    dataset: "LeRobotDataset",
+    dataset: LeRobotDataset,
     output_dir: Path,
     episode_indices: list[int],
     camera_key: str,
 ) -> Path:
     pad_width = max(3, len(str(max(episode_indices))))
     episodes = dataset.meta.episodes
+    if episodes is None:
+        raise ValueError("Dataset has no readable episode metadata.")
+    row_by_episode_index = {
+        int(ep_idx): row_idx for row_idx, ep_idx in enumerate(episodes["episode_index"])
+    }
 
     manifest_rows: list[dict[str, Any]] = []
     for episode_index in episode_indices:
-        from_idx = int(episodes["dataset_from_index"][episode_index])
-        to_idx = int(episodes["dataset_to_index"][episode_index])
-        length = int(episodes["length"][episode_index])
-        success = str(episodes["episode_success"][episode_index]) if "episode_success" in episodes.column_names else ""
+        if episode_index not in row_by_episode_index:
+            raise KeyError(f"Episode {episode_index} is missing from episode metadata.")
+        row_idx = row_by_episode_index[episode_index]
+        from_idx = int(episodes["dataset_from_index"][row_idx])
+        to_idx = int(episodes["dataset_to_index"][row_idx])
+        length = int(episodes["length"][row_idx])
+        episode_row = {name: episodes[name][row_idx] for name in episodes.column_names}
+        success = resolve_episode_success_from_mapping(
+            episode_row, default_label=None, require_label=False
+        ) or ""
 
         first_name = f"episode_{episode_index:0{pad_width}d}_first.png"
         last_name = f"episode_{episode_index:0{pad_width}d}_last.png"
@@ -279,7 +291,7 @@ def main() -> None:
 
     dataset_root = resolve_dataset_root(args.dataset, args.root)
     repo_id = resolve_repo_id(dataset_root, args.root)
-    info = load_info(dataset_root)
+    info = load_info(dataset_root).to_dict()
     camera_key = select_camera_key(info, args.camera_key)
     episode_indices = parse_episode_indices(args.episodes, int(info["total_episodes"]))
 

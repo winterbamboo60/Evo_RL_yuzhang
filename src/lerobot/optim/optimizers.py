@@ -23,12 +23,12 @@ import draccus
 import torch
 from safetensors.torch import load_file, save_file
 
-from lerobot.datasets.utils import flatten_dict, unflatten_dict, write_json
 from lerobot.utils.constants import (
     OPTIMIZER_PARAM_GROUPS,
     OPTIMIZER_STATE,
 )
-from lerobot.utils.io_utils import deserialize_json_into_object
+from lerobot.utils.io_utils import deserialize_json_into_object, write_json
+from lerobot.utils.utils import flatten_dict, unflatten_dict
 
 # Type alias for parameters accepted by optimizer build() methods.
 # This matches PyTorch's optimizer signature while also supporting:
@@ -51,6 +51,11 @@ class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
     @property
     def type(self) -> str:
         return self.get_choice_name(self.__class__)
+
+    @property
+    def builds_multiple_optimizers(self) -> bool:
+        """True when build() returns a dict of optimizers (unsupported under sharded training)."""
+        return False
 
     @classmethod
     def default_choice_name(cls) -> str | None:
@@ -109,32 +114,6 @@ class AdamWConfig(OptimizerConfig):
         kwargs = asdict(self)
         kwargs.pop("grad_clip_norm")
         return torch.optim.AdamW(params, **kwargs)
-
-
-@OptimizerConfig.register_subclass("adamw8bit")
-@dataclass
-class AdamW8bitConfig(OptimizerConfig):
-    """8-bit AdamW optimizer via bitsandbytes. Reduces optimizer state memory by ~75%
-    by quantizing fp32 momentum buffers to 8-bit (dynamic quantization).
-    Requires: pip install bitsandbytes
-    """
-
-    lr: float = 1e-3
-    betas: tuple[float, float] = (0.9, 0.999)
-    eps: float = 1e-8
-    weight_decay: float = 1e-2
-    grad_clip_norm: float = 10.0
-
-    def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
-        try:
-            import bitsandbytes as bnb
-        except ImportError as e:
-            raise ImportError(
-                "bitsandbytes is required for AdamW8bitConfig. Install with: pip install bitsandbytes"
-            ) from e
-        kwargs = asdict(self)
-        kwargs.pop("grad_clip_norm")
-        return bnb.optim.AdamW8bit(params, **kwargs)
 
 
 @OptimizerConfig.register_subclass("sgd")
@@ -271,6 +250,10 @@ class MultiAdamConfig(OptimizerConfig):
     grad_clip_norm: float = 10.0
     optimizer_groups: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    @property
+    def builds_multiple_optimizers(self) -> bool:
+        return True
+
     def build(self, params: OptimizerParams) -> dict[str, torch.optim.Optimizer]:
         """Build multiple Adam optimizers.
 
@@ -307,9 +290,10 @@ class MultiAdamConfig(OptimizerConfig):
 
 
 def save_optimizer_state(
-    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer], save_dir: Path
+    optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer],
+    save_dir: Path,
 ) -> None:
-    """Save optimizer state to disk.
+    """Save optimizer state to disk (non-sharded runs; sharded runs use the DCP channel).
 
     Args:
         optimizer: Either a single optimizer or a dictionary of optimizers.
@@ -331,13 +315,6 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
     state = optimizer.state_dict()
     param_groups = state.pop("param_groups")
     flat_state = flatten_dict(state)
-    # safetensors requires all values to be tensors; convert scalars (e.g. Adam's step int).
-    # Also .clone() every tensor to break shared-memory references (bitsandbytes shares qmap
-    # lookup tables across all param states; safetensors rejects tensors that alias memory).
-    flat_state = {
-        k: (torch.tensor(v) if isinstance(v, (int, float)) else v.clone())
-        for k, v in flat_state.items()
-    }
     save_file(flat_state, save_dir / OPTIMIZER_STATE)
     write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
 
@@ -377,15 +354,7 @@ def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
 
     # Handle case where 'state' key might not exist (for newly created optimizers)
     if "state" in state:
-        # Unwrap 0-dim tensors that were scalar ints/floats at save time (e.g. Adam step)
-        def _unwrap(v):
-            if isinstance(v, torch.Tensor) and v.ndim == 0:
-                return v.item()
-            return v
-
-        loaded_state_dict = {
-            "state": {int(k): {sk: _unwrap(sv) for sk, sv in v.items()} for k, v in state["state"].items()}
-        }
+        loaded_state_dict = {"state": {int(k): v for k, v in state["state"].items()}}
     else:
         loaded_state_dict = {"state": {}}
 

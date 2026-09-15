@@ -14,21 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import multiprocessing as mp
 import traceback
 from functools import cached_property
 from typing import Any
 
-from lerobot.processor import RobotAction
+from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.piper_leader import (
     PiperLeader,
     PiperLeaderConfig,
     PiperXLeader,
     PiperXLeaderConfig,
 )
-from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.piper_sdk import PIPER_ACTION_KEYS
 
 from ..teleoperator import Teleoperator
 from .config_bi_piper_leader import BiPiperLeaderConfig, BiPiperXLeaderConfig
@@ -119,8 +120,7 @@ class _PiperLeaderProcessProxy:
         if response["ok"]:
             return response.get("result")
         raise RuntimeError(
-            f"bi_piper leader worker command '{command}' failed: {response['error']}\n"
-            f"{response['traceback']}"
+            f"bi_piper leader worker command '{command}' failed: {response['error']}\n{response['traceback']}"
         )
 
     def connect(self, calibrate: bool = True) -> None:
@@ -143,6 +143,12 @@ class _PiperLeaderProcessProxy:
     def set_manual_control(self, enabled: bool) -> None:
         self._call("set_manual_control", enabled)
 
+    def enable_torque(self) -> None:
+        self._call("enable_torque")
+
+    def disable_torque(self) -> None:
+        self._call("disable_torque")
+
     def get_action(self) -> RobotAction:
         return self._call("get_action")
 
@@ -160,14 +166,10 @@ class _PiperLeaderProcessProxy:
                     self._call("disconnect")
             except Exception:
                 pass
-            try:
+            with contextlib.suppress(Exception):
                 self._parent_conn.send({"command": "__close__"})
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 self._parent_conn.close()
-            except Exception:
-                pass
 
         if self._process.is_alive():
             self._process.join(timeout=2.0)
@@ -252,7 +254,12 @@ class BiPiperLeader(Teleoperator):
 
     @cached_property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        left_arm_features = self.left_arm.feedback_features
+        right_arm_features = self.right_arm.feedback_features
+        return {
+            **{f"left_{key}": value for key, value in left_arm_features.items()},
+            **{f"right_{key}": value for key, value in right_arm_features.items()},
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -283,6 +290,14 @@ class BiPiperLeader(Teleoperator):
     def set_manual_control(self, enabled: bool) -> None:
         self.left_arm.set_manual_control(enabled)
         self.right_arm.set_manual_control(enabled)
+
+    def enable_torque(self) -> None:
+        self.left_arm.enable_torque()
+        self.right_arm.enable_torque()
+
+    def disable_torque(self) -> None:
+        self.left_arm.disable_torque()
+        self.right_arm.disable_torque()
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:

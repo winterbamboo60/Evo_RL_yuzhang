@@ -482,3 +482,72 @@ def test_pistar06_save_pretrained_keeps_full_weights_when_encoders_not_frozen(hf
         loaded.model.language_model.proj.weight,
         torch.full_like(loaded.model.language_model.proj.weight, 3.0),
     )
+
+class _IterableEpisodes:
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(rows[0])
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
+class _StandardDatasetMeta:
+    def __init__(self):
+        self.episodes = _IterableEpisodes(
+            [
+                {
+                    "episode_index": 0,
+                    "length": 2,
+                    "dataset_from_index": 0,
+                    "dataset_to_index": 2,
+                    "tasks": ["pick"],
+                    "episode_success": "success",
+                },
+                {
+                    "episode_index": 1,
+                    "length": 2,
+                    "dataset_from_index": 2,
+                    "dataset_to_index": 4,
+                    "tasks": ["pick"],
+                    "episode_outcome": "failure",
+                },
+            ]
+        )
+        self.tasks = _TaskIndexTable({"pick": 0})
+
+    def ensure_readable(self):
+        return None
+
+
+def test_pistar06_forward_builds_targets_from_standard_dataset_index(hf_stubs):
+    del hf_stubs
+    cfg = Pistar06Config(
+        device="cpu",
+        camera_features=["observation.images.front"],
+        num_bins=17,
+        fusion_hidden_dim=32,
+        fusion_num_heads=8,
+        dropout=0.0,
+    )
+    policy = Pistar06Policy(config=cfg, dataset_meta=_StandardDatasetMeta())
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.randint(0, 100, (4, 12), dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(4, 12, dtype=torch.bool),
+        PISTAR06_IMAGES_KEY: torch.rand(4, 1, 3, 32, 32),
+        PISTAR06_IMAGE_MASK_KEY: torch.ones(4, 1, dtype=torch.bool),
+        "index": torch.tensor([0, 1, 2, 3]),
+    }
+
+    loss, metrics = policy(batch)
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    assert "value_mae" in metrics
+    assert torch.allclose(
+        policy.value_target_lookup,
+        torch.tensor([-0.25, 0.0, -0.75, -0.5]),
+    )

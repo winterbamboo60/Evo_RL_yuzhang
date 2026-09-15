@@ -32,8 +32,13 @@ from typing import Any
 
 import pyarrow.dataset as pa_ds
 
-from lerobot.datasets.utils import load_episodes, load_info, load_tasks
+from lerobot.datasets.io_utils import load_episodes, load_info, load_tasks
 from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.utils.recording_annotations import (
+    INTERVENTION_FIELD_ALIASES,
+    resolve_episode_success_from_mapping,
+    resolve_intervention_value,
+)
 
 
 def resolve_dataset_root(dataset: str, root: Path | None) -> Path:
@@ -131,15 +136,16 @@ def _format_ascii_histogram(histogram: list[dict[str, float | int]], bar_width: 
 
 
 def build_report(dataset_root: Path) -> dict[str, Any]:
-    info = load_info(dataset_root)
+    info = load_info(dataset_root).to_dict()
     episodes_ds = load_episodes(dataset_root)
     episodes_df = episodes_ds.to_pandas()
 
     actual_episode_count = int(len(episodes_df))
-    episode_success_labels = (
-        episodes_df["episode_success"].tolist() if "episode_success" in episodes_df else []
-    )
-    normalized_labels = [_normalize_label(v) for v in episode_success_labels]
+    normalized_labels = [
+        resolve_episode_success_from_mapping(row.to_dict(), default_label=None, require_label=False)
+        or "unlabeled"
+        for _, row in episodes_df.iterrows()
+    ]
 
     success_count = sum(1 for v in normalized_labels if v == "success")
     failure_count = sum(1 for v in normalized_labels if v == "failure")
@@ -150,13 +156,13 @@ def build_report(dataset_root: Path) -> dict[str, Any]:
     data_schema_names = set(data_dataset.schema.names)
     actual_frame_count = int(data_dataset.count_rows())
 
-    intervention_col = "complementary_info.is_intervention"
+    intervention_col = next((field for field in INTERVENTION_FIELD_ALIASES if field in data_schema_names), None)
     episode_index_col = "episode_index"
     intervention_frames = 0
     intervention_episode_count = 0
 
     if (
-        intervention_col in data_schema_names
+        intervention_col is not None
         and episode_index_col in data_schema_names
         and actual_frame_count > 0
     ):
@@ -166,7 +172,7 @@ def build_report(dataset_root: Path) -> dict[str, Any]:
 
         intervention_episode_ids = set()
         for ep_idx, raw_value in zip(episode_indices, intervention_values, strict=True):
-            if _to_float(raw_value) > 0.0:
+            if resolve_intervention_value({intervention_col: raw_value}):
                 intervention_frames += 1
                 intervention_episode_ids.add(int(ep_idx))
         intervention_episode_count = len(intervention_episode_ids)

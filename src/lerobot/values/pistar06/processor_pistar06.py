@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+"""Processor pipeline for Pistar06 value-model inputs."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -12,6 +14,7 @@ import torch.nn.functional as functional
 from torch import Tensor
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     DeviceProcessorStep,
     NormalizerProcessorStep,
@@ -23,7 +26,6 @@ from lerobot.processor import (
     TokenizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_IMAGES,
     OBS_STATE,
@@ -45,6 +47,8 @@ def _pad_last_dim(vector: Tensor, new_dim: int) -> Tensor:
 @ProcessorStepRegistry.register(name="pistar06_prepare_task_prompt")
 @dataclass
 class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
+    """Convert task text and optional robot state into the value prompt."""
+
     task_key: str = "task"
     include_state_in_prompt: bool = True
     state_feature: str = OBS_STATE
@@ -52,6 +56,7 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
     state_discretization_bins: int = 256
 
     def get_config(self) -> dict[str, Any]:
+        """Return the serializable processor configuration."""
         return {
             "task_key": self.task_key,
             "include_state_in_prompt": self.include_state_in_prompt,
@@ -65,6 +70,7 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
         return str(task).strip().replace("_", " ").replace("\n", " ").strip()
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """Add the formatted value prompt to complementary task data."""
         transition = transition.copy()
         observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
         complementary_data = dict(transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
@@ -125,15 +131,19 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Leave feature declarations unchanged."""
         return features
 
 
 @ProcessorStepRegistry.register(name="pistar06_prepare_images")
 @dataclass
 class Pistar06PrepareImagesProcessorStep(ProcessorStep):
+    """Pack configured camera observations and validity masks for Pistar06."""
+
     camera_features: list[str]
 
     def get_config(self) -> dict[str, Any]:
+        """Return the serializable camera configuration."""
         return {
             "camera_features": self.camera_features,
         }
@@ -191,6 +201,7 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
         return images, masks
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """Attach packed camera tensors and their attention mask."""
         transition = transition.copy()
         observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
 
@@ -204,6 +215,7 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Leave feature declarations unchanged."""
         return features
 
 
@@ -214,6 +226,7 @@ def make_pistar06_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
+    """Build current LeRobot pre/postprocessor pipelines for Pistar06."""
     camera_features = list(config.camera_features)
     if not camera_features:
         camera_features = [k for k in (config.input_features or {}) if k.startswith(OBS_IMAGES)]

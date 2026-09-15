@@ -20,6 +20,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from lerobot.utils.recording_annotations import ACP_INDICATOR_FIELD_ALIASES
+
 
 @dataclass(frozen=True)
 class ACPIndicatorStats:
@@ -106,9 +108,18 @@ def _from_hf_dataset_scan(dataset: Any, indicator_field: str) -> ACPIndicatorSta
 
 
 def compute_acp_indicator_stats(dataset: Any, indicator_field: str) -> ACPIndicatorStats | None:
-    """Compute ACP indicator ratio from dataset metadata or by scanning the indicator column."""
-    stats_from_meta = _from_meta_stats(dataset, indicator_field)
-    if stats_from_meta is not None:
-        return stats_from_meta
+    """Compute ACP ratio from current or legacy indicator columns.
 
-    return _from_hf_dataset_scan(dataset, indicator_field)
+    The requested field wins. If it is absent, the aliases cover both the
+    current ``complementary_info.acp_indicator`` name and the 0901 shell
+    workflow's ``complementary_info.indicator_field`` name.
+    """
+    candidates = tuple(dict.fromkeys((indicator_field, *ACP_INDICATOR_FIELD_ALIASES)))
+    for candidate in candidates:
+        stats_from_meta = _from_meta_stats(dataset, candidate)
+        if stats_from_meta is not None:
+            return stats_from_meta
+        stats_from_scan = _from_hf_dataset_scan(dataset, candidate)
+        if stats_from_scan is not None:
+            return stats_from_scan
+    return None

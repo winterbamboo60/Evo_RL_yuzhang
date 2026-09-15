@@ -1,294 +1,431 @@
-#!/bin/bash
-# 用法：
-#   ./lerobot_train.sh \
-#     --DATASET_ROOT <数据存放目录> \
-#     --ModelZoo <预训练模型路径> \
-#     --OUTPUT_DIR <输出目录> \
-#     [--history_pretrained_path <上一轮策略模型路径>]   # 可选：策略训练预训练权重，默认用基础模型
-# 示例：
+#!/usr/bin/env bash
+# Train current LeRobot policies directly from local current or 0901 v3 datasets.
+#
+# Verified example (plain current PI0.5 fine-tuning):
+#   # Activate the desired environment first; this script resolves python from PATH.
+#   cd /home/lenovo/code/Evo-RL-loop-0911
+#   nohup bash scripts/RL_train.sh \
+#     --DATASET_ROOT /home/lenovo/datasets/cube_catch_rollout_v3-2_merged \
+#     --history_pretrained_path /home/lenovo/outputs/0910_pi05_sft_cube_catch_belt_50000 \
+#     --OUTPUT_DIR /home/lenovo/outputs/0911_pi05_cube_catch_rollout_v3_2 \
+#     --policy_type pi05 \
+#     > /home/lenovo/outputs/logs/0911_pi05_cube_catch_rollout_v3_2.log 2>&1 &
+#
+# Use --policy_type pi05_rlt to initialize the independent RLT policy from the
+# same plain PI0.5 checkpoint. This dataset has no ACP indicator column, so keep
+# --acp_enabled=false unless lerobot-value-infer has first written that column.
 
-# 一楼真机训练
-# pi05_base_cup_catch_0813
-# source /home/yz/projects/env/package_sorting_env/bin/activate
-# nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/cup_catch_0813/cup_catch_0813_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/pi05_base_cup_catch_0813_tain0813" \
-#   > "/home/yz/projects/outputs/logs/pi05_base_cup_catch_0813_tain0813.log" 2>&1 &
-# echo "PID: $!"
+set -euo pipefail
 
-# smolvla_base_cup_catch_0813
-# source /home/yz/projects/env/package_sorting_env/bin/activate
-# nohup bash /home/yz/projects/Evo-RL-loop-0810/scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/yz/datasets/cup_catch_0813/cup_catch_0813_merged" \
-#   --ModelZoo /home/yz/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/home/yz/projects/outputs/smovla_base_cup_catch_0813_train0814_0810" \
-#   --history_pretrained_path /home/yz/modelZoo/smolvla_base \
-#   > "/home/yz/projects/outputs/logs/smovla_base_cup_catch_0813_train0814_0810.log" 2>&1 &
-# echo "PID: $!"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
-
-
-
-# 北京5080训练
-# pi05_base_rlt_sft_cup_catch_v4_merged_train0901
-# source /home/lenovo/code/envs/package_sorting_env/bin/activate
-# cd /home/lenovo/code/Evo-RL-loop-0901
-# nohup bash ./scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/lenovo/datasets/cup_catch_v4_merged_checked" \
-#   --ModelZoo /home/lenovo/modelZoo \
-#   --OUTPUT_DIR "/home/lenovo/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901" \
-#   --history_pretrained_path /home/lenovo/outputs/pi05_base_sft_cup_catch_v4_merged_train0831/train/checkpoints/040000/pi05_base_sft_cup_catch_v4_merged_train0831_40k \
-#   > "/home/lenovo/outputs/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901.log" 2>&1 &
-# echo "PID: $!"
-
-# smolvla_base_cup_catch_0813
-# source /home/lenovo/code/envs/package_sorting_env/bin/activate
-# cd /home/lenovo/code/Evo-RL-loop-0901
-# nohup bash ./scripts/RL_train.sh \
-#   --DATASET_ROOT "/home/lenovo/datasets/cup_catch_v4_merged_checked" \
-#   --ModelZoo /home/lenovo/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/home/lenovo/outputs/smovla_cup_catch_v4_merged_train0829" \
-#   --history_pretrained_path /home/lenovo/modelZoo/smolvla_base \
-#   > "/home/lenovo/outputs/logs/smovla_cup_catch_v4_merged_train0829.log" 2>&1 &
-# echo "PID: $!"
-
-
-
-
-# 百度云训练
-# pi05_base_rlt_sft_cup_catch_v4_merged_train0901
-# source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
-# cd /root/projects/Evo_RL_yuzhang
-# nohup bash /root/projects/Evo_RL_yuzhang/scripts/RL_train.sh \
-#   --DATASET_ROOT "/mnt/cfs/0z9lxh/yuzhang/datasets/cup_catch_v4_merged_checked" \
-#   --ModelZoo /mnt/cfs/0z9lxh/yuzhang/modelZoo \
-#   --OUTPUT_DIR "/mnt/cfs/0z9lxh/yuzhang/outputs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901" \
-#   --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/outputs/pi05_base_sft_cup_catch_v4_merged_train0831/train/checkpoints/040000/pi05_base_sft_cup_catch_v4_merged_train0831_40k \
-#   > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901.log" 2>&1 &
-# echo "PID: $!"
-
-
-# smolvla_base_cup_catch_0813
-# source /mnt/cfs/0z9lxh/yuzhang/env/package_sorting_env_raw/bin/activate
-# nohup bash /root/projects/Evo_RL_yuzhang/scripts/RL_train.sh \
-#   --DATASET_ROOT "/mnt/cfs/0z9lxh/yuzhang/datasets/cup_catch_v4_merged" \
-#   --ModelZoo /mnt/cfs/0z9lxh/yuzhang/modelZoo \
-#   --policy_type "smolvla" \
-#   --OUTPUT_DIR "/mnt/cfs/0z9lxh/yuzhang/outputs/smovla_cup_catch_v4_merged_train0829" \
-#   --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/modelZoo/smolvla_base \
-#   > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/smovla_cup_catch_v4_merged_train0829.log" 2>&1 &
-# echo "PID: $!"
-
-
-set -e
-
-# ---------- 解析参数 ----------
 DATASET_ROOT=""
+DATASET_REPO_ID=""
 MODELZOO_PATH=""
 OUTPUT_DIR=""
-HISTORY_PRETRAINED_PATH=""   # 可选：策略训练的预训练权重路径，未指定则用基础模型
-policy_type="pi05"
+HISTORY_PRETRAINED_PATH=""
+POLICY_TYPE="pi05"
+POLICY_REPO_ID=""
+BATCH_SIZE="1"
+GRADIENT_ACCUMULATION_STEPS="32"
+STEPS="50000"
+SAVE_FREQ="10000"
+LOG_FREQ="100"
+NUM_WORKERS="4"
+DEVICE="cuda"
+DTYPE="bfloat16"
+MIXED_PRECISION="bf16"
+TRAIN_EXPERT_ONLY="false"
+GRADIENT_CHECKPOINTING="true"
+ACP_ENABLED="false"
+ACP_INDICATOR_FIELD="complementary_info.indicator_field"
+ACP_INDICATOR_DROPOUT_PROB="0.3"
+RLT_ALPHA="1.0"
+JOB_NAME="VLA_train"
+TENSORBOARD_ENABLE="false"
+NUM_GPUS="1"
+CHECK_ONLY="false"
+DRY_RUN="false"
+FORWARD_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash scripts/RL_train.sh --DATASET_ROOT PATH --OUTPUT_DIR PATH \
+    (--history_pretrained_path CHECKPOINT | --ModelZoo DIR) [options] [-- CURRENT_OVERRIDES...]
+
+Required for training:
+  --DATASET_ROOT PATH              Local LeRobot dataset root (current or readable 0901 v3)
+  --OUTPUT_DIR PATH                Run root; checkpoints are written under PATH/train
+  --history_pretrained_path PATH   Current-compatible policy checkpoint
+    or --ModelZoo DIR              Uses DIR/pi05base or DIR/smolvla_base
+
+Main options:
+  --policy_type TYPE               pi05 (default), pi05_rlt, or smolvla
+  --dataset.repo_id ID             Logical local dataset id (auto-generated by default)
+  --policy.repo_id ID              Logical output policy id (auto-generated by default)
+  --batch_size N                   Per-device micro-batch size (default: 1)
+  --gradient_accumulation_steps N  Current mapping: accelerator.gradient_accumulation.steps (default: 32)
+  --steps N                        Training micro-steps (default: 50000)
+  --save_freq N                    Checkpoint interval (default: 10000)
+  --num_workers N                  DataLoader workers (default: 4)
+  --device DEVICE                  Policy device (default: cuda)
+  --dtype TYPE                     PI0.5 model dtype (default: bfloat16)
+  --mixed_precision MODE           Accelerator AMP: no/fp16/bf16 (default: bf16)
+  --train_expert_only BOOL         PI0.5/SmolVLA expert-only fine-tuning (default: true)
+  --gradient_checkpointing BOOL    PI0.5 memory saving (default: true)
+  --tensorboard                    Enable TensorBoard scalar logging
+  --tensorboard.enable BOOL        Explicitly enable/disable TensorBoard (default: false)
+  --num_gpus N                     Single-node GPU process count; N>1 enables DDP (default: 1)
+                                   Select physical GPUs with CUDA_VISIBLE_DEVICES
+
+Logging:
+  stdout/stderr                    Also copied to OUTPUT_DIR/RL_train.log
+  TensorBoard events               OUTPUT_DIR/tensoborad (when enabled)
+
+PI05-RLT options:
+  --acp_enabled BOOL               Enable advantage-conditioned task tags (default: false)
+  --acp_indicator_field FIELD      Default: complementary_info.indicator_field
+  --acp_indicator_dropout_prob P   Default: 0.3
+  --rlt_alpha FLOAT                RLT reconstruction loss weight (default: 1.0)
+
+Validation:
+  --check_only                     Open metadata and decode one real training sample, then exit
+  --dry_run                        Validate everything and print the exact lerobot-train command
+  -- CURRENT_OVERRIDES...          Forward additional current lerobot-train arguments
+EOF
+}
+
+require_value() {
+    if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "[错误] $1 缺少参数值" >&2
+        exit 2
+    fi
+}
+
+validate_bool() {
+    case "$2" in
+        true|false) ;;
+        *) echo "[错误] $1 只能是 true 或 false，当前为：$2" >&2; exit 2 ;;
+    esac
+}
+
+validate_positive_integer() {
+    if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[错误] $1 必须是正整数，当前为：$2" >&2
+        exit 2
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --DATASET_ROOT)
-            DATASET_ROOT="$2"; shift 2 ;;
-        --ModelZoo)
-            MODELZOO_PATH="$2"; shift 2 ;;
-        --OUTPUT_DIR)
-            OUTPUT_DIR="$2"; shift 2 ;;
-        --history_pretrained_path)
-            HISTORY_PRETRAINED_PATH="$2"; shift 2 ;;
-        --policy_type)
-            policy_type="$2"; shift 2 ;;
-        *)
-            echo "[错误] 未知参数：$1" >&2
-            exit 1 ;;
+        -h|--help) usage; exit 0 ;;
+        --DATASET_ROOT|--dataset.root) require_value "$@"; DATASET_ROOT="$2"; shift 2 ;;
+        --dataset.repo_id) require_value "$@"; DATASET_REPO_ID="$2"; shift 2 ;;
+        --ModelZoo) require_value "$@"; MODELZOO_PATH="$2"; shift 2 ;;
+        --OUTPUT_DIR|--output_dir) require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+        --history_pretrained_path|--policy.pretrained_path|--policy.path)
+            require_value "$@"; HISTORY_PRETRAINED_PATH="$2"; shift 2 ;;
+        --policy_type|--policy.type) require_value "$@"; POLICY_TYPE="$2"; shift 2 ;;
+        --policy.repo_id) require_value "$@"; POLICY_REPO_ID="$2"; shift 2 ;;
+        --batch_size) require_value "$@"; BATCH_SIZE="$2"; shift 2 ;;
+        --gradient_accumulation_steps|--accelerator.gradient_accumulation.steps)
+            require_value "$@"; GRADIENT_ACCUMULATION_STEPS="$2"; shift 2 ;;
+        --steps) require_value "$@"; STEPS="$2"; shift 2 ;;
+        --save_freq) require_value "$@"; SAVE_FREQ="$2"; shift 2 ;;
+        --log_freq) require_value "$@"; LOG_FREQ="$2"; shift 2 ;;
+        --num_workers) require_value "$@"; NUM_WORKERS="$2"; shift 2 ;;
+        --device|--policy.device) require_value "$@"; DEVICE="$2"; shift 2 ;;
+        --dtype|--policy.dtype) require_value "$@"; DTYPE="$2"; shift 2 ;;
+        --mixed_precision|--accelerator.mixed_precision)
+            require_value "$@"; MIXED_PRECISION="$2"; shift 2 ;;
+        --train_expert_only|--policy.train_expert_only)
+            require_value "$@"; TRAIN_EXPERT_ONLY="$2"; shift 2 ;;
+        --gradient_checkpointing|--policy.gradient_checkpointing)
+            require_value "$@"; GRADIENT_CHECKPOINTING="$2"; shift 2 ;;
+        --acp_enabled|--policy.acp_enabled) require_value "$@"; ACP_ENABLED="$2"; shift 2 ;;
+        --acp_indicator_field|--policy.acp_indicator_field)
+            require_value "$@"; ACP_INDICATOR_FIELD="$2"; shift 2 ;;
+        --acp_indicator_dropout_prob|--policy.acp_indicator_dropout_prob)
+            require_value "$@"; ACP_INDICATOR_DROPOUT_PROB="$2"; shift 2 ;;
+        --rlt_alpha|--policy.rlt_alpha) require_value "$@"; RLT_ALPHA="$2"; shift 2 ;;
+        --job_name) require_value "$@"; JOB_NAME="$2"; shift 2 ;;
+        --tensorboard) TENSORBOARD_ENABLE="true"; shift ;;
+        --tensorboard.enable)
+            require_value "$@"; TENSORBOARD_ENABLE="$2"; shift 2 ;;
+        --NUM_GPUS|--num_gpus|--nproc_per_node)
+            require_value "$@"; NUM_GPUS="$2"; shift 2 ;;
+        --check_only) CHECK_ONLY="true"; shift ;;
+        --dry_run) DRY_RUN="true"; shift ;;
+        --) shift; FORWARD_ARGS=("$@"); break ;;
+        *) echo "[错误] 未知脚本参数：$1；新版原生参数请放在 -- 之后" >&2; exit 2 ;;
     esac
 done
 
-# ---------- 校验必填参数 ----------
-MISSING=()
-[[ -z "$DATASET_ROOT"   ]] && MISSING+=("--DATASET_ROOT")
-[[ -z "$MODELZOO_PATH" ]] && MISSING+=("--ModelZoo")
-[[ -z "$OUTPUT_DIR"     ]] && MISSING+=("--OUTPUT_DIR")
-
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo "[错误] 缺少必填参数：${MISSING[*]}" >&2
-    exit 1
+if ! PYTHON_BIN="$(command -v python)" || [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "[错误] 当前 PATH 中找不到可执行的 python；请先激活训练环境" >&2
+    exit 2
+fi
+validate_positive_integer "--num_gpus" "$NUM_GPUS"
+if (( NUM_GPUS > 1 )); then
+    if [[ "$DEVICE" != "cuda" ]]; then
+        echo "[错误] 多卡 DDP 要求 --device cuda；不要指定 cuda:0，否则所有 rank 可能落到同一张卡" >&2
+        exit 2
+    fi
+    if [[ "$CHECK_ONLY" != "true" && "$DRY_RUN" != "true" ]]; then
+        VISIBLE_GPU_COUNT="$($PYTHON_BIN - <<'PY'
+import torch
+print(torch.cuda.device_count())
+PY
+)"
+        if [[ ! "$VISIBLE_GPU_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "[错误] 无法读取当前环境可见的 CUDA GPU 数量：$VISIBLE_GPU_COUNT" >&2
+            exit 2
+        fi
+        if (( VISIBLE_GPU_COUNT < NUM_GPUS )); then
+            echo "[错误] --num_gpus=$NUM_GPUS，但当前进程只看见 $VISIBLE_GPU_COUNT 张 GPU；请检查 CUDA_VISIBLE_DEVICES" >&2
+            exit 2
+        fi
+    fi
+fi
+if [[ "$CHECK_ONLY" != "true" ]]; then
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        echo "[错误] 缺少 --OUTPUT_DIR" >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" != "true" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+        TRAIN_LOG_FILE="$OUTPUT_DIR/RL_train.log"
+        printf '[训练日志] %s\n' "$TRAIN_LOG_FILE" >> "$TRAIN_LOG_FILE"
+        printf '[训练日志] %s\n' "$TRAIN_LOG_FILE"
+        exec > >(tee -a "$TRAIN_LOG_FILE") 2>&1
+        if [[ "$TENSORBOARD_ENABLE" == "true" ]]; then
+            echo "[TensorBoard] $OUTPUT_DIR/tensoborad"
+        fi
+    fi
+    if [[ -e "$OUTPUT_DIR/train" ]]; then
+        echo "[错误] 当前 LeRobot 不覆盖已有输出目录：$OUTPUT_DIR/train" >&2
+        exit 2
+    fi
+fi
+if [[ -z "$DATASET_ROOT" ]]; then
+    echo "[错误] 缺少 --DATASET_ROOT" >&2
+    exit 2
+fi
+if [[ ! -f "$DATASET_ROOT/meta/info.json" ]]; then
+    echo "[错误] 不是可识别的 LeRobot 数据集：缺少 $DATASET_ROOT/meta/info.json" >&2
+    exit 2
+fi
+case "$POLICY_TYPE" in
+    pi05|pi05_rlt|smolvla) ;;
+    *) echo "[错误] --policy_type 仅支持 pi05、pi05_rlt、smolvla：$POLICY_TYPE" >&2; exit 2 ;;
+esac
+for pair in \
+    "--train_expert_only:$TRAIN_EXPERT_ONLY" \
+    "--gradient_checkpointing:$GRADIENT_CHECKPOINTING" \
+    "--acp_enabled:$ACP_ENABLED"; do
+    validate_bool "${pair%%:*}" "${pair#*:}"
+done
+validate_bool "--tensorboard.enable" "$TENSORBOARD_ENABLE"
+if [[ "$POLICY_TYPE" != "pi05_rlt" && "$ACP_ENABLED" == "true" ]]; then
+    echo "[错误] ACP task 标签只属于独立策略 pi05_rlt" >&2
+    exit 2
+fi
+if [[ -z "$DATASET_REPO_ID" ]]; then
+    DATASET_REPO_ID="local/$(basename "${DATASET_ROOT%/}")"
 fi
 
-# if [ -d "${OUTPUT_DIR}" ]; then
-#     rm -rf "${OUTPUT_DIR:?}"/*
-#     echo "已清空 ${OUTPUT_DIR}"
-# else
-#     mkdir -p "${OUTPUT_DIR}"
-#     echo "目录不存在，已创建 ${OUTPUT_DIR}"
-# fi
 
-#!/bin/bash
+# Use the exact current training dataset factory, including the policy's action horizon,
+# and decode one video-backed item. This is read-only and never rewrites the old dataset.
+if ! "$PYTHON_BIN" - "$DATASET_ROOT" "$DATASET_REPO_ID" "$POLICY_TYPE" "$ACP_ENABLED" "$ACP_INDICATOR_FIELD" <<'PY'
+import sys
+from pathlib import Path
 
-# ─────────────────────────────────────────────
-#  wait_18h.sh
-#  等待 18 小时后执行任务，每 30 分钟打印一次剩余时间
-# ─────────────────────────────────────────────
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.factory import make_dataset
+from lerobot.policies.factory import make_policy_config
+from lerobot.utils.recording_annotations import ACP_INDICATOR_FIELD_ALIASES
 
-# TOTAL_SECONDS=$((24 * 3600))   # 24 小时 = 86400 秒
-# INTERVAL=$((30 * 60))          # 每 0.5 小时 = 1800 秒
-# ELAPSED=0
+root = Path(sys.argv[1]).resolve()
+repo_id, policy_type = sys.argv[2], sys.argv[3]
+acp_enabled = sys.argv[4].lower() == "true"
+requested_indicator = sys.argv[5]
+policy = make_policy_config(policy_type, device="cpu")
+cfg = TrainPipelineConfig(
+    dataset=DatasetConfig(repo_id=repo_id, root=str(root)),
+    policy=policy,
+    num_workers=0,
+    batch_size=1,
+    steps=1,
+)
+dataset = make_dataset(cfg)
+required = {"observation.state", "action"}
+missing = sorted(required - set(dataset.meta.features))
+if missing:
+    raise SystemExit(f"dataset is missing required training features: {missing}")
+if not dataset.meta.camera_keys:
+    raise SystemExit("dataset has no observation image/video features")
+if acp_enabled:
+    candidates = tuple(dict.fromkeys((requested_indicator, *ACP_INDICATOR_FIELD_ALIASES)))
+    matched = next((field for field in candidates if field in dataset.meta.features), None)
+    if matched is None:
+        raise SystemExit(
+            "ACP is enabled but no ACP indicator column exists. Run lerobot-value-infer first "
+            f"or disable ACP. Checked: {candidates}"
+        )
+    print(f"[数据检查] ACP indicator: {matched}")
+sample = dataset[0]
+action = sample["action"]
+print(
+    f"[数据检查] 可直接训练：episodes={dataset.num_episodes}, frames={dataset.num_frames}, "
+    f"fps={dataset.fps}, action_shape={tuple(action.shape)}"
+)
+print(f"[数据检查] cameras={dataset.meta.camera_keys}")
+print(f"[数据检查] episode_columns={dataset.meta.episodes.column_names}")
+PY
+then
+    echo "[错误] 当前训练工厂不能直接读取该数据集。请先用 lerobot-migrate-evorl-dataset --direction to-canonical 非覆盖转换。" >&2
+    exit 2
+fi
 
-# START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-# END_TIME=$(date -d "+18 hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-#            || date -v+18H '+%Y-%m-%d %H:%M:%S')   # 兼容 macOS
+if [[ "$CHECK_ONLY" == "true" ]]; then
+    exit 0
+fi
+if [[ -z "$HISTORY_PRETRAINED_PATH" ]]; then
+    if [[ -z "$MODELZOO_PATH" ]]; then
+        echo "[错误] 训练需要 --history_pretrained_path，或提供包含基础策略的 --ModelZoo" >&2
+        exit 2
+    fi
+    case "$POLICY_TYPE" in
+        pi05|pi05_rlt) HISTORY_PRETRAINED_PATH="${MODELZOO_PATH}/pi05base" ;;
+        smolvla) HISTORY_PRETRAINED_PATH="${MODELZOO_PATH}/smolvla_base" ;;
+    esac
+fi
+if [[ ! -f "$HISTORY_PRETRAINED_PATH/config.json" || ! -f "$HISTORY_PRETRAINED_PATH/model.safetensors" ]]; then
+    echo "[错误] checkpoint 缺少 config.json 或 model.safetensors：$HISTORY_PRETRAINED_PATH" >&2
+    exit 2
+fi
+if [[ -z "$POLICY_REPO_ID" ]]; then
+    POLICY_REPO_ID="local/${POLICY_TYPE}_$(basename "${OUTPUT_DIR%/}")"
+fi
 
-# echo "╔══════════════════════════════════════════╗"
-# echo "║          ⏳  24 小时倒计时启动            ║"
-# echo "╚══════════════════════════════════════════╝"
-# echo "  开始时间：$START_TIME"
-# echo "  预计执行：$END_TIME"
-# echo "  打印间隔：每 30 分钟"
-# echo "──────────────────────────────────────────"
+CHECKPOINT_TYPE="$($PYTHON_BIN - "$HISTORY_PRETRAINED_PATH/config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+payload = json.loads(Path(sys.argv[1]).read_text())
+print(payload.get("type", ""))
+PY
+)"
+if [[ -z "$CHECKPOINT_TYPE" ]]; then
+    echo "[错误] checkpoint config.json 缺少 type" >&2
+    exit 2
+fi
 
-# while [ "$ELAPSED" -lt "$TOTAL_SECONDS" ]; do
-#     REMAINING=$((TOTAL_SECONDS - ELAPSED))
-#     REM_H=$((REMAINING / 3600))
-#     REM_M=$(( (REMAINING % 3600) / 60 ))
+# Parse only the config with current LeRobot before any multi-GB weight load.
+if ! "$PYTHON_BIN" - "$HISTORY_PRETRAINED_PATH" <<'PY'
+import sys
+import lerobot.policies  # noqa: F401 - registers current policy configs
+from lerobot.configs import PreTrainedConfig
+cfg = PreTrainedConfig.from_pretrained(sys.argv[1])
+print(f"[模型检查] current config OK: type={cfg.type}")
+PY
+then
+    echo "[错误] 这是旧模型配置，不是当前 LeRobot checkpoint。请先转换模型；不要直接用于新版训练。" >&2
+    exit 2
+fi
 
-#     printf "[%s]  剩余时间：%2d 小时 %02d 分钟\n" \
-#            "$(date '+%H:%M:%S')" "$REM_H" "$REM_M"
+POLICY_ARGS=()
+if [[ "$CHECKPOINT_TYPE" == "$POLICY_TYPE" ]]; then
+    # Matching current checkpoint: let current LeRobot load its complete saved config.
+    POLICY_ARGS+=("--policy.path=${HISTORY_PRETRAINED_PATH}")
+elif [[ "$POLICY_TYPE" == "pi05_rlt" && "$CHECKPOINT_TYPE" == "pi05" ]]; then
+    # Deliberate cross-type initialization: current PI0.5 weights plus fresh RLT tensors.
+    POLICY_ARGS+=("--policy.type=pi05_rlt" "--policy.pretrained_path=${HISTORY_PRETRAINED_PATH}")
+else
+    echo "[错误] checkpoint type=${CHECKPOINT_TYPE}，不能初始化 policy_type=${POLICY_TYPE}" >&2
+    exit 2
+fi
 
-#     sleep "$INTERVAL"
-#     ELAPSED=$((ELAPSED + INTERVAL))
-# done
+TRAIN_LAUNCHER=("$PYTHON_BIN")
+if (( NUM_GPUS > 1 )); then
+    # Current LeRobot owns all Accelerate settings in TrainPipelineConfig. Launching a default
+    # topology with torchrun makes ParallelismConfig resolve dp_replicate to WORLD_SIZE (plain DDP).
+    TRAIN_LAUNCHER+=(
+        -m
+        torch.distributed.run
+        --standalone
+        "--nproc-per-node=${NUM_GPUS}"
+    )
+fi
 
-# echo "──────────────────────────────────────────"
-# echo "✅  等待结束！开始执行任务..."
-# echo "   执行时间：$(date '+%Y-%m-%d %H:%M:%S')"
-# echo "══════════════════════════════════════════"
+CMD=(
+    "${TRAIN_LAUNCHER[@]}"
+    -m
+    lerobot.scripts.lerobot_train
+    "--dataset.repo_id=${DATASET_REPO_ID}"
+    "--dataset.root=${DATASET_ROOT}"
+    --dataset.streaming=false
+    "${POLICY_ARGS[@]}"
+    "--policy.device=${DEVICE}"
+    --policy.push_to_hub=false
+    "--policy.repo_id=${POLICY_REPO_ID}"
+    "--batch_size=${BATCH_SIZE}"
+    "--accelerator.gradient_accumulation.steps=${GRADIENT_ACCUMULATION_STEPS}"
+    "--accelerator.mixed_precision=${MIXED_PRECISION}"
+    "--steps=${STEPS}"
+    "--save_freq=${SAVE_FREQ}"
+    "--log_freq=${LOG_FREQ}"
+    "--num_workers=${NUM_WORKERS}"
+    --env_eval_freq=0
+    --save_checkpoint=true
+    --checkpoint_format=safetensors
+    --use_policy_training_preset=true
+    "--output_dir=${OUTPUT_DIR}/train"
+    "--job_name=${JOB_NAME}"
+    --wandb.enable=false
+    "--tensorboard.enable=${TENSORBOARD_ENABLE}"
+    "--tensorboard.log_dir=${OUTPUT_DIR}/tensoborad"
+)
 
+case "$POLICY_TYPE" in
+    pi05|pi05_rlt)
+        CMD+=(
+            "--policy.dtype=${DTYPE}"
+            "--policy.train_expert_only=${TRAIN_EXPERT_ONLY}"
+            "--policy.gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
+        )
+        ;;
+    smolvla)
+        CMD+=("--policy.train_expert_only=${TRAIN_EXPERT_ONLY}")
+        ;;
+esac
+if [[ "$POLICY_TYPE" == "pi05_rlt" ]]; then
+    CMD+=(
+        "--policy.rlt_alpha=${RLT_ALPHA}"
+        "--policy.acp_enabled=${ACP_ENABLED}"
+        "--policy.acp_indicator_field=${ACP_INDICATOR_FIELD}"
+        "--policy.acp_indicator_dropout_prob=${ACP_INDICATOR_DROPOUT_PROB}"
+    )
+fi
+CMD+=("${FORWARD_ARGS[@]}")
 
-# ---------- Step 1: value 训练 ----------
-# 推荐参数：batch_size * gradient_accumulation_steps =64, steps=2000
-# echo "[Step 1/3] 开始 value 训练..."
-# lerobot-value-train \
-#     --dataset.repo_id=local_data \
-#     "--dataset.root=${DATASET_ROOT}" \
-#     --value.type=pistar06 \
-#     --value.dtype=bfloat16 \
-#     --value.push_to_hub=False \
-#     --value.repo_id=local_value_model \
-#     --value.vision_repo_id="${MODELZOO_PATH}/siglip-so400m-patch14-384" \
-#     --value.language_repo_id="${MODELZOO_PATH}/gemma-3-270m" \
-#     --value.device="cuda" \
-#     --batch_size=16 \
-#     --steps=8000 \
-#     --save_freq=2000 \
-#     --gradient_accumulation_steps=4 \
-#     "--output_dir=${OUTPUT_DIR}/value_train" \
-#     --job_name=value_train \
-#     --wandb.enable=false \
-#     # --value.freeze_vision_encoder=true \
-#     # --value.freeze_language_model=true \
-# echo "[Step 1/3] value 训练完成，模型已保存至 ${OUTPUT_DIR}/value_train"
-# echo "[Step 2/3] 即将开始 value 推理..."
+if (( NUM_GPUS > 1 )); then
+    echo "[并行训练] 单机 DDP：${NUM_GPUS} 个进程；可见 GPU=${CUDA_VISIBLE_DEVICES:-全部}"
+else
+    echo "[并行训练] 单进程"
+fi
+printf '[训练命令] '
+printf '%q ' "${CMD[@]}"
+printf '\n'
+if [[ "$DRY_RUN" == "true" ]]; then
+    exit 0
+fi
 
-# # # ---------- Step 2: value 推理 ----------
-# lerobot-value-infer \
-#     --dataset.repo_id=local_data \
-#     "--dataset.root=${DATASET_ROOT}" \
-#     "--inference.checkpoint_path=${OUTPUT_DIR}/value_train" \
-#     --runtime.device="cuda" \
-#     --runtime.batch_size=64 \
-#     --acp.enable=true \
-#     --acp.n_step=50 \
-#     --acp.positive_ratio=0.3 \
-#     --acp.value_field=complementary_info.value_field \
-#     --acp.advantage_field=complementary_info.advantage_field \
-#     --acp.indicator_field=complementary_info.indicator_field\
-#     --acp.force_intervention_positive=True \
-#     "--output_dir=${OUTPUT_DIR}/value_infer" \
-#     --job_name=value_infer \
-#     --viz.enable=true \
-#     --viz.episodes=all \
-#     --viz.video_keys=observation.images.top,observation.images.wrist \
-#     --viz.smooth_window=5 \
-#     --viz.overwrite=false \
-#     --viz.frame_storage_mode=memory \
-#     --viz.indicator_only=false
-# echo "[Step 2/3] value 推理完成，结果已保存至 ${OUTPUT_DIR}/value_infer"
-# echo "[Step 3/3] 即将开始策略训练..."
-
-# ---------- Step 3: 策略训练 ----------
-# 推荐参数：batch_size=32，steps=30000，--use_8bit_optimizer=false
-# 若显存低于34G，可以选择开启--use_8bit_optimizer=true
-# 预训练权重：传了 --history_pretrained_path 就用它（从上一轮策略继续），否则用基础模型。
-# --sft_train=true时，直接对给定数据集进行SFT训练
-POLICY_PRETRAINED_PATH="${HISTORY_PRETRAINED_PATH:-${MODELZOO_PATH}/pi05base}"
-echo "[Step 3/3] policy.pretrained_path = ${POLICY_PRETRAINED_PATH}"
-
-
-lerobot-train \
-    --use_8bit_optimizer=false \
-    --dataset.repo_id=local_data \
-    "--dataset.root=${DATASET_ROOT}" \
-    --policy.type=${policy_type} \
-    "--policy.pretrained_path=${POLICY_PRETRAINED_PATH}" \
-    --policy.device="cuda" \
-    --policy.train_expert_only=true \
-    --batch_size=32 \
-    --gradient_accumulation_steps=1 \
-    --steps=50000 \
-    --save_freq=10000 \
-    --acp.enable=true \
-    --acp.indicator_field=complementary_info.indicator_field \
-    --acp.indicator_dropout_prob=0.3 \
-    "--output_dir=${OUTPUT_DIR}/train" \
-    --job_name=VLA_train \
-    --wandb.enable=false \
-    --policy.push_to_hub=False \
-    --policy.repo_id=local_policy_model \
-    --sft_train=true \
-    --policy.dtype=bfloat16 \
-    # --policy.vlm_model_name=/home/yz/modelZoo/HuggingFaceTB--SmolVLM2-500M-Video-Instruct \
-    # --policy.dtype=bfloat16 \
-    # --policy.use_rlt=true \
-    # --policy.device=cpu \
-    # --resume=true \
-    # --config_path=/path/to/output_dir/checkpoints/last/pretrained_model/train_config.json
-    # --policy.gradient_checkpointing=true \
-
-# 多卡训练
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
-    --multi_gpu \
-    --num_processes=4 \
-    --mixed_precision=bf16 \
-    "$(command -v lerobot-train)" \
-    --use_8bit_optimizer=false \
-    --dataset.repo_id=local_data \
-    "--dataset.root=${DATASET_ROOT}" \
-    --policy.type=${policy_type} \
-    "--policy.pretrained_path=${POLICY_PRETRAINED_PATH}" \
-    --policy.device="cuda" \
-    --policy.train_expert_only=true \
-    --batch_size=32 \
-    --gradient_accumulation_steps=1 \
-    --steps=20000 \
-    --save_freq=5000 \
-    --acp.enable=true \
-    --acp.indicator_field=complementary_info.indicator_field \
-    --acp.indicator_dropout_prob=0.3 \
-    "--output_dir=${OUTPUT_DIR}/train" \
-    --job_name=VLA_train \
-    --wandb.enable=false \
-    --policy.push_to_hub=False \
-    --policy.repo_id=local_policy_model \
-    --sft_train=true \
-    --policy.dtype=bfloat16
-
-
-echo "[Step 3/3] 策略训练完成"
-# ---------- 输出策略模型保存路径 ----------
-echo "OUTPUT_DIR: ${OUTPUT_DIR}/train/checkpoints/last/pretrained_model"
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+exec "${CMD[@]}"

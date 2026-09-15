@@ -47,27 +47,38 @@ import draccus
 import grpc
 import torch
 
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+
+# `lerobot.cameras.realsense` imports pyrealsense2 eagerly whenever the package is merely
+# installed, and on some platforms it is installed but not loadable (e.g. a Jetson wheel built
+# against a newer glibc). Probe the dependency itself rather than the camera module, so a missing
+# realsense only costs us that camera type, while any other import error still surfaces.
+try:
+    import pyrealsense2  # noqa: F401
+except ImportError as e:
+    logging.warning("realsense camera type unavailable: pyrealsense2 failed to import (%s)", e)
+else:
+    from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_piper_follower,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
     omx_follower,
-    piper_follower,
     so_follower,
+    unitree_g1,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
-from .constants import SUPPORTED_ROBOTS
 from .helpers import (
     Action,
     FPSTracker,
@@ -487,8 +498,9 @@ class RobotClient:
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
-    if cfg.robot.type not in SUPPORTED_ROBOTS:
-        raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
+    # TODO: Assert if checking robot support is still needed with the plugin system
+    # if cfg.robot.type not in SUPPORTED_ROBOTS:
+    #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
 
     client = RobotClient(cfg)
 
@@ -514,4 +526,5 @@ def async_client(cfg: RobotClientConfig):
 
 
 if __name__ == "__main__":
+    register_third_party_plugins()
     async_client()  # run the client

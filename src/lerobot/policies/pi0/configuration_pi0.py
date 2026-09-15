@@ -16,12 +16,11 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
-from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
+from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+
+from ..rtc.configuration_rtc import RTCConfig
 
 DEFAULT_IMAGE_SIZE = 224
 
@@ -49,6 +48,13 @@ class PI0Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+
+    # Relative actions: converts absolute actions to relative (relative to state).
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -95,6 +101,7 @@ class PI0Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
+    text_tokenizer_name: str = "google/paligemma-3b-pt-224"
 
     def __post_init__(self):
         super().__post_init__()

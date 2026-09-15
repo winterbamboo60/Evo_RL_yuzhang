@@ -18,13 +18,18 @@ class ValueInferenceDatasetConfig:
     root: str | None = None
     episodes: list[int] | None = None
     revision: str | None = None
+    repo_type: str = "dataset"
     download_videos: bool = True
+    video_backend: str | None = None
+    return_uint8: bool = False
     success_field: str = "episode_success"
     default_success: str = "failure"
 
     def validate(self) -> None:
         if not self.repo_id:
             raise ValueError("'dataset.repo_id' must be non-empty.")
+        if self.repo_type not in {"dataset", "bucket"}:
+            raise ValueError("'dataset.repo_type' must be either 'dataset' or 'bucket'.")
         if not self.success_field:
             raise ValueError("'dataset.success_field' must be non-empty.")
 

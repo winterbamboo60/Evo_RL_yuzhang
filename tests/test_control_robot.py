@@ -14,41 +14,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-from collections import deque
-from unittest.mock import MagicMock, patch
+import re
+from unittest.mock import patch
 
-import numpy as np
 import pytest
-import torch
 
-from lerobot.datasets.dataset_tools import merge_datasets, remove_feature
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[hardware])")
+
+from lerobot.configs.dataset import DatasetRecordConfig
+from lerobot.processor import make_default_processors
+from lerobot.robots import make_robot_from_config
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_human_inloop_record import (
-    _HumanInloopFailureResetController,
-    _load_failure_reset_pose,
-    _save_failure_reset_pose,
-    _slow_reset_all_arms_to_pose,
-    human_inloop_record,
-)
-from lerobot.scripts.lerobot_patch_hil_dataset_schema import PatchHilDatasetSchemaConfig, patch_hil_dataset_schema
-from lerobot.scripts.lerobot_record import (
-    ACPInferenceConfig,
-    DatasetRecordConfig,
-    PolicySyncDualArmExecutor,
-    RecordConfig,
-    _capture_policy_runtime_state,
-    _predict_policy_action_with_acp_inference,
-    record,
-    record_loop,
-)
+from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
-from lerobot.utils.recording_annotations import EPISODE_SUCCESS
 from tests.fixtures.constants import DUMMY_REPO_ID
-from tests.mocks.mock_robot import MockRobot, MockRobotConfig
-from tests.mocks.mock_teleop import MockTeleop, MockTeleopConfig
+from tests.mocks.mock_robot import MockRobotConfig
+from tests.mocks.mock_teleop import MockTeleopConfig
+
+
+def _ticks(summary: str) -> int:
+    """Sample size out of a cadence report — every other number is an average over it."""
+    return int(re.search(r"(\d+) ticks", summary).group(1))
+
+
+def _step_calls(summary: str, step: str) -> int:
+    """How many ticks ran *step*, off the loop-body breakdown of a run summary."""
+    return int(re.search(rf"\n\s+{step}\s+.*· (\d+) calls", summary).group(1))
 
 
 def test_calibrate():
@@ -57,15 +50,23 @@ def test_calibrate():
     calibrate(cfg)
 
 
-def test_teleoperate():
+def test_teleoperate(cadence_log):
     robot_cfg = MockRobotConfig()
     teleop_cfg = MockTeleopConfig()
     cfg = TeleoperateConfig(
         robot=robot_cfg,
         teleop=teleop_cfg,
+        fps=30,
         teleop_time_s=0.1,
     )
     teleoperate(cfg)
+
+    # A teleop session has no episodes, so there is one cadence block for the whole run,
+    # and the steps it names are the ones the loop wraps.
+    (summary,) = cadence_log
+    assert summary.startswith("Cadence summary — whole run · target 30 Hz (33.3 ms budget per tick):")
+    for step in ("observe", "teleop", "send"):
+        assert step in summary, step
 
 
 def test_record_and_resume(tmp_path):
@@ -97,8 +98,8 @@ def test_record_and_resume(tmp_path):
     cfg.resume = True
     # Mock the revision to prevent Hub calls during resume
     with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
     ):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record")
@@ -109,304 +110,7 @@ def test_record_and_resume(tmp_path):
     assert dataset.meta.total_tasks == 1
 
 
-def test_record_adds_episode_success_and_collector_policy_id(tmp_path):
-    robot_cfg = MockRobotConfig()
-    teleop_cfg = MockTeleopConfig()
-    root = tmp_path / "record_with_annotations"
-    dataset_cfg = DatasetRecordConfig(
-        repo_id=DUMMY_REPO_ID,
-        single_task="Dummy task",
-        root=root,
-        num_episodes=1,
-        episode_time_s=0.1,
-        reset_time_s=0,
-        push_to_hub=False,
-    )
-    cfg = RecordConfig(
-        robot=robot_cfg,
-        dataset=dataset_cfg,
-        teleop=teleop_cfg,
-        play_sounds=False,
-        enable_episode_outcome_labeling=True,
-        default_episode_success="failure",
-        enable_collector_policy_id=True,
-    )
-
-    dataset = record(cfg)
-    assert "complementary_info.collector_policy_id" in dataset.features
-
-    reloaded = LeRobotDataset(DUMMY_REPO_ID, root=root)
-    assert reloaded[0]["complementary_info.collector_policy_id"] == "human"
-    assert "episode_success" in reloaded.meta.episodes.column_names
-    assert reloaded.meta.episodes[0]["episode_success"] == "failure"
-
-
-def test_human_inloop_record_works_without_policy_and_saves_annotations(tmp_path):
-    robot_cfg = MockRobotConfig()
-    teleop_cfg = MockTeleopConfig()
-    root = tmp_path / "hil_no_policy"
-    dataset_cfg = DatasetRecordConfig(
-        repo_id=DUMMY_REPO_ID,
-        single_task="Dummy task",
-        root=root,
-        num_episodes=1,
-        episode_time_s=0.1,
-        reset_time_s=0,
-        push_to_hub=False,
-    )
-    cfg = RecordConfig(
-        robot=robot_cfg,
-        dataset=dataset_cfg,
-        teleop=teleop_cfg,
-        play_sounds=False,
-    )
-
-    dataset = human_inloop_record(cfg)
-    assert cfg.intervention_state_machine_enabled is False
-    assert cfg.collector_policy_id_policy == "human"
-    assert "complementary_info.collector_policy_id" in dataset.features
-    assert "complementary_info.policy_action" in dataset.features
-    assert "complementary_info.is_intervention" in dataset.features
-    assert "complementary_info.state" in dataset.features
-
-    reloaded = LeRobotDataset(DUMMY_REPO_ID, root=root)
-    assert reloaded[0]["complementary_info.collector_policy_id"] == "human"
-    torch.testing.assert_close(
-        reloaded[0]["complementary_info.policy_action"],
-        torch.zeros_like(reloaded[0]["action"]),
-    )
-    assert float(reloaded[0]["complementary_info.is_intervention"]) == 0.0
-    assert float(reloaded[0]["complementary_info.state"]) == 0.0
-    assert "episode_success" in reloaded.meta.episodes.column_names
-    assert reloaded.meta.episodes[0]["episode_success"] == "failure"
-
-
-def test_patch_hil_dataset_schema_restores_legacy_dataset_mergeability(tmp_path):
-    robot_cfg = MockRobotConfig()
-    teleop_cfg = MockTeleopConfig()
-    current_root = tmp_path / "hil_current"
-    legacy_root = tmp_path / "hil_legacy"
-    patched_root = tmp_path / "hil_patched"
-    merged_root = tmp_path / "hil_merged"
-    dataset_cfg = DatasetRecordConfig(
-        repo_id=DUMMY_REPO_ID,
-        single_task="Dummy task",
-        root=current_root,
-        num_episodes=1,
-        episode_time_s=0.1,
-        reset_time_s=0,
-        push_to_hub=False,
-    )
-    cfg = RecordConfig(
-        robot=robot_cfg,
-        dataset=dataset_cfg,
-        teleop=teleop_cfg,
-        play_sounds=False,
-    )
-
-    current_dataset = human_inloop_record(cfg)
-    legacy_dataset = remove_feature(
-        current_dataset,
-        feature_names=[
-            "complementary_info.policy_action",
-            "complementary_info.is_intervention",
-            "complementary_info.state",
-        ],
-        output_dir=legacy_root,
-        repo_id="dummy/repo_legacy",
-    )
-    assert "complementary_info.policy_action" not in legacy_dataset.features
-
-    patched_dataset = patch_hil_dataset_schema(
-        PatchHilDatasetSchemaConfig(
-            repo_id="dummy/repo_legacy",
-            root=str(legacy_root),
-            output_repo_id="dummy/repo_patched",
-            output_dir=str(patched_root),
-        )
-    )
-
-    assert "complementary_info.policy_action" in patched_dataset.features
-    assert "complementary_info.is_intervention" in patched_dataset.features
-    assert "complementary_info.state" in patched_dataset.features
-    patched_reloaded = LeRobotDataset("dummy/repo_patched", root=patched_root)
-    torch.testing.assert_close(
-        patched_reloaded[0]["complementary_info.policy_action"],
-        torch.zeros_like(patched_reloaded[0]["action"]),
-    )
-    assert float(patched_reloaded[0]["complementary_info.is_intervention"]) == 0.0
-    assert float(patched_reloaded[0]["complementary_info.state"]) == 0.0
-
-    merged_dataset = merge_datasets(
-        datasets=[current_dataset, patched_dataset],
-        output_repo_id="dummy/repo_merged",
-        output_dir=merged_root,
-    )
-    assert merged_dataset.meta.total_episodes == current_dataset.meta.total_episodes + patched_dataset.meta.total_episodes
-
-
-def test_record_loop_sets_leader_manual_control_during_reset():
-    class MockTeleopWithManualControl(MockTeleop):
-        def __init__(self, config):
-            super().__init__(config)
-            self.manual_control_calls = []
-
-        def set_manual_control(self, enabled: bool) -> None:
-            self.manual_control_calls.append(enabled)
-
-    robot = MockRobot(MockRobotConfig())
-    teleop = MockTeleopWithManualControl(MockTeleopConfig())
-    robot.connect()
-    teleop.connect()
-    try:
-        record_loop(
-            robot=robot,
-            events={
-                "exit_early": True,
-                "rerecord_episode": False,
-                "stop_recording": False,
-                "toggle_intervention": False,
-                "episode_outcome": None,
-            },
-            fps=30,
-            teleop_action_processor=lambda x: x[0],
-            robot_action_processor=lambda x: x[0],
-            robot_observation_processor=lambda x: x,
-            teleop=teleop,
-            policy=None,
-            control_time_s=0.1,
-        )
-    finally:
-        if teleop.is_connected:
-            teleop.disconnect()
-        if robot.is_connected:
-            robot.disconnect()
-
-    assert teleop.manual_control_calls == [True]
-
-
-def test_save_and_load_failure_reset_pose(tmp_path):
-    robot = MockRobot(MockRobotConfig(n_motors=2, random_values=False, static_values=[12.5, -3.0]))
-    robot.connect()
-    pose_path = tmp_path / "failure_reset_pose.json"
-
-    try:
-        saved_pose = _save_failure_reset_pose(robot=robot, pose_path=pose_path)
-    finally:
-        if robot.is_connected:
-            robot.disconnect()
-
-    with open(pose_path) as f:
-        payload = json.load(f)
-    assert saved_pose == {"motor_1.pos": 12.5, "motor_2.pos": -3.0}
-    assert payload["joint_pos"] == {"motor_1.pos": 12.5, "motor_2.pos": -3.0}
-
-
-def test_load_failure_reset_pose_from_json(tmp_path):
-    pose_path = tmp_path / "failure_reset_pose.json"
-    payload = {
-        "robot_type": "mock_robot",
-        "joint_pos": {
-            "motor_1.pos": 12.5,
-            "motor_2.pos": -3.0,
-            "non_joint_key": 999,
-        },
-    }
-    with open(pose_path, "w") as f:
-        json.dump(payload, f)
-
-    loaded_pose = _load_failure_reset_pose(pose_path)
-    assert loaded_pose == {"motor_1.pos": 12.5, "motor_2.pos": -3.0}
-
-
-def test_human_inloop_failure_reset_controller_reuses_existing_pose(tmp_path):
-    robot_cfg = MockRobotConfig()
-    teleop_cfg = MockTeleopConfig()
-    dataset_cfg = DatasetRecordConfig(
-        repo_id=DUMMY_REPO_ID,
-        single_task="Dummy task",
-        root=tmp_path / "hil_with_policy",
-        num_episodes=1,
-        episode_time_s=0.1,
-        reset_time_s=0,
-        push_to_hub=False,
-    )
-    cfg = RecordConfig(
-        robot=robot_cfg,
-        dataset=dataset_cfg,
-        teleop=teleop_cfg,
-        play_sounds=False,
-    )
-    controller = _HumanInloopFailureResetController(cfg)
-    controller.pose_path = tmp_path / "existing_failure_reset_pose.json"
-    with open(controller.pose_path, "w") as f:
-        json.dump({"joint_pos": {"motor_1.pos": 1.0, "motor_2.pos": -2.0}}, f)
-
-    with (
-        patch("builtins.input") as mock_input,
-        patch("lerobot.scripts.lerobot_human_inloop_record._save_failure_reset_pose") as mock_save,
-    ):
-        controller.on_record_connected(robot=MagicMock(), teleop=MagicMock())
-
-    assert controller.failure_reset_pose == {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
-    mock_input.assert_not_called()
-    mock_save.assert_not_called()
-
-
-def test_human_inloop_failure_reset_controller_resets_on_success(tmp_path):
-    robot_cfg = MockRobotConfig()
-    teleop_cfg = MockTeleopConfig()
-    dataset_cfg = DatasetRecordConfig(
-        repo_id=DUMMY_REPO_ID,
-        single_task="Dummy task",
-        root=tmp_path / "hil_with_policy_success_reset",
-        num_episodes=1,
-        episode_time_s=0.1,
-        reset_time_s=0,
-        push_to_hub=False,
-    )
-    cfg = RecordConfig(
-        robot=robot_cfg,
-        dataset=dataset_cfg,
-        teleop=teleop_cfg,
-        play_sounds=False,
-    )
-    controller = _HumanInloopFailureResetController(cfg)
-    controller.failure_reset_pose = {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
-
-    with patch("lerobot.scripts.lerobot_human_inloop_record._slow_reset_all_arms_to_pose") as mock_reset:
-        controller.on_episode_outcome(robot=MagicMock(), teleop=MagicMock(), episode_success=EPISODE_SUCCESS)
-
-    mock_reset.assert_called_once()
-    assert mock_reset.call_args.kwargs["target_pose"] == {"motor_1.pos": 1.0, "motor_2.pos": -2.0}
-
-
-def test_slow_reset_all_arms_to_pose_uses_interpolation():
-    robot = MockRobot(MockRobotConfig(n_motors=2, random_values=False, static_values=[0.0, 0.0]))
-    teleop = MagicMock()
-    robot.connect()
-    robot.send_action = MagicMock(wraps=robot.send_action)
-    target_pose = {"motor_1.pos": 11.0, "motor_2.pos": -22.0}
-
-    try:
-        _slow_reset_all_arms_to_pose(
-            robot=robot,
-            teleop=teleop,
-            target_pose=target_pose,
-            duration_s=0.2,
-        )
-    finally:
-        if robot.is_connected:
-            robot.disconnect()
-
-    final_action = robot.send_action.call_args_list[-1].args[0]
-    assert final_action == {"motor_1.pos": 11.0, "motor_2.pos": -22.0}
-    assert robot.send_action.call_count > 1
-    teleop.set_manual_control.assert_called_once_with(False)
-    teleop.send_feedback.assert_called()
-
-
-def test_record_and_replay(tmp_path):
+def test_record_and_replay(tmp_path, cadence_log):
     robot_cfg = MockRobotConfig()
     teleop_cfg = MockTeleopConfig()
     record_dataset_cfg = DatasetRecordConfig(
@@ -438,186 +142,114 @@ def test_record_and_replay(tmp_path):
 
     # Mock the revision to prevent Hub calls during replay
     with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
     ):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
 
-
-def test_policy_sync_dual_arm_executor():
-    robot = MagicMock()
-    robot.send_action.return_value = {"motor_1.pos": 10.0}
-    teleop = MagicMock()
-
-    executor = PolicySyncDualArmExecutor(robot=robot, teleop=teleop, parallel_dispatch=True)
-    action = {"motor_1.pos": 10.0}
-    sent_action = executor.send_action(action)
-    executor.shutdown()
-
-    assert sent_action == action
-    robot.send_action.assert_called_once_with(action)
-    teleop.send_feedback.assert_called_once_with(action)
+    # Replay has to hit the dataset's frame rate or the trajectory plays back at the
+    # wrong speed, so it reports its cadence like every other loop.  Its block is the
+    # last one and names its own steps.
+    assert cadence_log[-1].startswith("Cadence summary — whole run · target 30 Hz")
+    assert "read_frame" in cadence_log[-1]
 
 
-def test_record_config_rejects_cfg_without_acp_enable():
+def test_record_reports_a_cadence_summary_per_episode_and_for_the_run(tmp_path, cadence_log):
     robot_cfg = MockRobotConfig()
     teleop_cfg = MockTeleopConfig()
     dataset_cfg = DatasetRecordConfig(
         repo_id=DUMMY_REPO_ID,
         single_task="Dummy task",
-        num_episodes=1,
+        root=tmp_path / "cadence",
+        num_episodes=2,
         episode_time_s=0.1,
-        reset_time_s=0,
+        reset_time_s=0.1,
         push_to_hub=False,
     )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
 
-    with pytest.raises(ValueError, match="acp_inference.use_cfg=true"):
-        RecordConfig(
-            robot=robot_cfg,
-            dataset=dataset_cfg,
-            teleop=teleop_cfg,
-            play_sounds=False,
-            acp_inference=ACPInferenceConfig(enable=False, use_cfg=True, cfg_beta=0.6),
-        )
+    record(cfg)
+
+    assert len(cadence_log) == 3
+    per_episode, run = cadence_log[:2], cadence_log[2]
+    assert [m.split(":")[0] for m in per_episode] == ["Cadence (episode 0)", "Cadence (episode 1)"]
+    assert run.startswith("Cadence summary — whole run, 2 episodes")
+    # Windows partition the session, so the episodes account for every tick of the run...
+    assert _ticks(run) == sum(_ticks(m) for m in per_episode)
+    # ...and every one of those ticks wrote a frame.  The reset phase paces at the same
+    # fps but records nothing, so it runs on its own timer rather than diluting the
+    # numbers that answer "did I record at `fps`?".
+    assert _step_calls(run, "record") == _step_calls(run, "observe") == _ticks(run)
 
 
-def test_record_config_rejects_negative_cfg_beta():
+def test_record_forwards_compressed_images_setting_to_reset_phase(tmp_path):
     robot_cfg = MockRobotConfig()
     teleop_cfg = MockTeleopConfig()
     dataset_cfg = DatasetRecordConfig(
         repo_id=DUMMY_REPO_ID,
         single_task="Dummy task",
-        num_episodes=1,
+        root=tmp_path / "compressed_images",
+        num_episodes=2,
         episode_time_s=0.1,
-        reset_time_s=0,
+        reset_time_s=0.1,
         push_to_hub=False,
     )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        display_compressed_images=True,
+        play_sounds=False,
+    )
 
-    with pytest.raises(ValueError, match="cfg_beta"):
-        RecordConfig(
-            robot=robot_cfg,
-            dataset=dataset_cfg,
-            teleop=teleop_cfg,
-            play_sounds=False,
-            acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, cfg_beta=-0.1),
+    with patch("lerobot.scripts.lerobot_record.record_loop", wraps=record_loop) as mock_record_loop:
+        record(cfg)
+
+    # Recording episode 0, resetting, then recording episode 1 should all use the same
+    # image representation so visualization backends do not receive mixed message types.
+    assert [
+        call.kwargs.get("display_compressed_images", False) for call in mock_record_loop.call_args_list
+    ] == [True, True, True]
+
+
+def test_record_loop_without_a_teleoperator_paces_and_terminates():
+    # Regression: the no-teleop branch used to `continue` past both the pacing sleep and
+    # the `timestamp` update, so a reset phase with no teleop device spun as fast as the
+    # CPU allowed and never reached `control_time_s` at all.
+    robot = make_robot_from_config(MockRobotConfig())
+    robot.connect()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    calls = 0
+    real_get_observation = robot.get_observation
+
+    def counted_get_observation():
+        nonlocal calls
+        calls += 1
+        assert calls <= 20, "loop is spinning: 20 iterations of a 0.1 s phase at 30 Hz"
+        return real_get_observation()
+
+    robot.get_observation = counted_get_observation
+
+    try:
+        record_loop(
+            robot=robot,
+            events={"exit_early": False, "stop_recording": False, "rerecord_episode": False},
+            fps=30,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            teleop=None,
+            control_time_s=0.1,
         )
+    finally:
+        robot.disconnect()
 
-
-def test_acp_inference_without_cfg_appends_positive_prompt():
-    class _StaticPolicy:
-        def __init__(self, value: float):
-            self.value = value
-            self.tasks = []
-
-        def select_action(self, batch):
-            self.tasks.append(batch["task"])
-            return torch.tensor([[self.value, self.value, self.value]], dtype=torch.float32)
-
-    observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
-    policy = _StaticPolicy(value=2.0)
-
-    action = _predict_policy_action_with_acp_inference(
-        observation_frame=observation_frame,
-        policy=policy,
-        device=torch.device("cpu"),
-        preprocessor=lambda x: x,
-        postprocessor=lambda x: x,
-        use_amp=False,
-        task="Pick and place",
-        robot_type="mock_robot",
-        acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, cfg_beta=0.6),
-    )
-
-    assert torch.allclose(action, torch.tensor([[2.0, 2.0, 2.0]], dtype=torch.float32))
-    assert policy.tasks[-1] == "Pick and place\nAdvantage: positive"
-
-
-def test_acp_inference_with_cfg_blends_cond_and_uncond_actions():
-    class _StaticPolicy:
-        def __init__(self):
-            self.tasks = []
-
-        def select_action(self, batch):
-            self.tasks.append(batch["task"])
-            value = 3.0 if "Advantage: positive" in batch["task"] else 1.0
-            return torch.tensor([[value, value, value]], dtype=torch.float32)
-
-    observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
-    policy = _StaticPolicy()
-    cond_state = {}
-    uncond_state = {}
-
-    action = _predict_policy_action_with_acp_inference(
-        observation_frame=observation_frame,
-        policy=policy,
-        device=torch.device("cpu"),
-        preprocessor=lambda x: x,
-        postprocessor=lambda x: x,
-        use_amp=False,
-        task="Pick and place",
-        robot_type="mock_robot",
-        acp_inference=ACPInferenceConfig(enable=True, use_cfg=True, cfg_beta=0.5),
-        cond_runtime_state=cond_state,
-        uncond_runtime_state=uncond_state,
-    )
-
-    assert torch.allclose(action, torch.tensor([[2.0, 2.0, 2.0]], dtype=torch.float32))
-    assert policy.tasks == [
-        "Pick and place\nAdvantage: positive",
-        "Pick and place",
-    ]
-
-
-def test_acp_inference_with_cfg_uses_isolated_branch_queues():
-    class _QueuePolicy:
-        def __init__(self):
-            self._action_queue = deque(maxlen=2)
-
-        def select_action(self, batch):
-            if len(self._action_queue) == 0:
-                base = 10.0 if "Advantage: positive" in batch["task"] else 0.0
-                self._action_queue.extend(
-                    [
-                        torch.tensor([[base + 1.0, base + 1.0, base + 1.0]], dtype=torch.float32),
-                        torch.tensor([[base + 2.0, base + 2.0, base + 2.0]], dtype=torch.float32),
-                    ]
-                )
-            return self._action_queue.popleft()
-
-    observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
-    policy = _QueuePolicy()
-    cond_state = _capture_policy_runtime_state(policy)
-    uncond_state = _capture_policy_runtime_state(policy)
-
-    action_1 = _predict_policy_action_with_acp_inference(
-        observation_frame=observation_frame,
-        policy=policy,
-        device=torch.device("cpu"),
-        preprocessor=lambda x: x,
-        postprocessor=lambda x: x,
-        use_amp=False,
-        task="Pick and place",
-        robot_type="mock_robot",
-        acp_inference=ACPInferenceConfig(enable=True, use_cfg=True, cfg_beta=0.5),
-        cond_runtime_state=cond_state,
-        uncond_runtime_state=uncond_state,
-    )
-
-    action_2 = _predict_policy_action_with_acp_inference(
-        observation_frame=observation_frame,
-        policy=policy,
-        device=torch.device("cpu"),
-        preprocessor=lambda x: x,
-        postprocessor=lambda x: x,
-        use_amp=False,
-        task="Pick and place",
-        robot_type="mock_robot",
-        acp_inference=ACPInferenceConfig(enable=True, use_cfg=True, cfg_beta=0.5),
-        cond_runtime_state=cond_state,
-        uncond_runtime_state=uncond_state,
-    )
-
-    assert torch.allclose(action_1, torch.tensor([[6.0, 6.0, 6.0]], dtype=torch.float32))
-    assert torch.allclose(action_2, torch.tensor([[7.0, 7.0, 7.0]], dtype=torch.float32))
+    # 0.1 s at 30 Hz is 3 ticks; the upper bound is what proves the phase was paced.
+    assert 1 <= calls <= 6

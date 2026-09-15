@@ -21,8 +21,8 @@ from functools import cached_property
 from importlib import resources
 from typing import Any
 
+from lerobot.lerobot_types import RobotAction
 from lerobot.motors import MotorCalibration
-from lerobot.processor import RobotAction
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.piper_sdk import (
@@ -317,6 +317,14 @@ class PiperLeader(Teleoperator):
 
     def configure(self) -> None:
         self.set_manual_control(self.config.manual_control)
+
+    def enable_torque(self) -> None:
+        """Hold the leader in command mode for smooth rollout handover."""
+        self.set_manual_control(False)
+
+    def disable_torque(self) -> None:
+        """Enter gravity-compensated manual mode for human intervention."""
+        self.set_manual_control(True)
 
     def _read_joint_from_ctrl(self) -> dict[str, float] | None:
         joint_ctrl_msg = self.arm.GetArmJointCtrl()

@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 """Nonblocking keyboard controls for online human-in-the-loop RL."""
 
 from __future__ import annotations
@@ -17,8 +15,7 @@ from queue import Empty, Queue
 
 EPISODE_SUCCESS = "success"
 EPISODE_FAILURE = "failure"
-
-HOTKEYS = "I: manual takeover, S: success, F: failure, LEFT: rerecord, R: reset+rerecord, ESC: stop"
+HOTKEYS = "C: manual takeover, B: success, F: failure, A: abandon+rerecord, R: reset+rerecord, ESC: stop"
 INTERVENTION_TOGGLE_COOLDOWN_S = 0.35
 
 
@@ -48,21 +45,20 @@ class KeyboardController:
                 key = self._events.get_nowait()
             except Empty:
                 break
-
             normalized = key.lower() if len(key) == 1 else key
             if normalized == "ESC":
                 state.stop = True
                 state.exit_episode = True
-            elif normalized == "LEFT":
+            elif normalized == "a":
                 state.rerecord_episode = True
                 state.exit_episode = True
-            elif normalized == "i":
+            elif normalized == "c":
                 now = time.monotonic()
                 if now - self._last_intervention_time < INTERVENTION_TOGGLE_COOLDOWN_S:
                     continue
                 self._last_intervention_time = now
                 state.toggle_intervention = True
-            elif normalized == "s":
+            elif normalized == "b":
                 state.episode_outcome = EPISODE_SUCCESS
                 state.exit_episode = True
             elif normalized == "f":
@@ -79,8 +75,6 @@ class KeyboardController:
 
 
 class TTYKeyboardListener:
-    """Read hotkeys from the current terminal for SSH/headless sessions."""
-
     def __init__(self, controller: KeyboardController) -> None:
         self.controller = controller
         self._fd = sys.stdin.fileno()
@@ -114,12 +108,9 @@ class TTYKeyboardListener:
                 if not ready:
                     break
                 sequence.extend(os.read(self._fd, 1))
-                last_byte = bytes(sequence[-1:])
-                if len(sequence) >= 3 and last_byte in {b"A", b"B", b"C", b"D", b"~"}:
+                if len(sequence) >= 3 and bytes(sequence[-1:]) in {b"A", b"B", b"C", b"D", b"~"}:
                     break
             sequence_bytes = bytes(sequence)
-            if sequence_bytes in {b"\x1b[D", b"\x1bOD"}:
-                return "LEFT"
             if sequence_bytes == b"\x1b":
                 return "ESC"
             return None
@@ -128,11 +119,10 @@ class TTYKeyboardListener:
     def _run(self) -> None:
         while not self._stop.is_set():
             ready, _, _ = select.select([self._fd], [], [], 0.1)
-            if not ready:
-                continue
-            key = self._read_key()
-            if key:
-                self.controller.push(key)
+            if ready:
+                key = self._read_key()
+                if key:
+                    self.controller.push(key)
 
 
 def start_keyboard_listener(controller: KeyboardController) -> object | None:
@@ -142,9 +132,7 @@ def start_keyboard_listener(controller: KeyboardController) -> object | None:
         logging.info("Global keyboard hotkeys unavailable; trying TTY: %s", error)
     else:
         def on_press(key):
-            if key == keyboard.Key.left:
-                controller.push("LEFT")
-            elif key == keyboard.Key.esc:
+            if key == keyboard.Key.esc:
                 controller.push("ESC")
             else:
                 controller.push(getattr(key, "char", "") or "")
@@ -157,7 +145,6 @@ def start_keyboard_listener(controller: KeyboardController) -> object | None:
         else:
             logging.info("Global keyboard hotkeys enabled through pynput: %s", HOTKEYS)
             return listener
-
     if sys.stdin.isatty():
         try:
             listener = TTYKeyboardListener(controller)
@@ -167,7 +154,6 @@ def start_keyboard_listener(controller: KeyboardController) -> object | None:
         else:
             logging.info("Keyboard hotkeys enabled on current TTY: %s", HOTKEYS)
             return listener
-
     logging.warning("Keyboard hotkeys disabled: neither pynput nor a usable TTY is available.")
     return None
 

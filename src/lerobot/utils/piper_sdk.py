@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
+import math
 import time
 from functools import lru_cache
 from typing import Any
-import math
 
 PIPER_JOINT_NAMES = (
     "joint_1",
@@ -42,19 +42,23 @@ def milli_to_unit(value: float | int) -> float:
 def unit_to_milli(value: float | int) -> int:
     return int(round(float(value) * 1e3))
 
+
 def joint_adjust(value: float | int) -> int:
     return int(round(float(value) * 1000 * 180 / math.pi))
 
+
 def gripper_adjust(value: float | int) -> int:
     return abs(int(round(float(value) * 70 * 1000)))
+
 
 @lru_cache(maxsize=1)
 def get_piper_sdk() -> tuple[type[Any], Any]:
     try:
         # from piper_sdk import C_PiperInterface_V2, LogLevel
         # return C_PiperInterface_V2, LogLevel
-        
+
         from piper_sdk import C_PiperInterface_V3, LogLevel
+
         return C_PiperInterface_V3, LogLevel
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(

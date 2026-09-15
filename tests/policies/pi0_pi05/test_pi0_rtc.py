@@ -23,11 +23,10 @@ import torch
 
 # Skip this entire module in CI
 pytestmark = pytest.mark.skipif(
-    os.environ.get("CI") == "true"
-    or os.environ.get("GITHUB_ACTIONS") == "true"
-    or not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
-    reason="This test requires local OpenPI setup and authenticated HF access token",
+    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="TODO: This test seems to hang the CI",
 )
+
 
 from lerobot.configs.types import FeatureType, PolicyFeature, RTCAttentionSchedule  # noqa: E402
 from lerobot.policies.pi0 import PI0Config, PI0Policy, make_pi0_pre_post_processors  # noqa: E402
@@ -90,6 +89,7 @@ def test_pi0_rtc_initialization_without_rtc_config():
     print("✓ PI0 RTC initialization without RTC config: Test passed")
 
 
+@require_cuda
 def test_pi0_rtc_inference_with_prev_chunk():
     """Test PI0 policy inference with RTC and previous chunk."""
     set_seed(42)

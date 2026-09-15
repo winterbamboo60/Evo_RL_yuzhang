@@ -1,13 +1,37 @@
-import functools
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
 import logging
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
-from PIL import Image
-from torchvision.transforms.functional import InterpolationMode, to_pil_image
-from transformers import AutoModel, AutoTokenizer
+import torchvision.transforms.functional as tvf
+from torchvision.transforms.functional import InterpolationMode
+
+from lerobot.utils.import_utils import _transformers_available, require_package
+
+if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoModel, AutoTokenizer
+    from transformers.utils import is_flash_attn_2_available
+else:
+    AutoModel = None
+    AutoTokenizer = None
+    is_flash_attn_2_available = None
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -15,446 +39,328 @@ IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"  # nosec B105
 IMG_START_TOKEN = "<img>"  # nosec B105
 IMG_END_TOKEN = "</img>"  # nosec B105
 
+logger = logging.getLogger(__name__)
 
-# === Image Transformations ===
-def build_transform(input_size):
-    return T.Compose(
-        [
-            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
+
+def _batched_resize_01(images: torch.Tensor, image_size: int) -> torch.Tensor:
+    """Resize a batch of ``[0, 1]`` images to ``(image_size, image_size)`` on-device.
+
+    Numerically mirrors InternVL3's reference PIL preprocessing
+    (``to_pil_image`` -> ``Image.resize`` -> ``to_tensor``): the float input is quantized to uint8
+    exactly as ``to_pil_image`` does, then resized with bicubic interpolation and antialiasing,
+    which matches PIL's default resampler. Matching the reference pixel-for-pixel keeps the policy
+    interchangeable with checkpoints produced by the upstream EVO1 preprocessing.
+
+    Args:
+        images: float tensor of shape ``(N, C, H, W)`` with values in ``[0, 1]``.
+
+    Returns:
+        float32 tensor of shape ``(N, C, image_size, image_size)`` with values in ``[0, 1]``.
+    """
+    # to_pil_image() quantizes float [0, 1] to uint8 (x * 255, truncated); replicate that so the
+    # bicubic resample sees the same integer pixels PIL would.
+    pixels_u8 = (images * 255.0).clamp(0, 255).to(torch.uint8)
+    resized = tvf.resize(
+        pixels_u8, [image_size, image_size], interpolation=InterpolationMode.BICUBIC, antialias=True
     )
+    return resized.to(torch.float32) / 255.0
 
 
-# === Aspect Ratio Handling ===
-@functools.lru_cache(maxsize=10000)
-def get_target_aspect_ratio(orig_width, orig_height, image_size, min_num, max_num):
-    aspect_ratio = orig_width / orig_height
-    target_ratios = {
-        (i, j)
-        for n in range(min_num, max_num + 1)
-        for i in range(1, n + 1)
-        for j in range(1, n + 1)
-        if i * j <= max_num and i * j >= min_num
-    }
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+def _batched_pixel_values(
+    camera_images: Sequence[torch.Tensor],
+    max_views: int,
+    image_size: int,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build InternVL3 ``pixel_values`` from per-camera ``[0, 1]`` image batches without leaving the device.
 
-    best_ratio_diff = float("inf")
-    best_ratio = (1, 1)
-    area = orig_width * orig_height
-    for ratio in target_ratios:
-        target_ar = ratio[0] / ratio[1]
-        diff = abs(aspect_ratio - target_ar)
-        if diff < best_ratio_diff:
-            best_ratio_diff = diff
-            best_ratio = ratio
-        elif diff == best_ratio_diff and area > 0.5 * image_size**2 * ratio[0] * ratio[1]:
-            best_ratio = ratio
-    return best_ratio
+    Each image is resized, converted to ``dtype``, and ImageNet-normalized (a single tile per
+    image), batched across the whole minibatch. Absent views (fewer cameras than ``max_views``)
+    are filled with zero images; their placeholder tokens are masked out of attention downstream
+    via ``_mask_absent_image_tokens``.
 
+    Returns:
+        ``pixel_values`` of shape ``(B * max_views, C, image_size, image_size)``, ordered row-major
+        over ``(sample, view)`` to line up with the per-view image placeholders in the prompt.
+    """
+    resized: list[torch.Tensor] = []
+    for image in camera_images:
+        resized.append(_batched_resize_01(image.to(device=device), image_size).to(dtype))
 
-def dynamic_preprocess(image, min_num=1, max_num=1, image_size=448, use_thumbnail=False):
-    orig_width, orig_height = image.size
-    target_aspect_ratio = get_target_aspect_ratio(orig_width, orig_height, image_size, min_num, max_num)
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size,
-        )
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images
+    batch_size = resized[0].shape[0]
+    channels = resized[0].shape[1]
+    while len(resized) < max_views:
+        resized.append(torch.zeros(batch_size, channels, image_size, image_size, dtype=dtype, device=device))
+
+    stacked = torch.stack(resized[:max_views], dim=1)  # (B, V, C, H, W)
+    mean = mean.to(device=device, dtype=dtype).view(1, 1, -1, 1, 1)
+    std = std.to(device=device, dtype=dtype).view(1, 1, -1, 1, 1)
+    normalized = (stacked - mean) / std
+    return normalized.reshape(batch_size * max_views, channels, image_size, image_size)
 
 
 class InternVL3Embedder(nn.Module):
+    """Vision-language embedder using the native HF InternVL3 model (no trust_remote_code)."""
+
     def __init__(
         self,
-        model_name="OpenGVLab/InternVL3-1B",
+        model_name="OpenGVLab/InternVL3-1B-hf",
         image_size=448,
         device="cuda",
         num_language_layers: int | None = 14,
         model_dtype: str | torch.dtype = "bfloat16",
         use_flash_attn: bool = True,
-        enable_gradient_checkpointing: bool = False,
-        enable_tensor_fastpath: bool = True,
+        max_text_length: int = 1024,
+        enable_gradient_checkpointing: bool = True,
         gradient_checkpointing_use_reentrant: bool = False,
+        hub_kwargs: dict | None = None,
     ):
         super().__init__()
         self._requested_device = device
         self.image_size = image_size
         self.num_language_layers = num_language_layers
-        self.max_text_length = 1024  # InternVL3 supports up to 1024 tokens
+        self.max_text_length = max_text_length
         self.enable_gradient_checkpointing = bool(enable_gradient_checkpointing)
-        self.enable_tensor_fastpath = bool(enable_tensor_fastpath)
         self.gradient_checkpointing_use_reentrant = bool(gradient_checkpointing_use_reentrant)
-        self.transform = build_transform(image_size)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
+        hub_kwargs = hub_kwargs or {}
+
+        require_package("transformers", extra="evo1")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hub_kwargs)
         if isinstance(model_dtype, str):
             try:
                 model_dtype = getattr(torch, model_dtype)
             except AttributeError as exc:
                 raise ValueError(f"Unsupported EVO1 vlm_dtype '{model_dtype}'") from exc
+        self.model_dtype = model_dtype
+
+        attn_implementation = (
+            "flash_attention_2" if (use_flash_attn and is_flash_attn_2_available()) else "eager"
+        )
+        if use_flash_attn and attn_implementation == "eager":
+            logger.warning(
+                "Flash Attention 2 is unavailable on this runtime. Falling back to eager attention."
+            )
+
         self.model = AutoModel.from_pretrained(
             model_name,
             torch_dtype=model_dtype,
-            trust_remote_code=True,
-            use_flash_attn=use_flash_attn,
+            attn_implementation=attn_implementation,
             low_cpu_mem_usage=True,
-            _fast_init=False,
+            **hub_kwargs,
         ).to(self._requested_device)
 
-        if hasattr(self.model.language_model, "model"):
-            layers = self.model.language_model.model.layers
+        checkpoint_image_size = getattr(self.model.config.vision_config, "image_size", None)
+        if isinstance(checkpoint_image_size, (list, tuple)):
+            checkpoint_image_size = checkpoint_image_size[0]
+        if checkpoint_image_size is not None and int(checkpoint_image_size) != int(image_size):
+            raise ValueError(
+                f"EVO1 image_resolution ({image_size}) must match the InternVL checkpoint's native "
+                f"image size ({checkpoint_image_size}): the checkpoint's image_seq_length assumes "
+                "its native resolution, so other sizes would desync the image placeholder tokens "
+                "from the vision features."
+            )
 
-        else:
-            layers = self.model.language_model.layers
+        self.num_image_token = self.model.config.image_seq_length
+
+        # Truncate language model to the requested number of layers
+        layers = self.model.language_model.layers
         if self.num_language_layers is not None:
             layers = layers[: self.num_language_layers]
+        self.model.language_model.layers = torch.nn.ModuleList(layers)
 
-        if hasattr(self.model.language_model, "model"):
-            self.model.language_model.model.layers = torch.nn.ModuleList(layers)
-        else:
-            self.model.language_model.layers = torch.nn.ModuleList(layers)
-        self.model.language_model.lm_head = torch.nn.Identity()
         self._configure_memory_features()
-
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
 
     def _configure_memory_features(self) -> None:
         checkpoint_kwargs = {"use_reentrant": self.gradient_checkpointing_use_reentrant}
 
-        def _enable_ckpt(module) -> bool:
-            if module is None or not hasattr(module, "gradient_checkpointing_enable"):
-                return False
-            module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
-            return True
-
         if not self.enable_gradient_checkpointing:
-            if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
-                self.model.vision_model.encoder.gradient_checkpointing = False
+            language_model = self.model.language_model
+            if hasattr(language_model, "gradient_checkpointing_disable"):
+                language_model.gradient_checkpointing_disable()
+            vision_tower = getattr(self.model, "vision_tower", None)
+            if vision_tower is not None and hasattr(vision_tower, "encoder"):
+                vision_tower.encoder.gradient_checkpointing = False
             return
 
-        enabled_any = False
-        enabled_any = _enable_ckpt(self.model) or enabled_any
+        def _enable_ckpt(module: nn.Module | None) -> bool:
+            if module is None:
+                return False
+            if hasattr(module, "gradient_checkpointing_enable"):
+                try:
+                    module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
+                except TypeError:
+                    module.gradient_checkpointing_enable()
+                return True
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+                return True
+            return False
 
-        if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
-            self.model.vision_model.encoder.gradient_checkpointing = True
-            enabled_any = True
+        enabled_any = _enable_ckpt(self.model)
 
-        if hasattr(self.model, "language_model"):
-            language_model = self.model.language_model
-            enabled_any = _enable_ckpt(language_model) or enabled_any
-            if hasattr(language_model, "model"):
-                enabled_any = _enable_ckpt(language_model.model) or enabled_any
-            if hasattr(language_model, "config"):
-                language_model.config.use_cache = False
+        vision_tower = getattr(self.model, "vision_tower", None)
+        if vision_tower is not None:
+            enabled_any = _enable_ckpt(vision_tower) or enabled_any
+
+        language_model = self.model.language_model
+        enabled_any = _enable_ckpt(language_model) or enabled_any
+        if hasattr(language_model, "config"):
+            language_model.config.use_cache = False
 
         if hasattr(self.model, "config"):
             self.model.config.use_cache = False
-
         if hasattr(self.model, "enable_input_require_grads"):
             self.model.enable_input_require_grads()
 
         if enabled_any:
-            logging.info(
-                "Enabled InternVL3 gradient checkpointing (use_reentrant=%s).",
-                self.gradient_checkpointing_use_reentrant,
-            )
+            logger.info("Gradient checkpointing enabled for InternVL3 embedder.")
         else:
-            logging.warning("Requested InternVL3 gradient checkpointing, but no checkpointable module was found.")
-
-    def _dynamic_preprocess_tensor(
-        self, image_t, min_num=1, max_num=1, use_thumbnail=False
-    ):
-        # image_t shape expected: [C, H, W]
-        C, orig_height, orig_width = image_t.shape
-
-        # get ratio by cache
-        target_aspect_ratio = get_target_aspect_ratio(
-            orig_width, orig_height, self.image_size, min_num, max_num
-        )
-
-        ratio_w, ratio_h = target_aspect_ratio[0], target_aspect_ratio[1]
-        target_width = self.image_size * ratio_w
-        target_height = self.image_size * ratio_h
-        blocks = ratio_w * ratio_h
-
-        # Resize on GPU
-        # image_t expected shape for interpolate is [C, H, W] mapping to size
-        resized_img = TF.resize(
-            image_t,
-            size=[target_height, target_width],
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-
-        # Eliminate the for-loop using view and permute for zero-copy strided tensor tiling
-        # resized_img shape: [C, ratio_h * image_size, ratio_w * image_size]
-        # 1. view to -> [C, ratio_h, image_size, ratio_w, image_size]
-        reshaped = resized_img.view(C, ratio_h, self.image_size, ratio_w, self.image_size)
-        # 2. permute to -> [ratio_h, ratio_w, C, image_size, image_size]
-        permuted = reshaped.permute(1, 3, 0, 2, 4)
-        # 3. reshape to -> [blocks, C, image_size, image_size]
-        stacked_tiles = permuted.reshape(blocks, C, self.image_size, self.image_size)
-
-        if use_thumbnail and blocks != 1:
-            thumbnail_img = TF.resize(
-                image_t,
-                size=[self.image_size, self.image_size],
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True,
-            )
-            # Concat the thumbnail directly along the batch dimension
-            stacked_tiles = torch.cat([stacked_tiles, thumbnail_img.unsqueeze(0)], dim=0)
-
-        return stacked_tiles
-
-    def _preprocess_images(
-        self, image_tensors_batch: list[list[Image.Image | torch.Tensor]]
-    ) -> tuple[torch.Tensor, list[list[int]]]:
-        pixel_values_list = []
-        batch_num_tiles_list = []
-        model_dtype = next(self.model.parameters()).dtype
-        mean = torch.tensor(IMAGENET_MEAN, device=self.device, dtype=torch.float32).view(
-            1, 3, 1, 1
-        )
-        std = torch.tensor(IMAGENET_STD, device=self.device, dtype=torch.float32).view(
-            1, 3, 1, 1
-        )
-
-        for image_tensors in image_tensors_batch:
-            num_tiles_list = []
-            for image in image_tensors:
-                if isinstance(image, torch.Tensor) and self.enable_tensor_fastpath:
-                    if (
-                        image.ndim == 3
-                        and image.shape[0] == 3
-                        and image.shape[1] == self.image_size
-                        and image.shape[2] == self.image_size
-                    ):
-                        image_t = image.to(device=self.device)
-                        if not torch.is_floating_point(image_t):
-                            image_t = image_t.to(torch.float32) / 255.0
-                        else:
-                            image_t = image_t.to(torch.float32)
-                            if float(image_t.max().item()) > 1.0:
-                                image_t = image_t / 255.0
-                        tile_tensors = (image_t.unsqueeze(0) - mean) / std
-                    else:
-                        image_t = image.to(device=self.device, dtype=torch.float32)
-                        if not torch.is_floating_point(image):
-                            image_t = image_t / 255.0
-                        else:
-                            if float(image_t.max().item()) > 1.0:
-                                image_t = image_t / 255.0
-                        tiles = self._dynamic_preprocess_tensor(image_t)
-                        tile_tensors = (tiles - mean) / std
-                else:
-                    if isinstance(image, torch.Tensor):
-                        image = to_pil_image(image.detach().to(device="cpu"))
-                    image_t = TF.to_tensor(image).to(device=self.device, dtype=torch.float32)
-                    tiles = self._dynamic_preprocess_tensor(image_t)
-                    tile_tensors = (tiles - mean) / std
-
-                tile_tensors = tile_tensors.to(dtype=model_dtype)
-                pixel_values_list.append(tile_tensors)
-                num_tiles_list.append(tile_tensors.shape[0])
-            batch_num_tiles_list.append(num_tiles_list)
-
-        if pixel_values_list:
-            pixel_values = torch.cat(pixel_values_list, dim=0)
-        else:
-            pixel_values = torch.empty(
-                0,
-                3,
-                self.image_size,
-                self.image_size,
-                dtype=model_dtype,
-                device=self.device,
+            logger.warning(
+                "Requested gradient checkpointing, but model does not expose checkpointing controls."
             )
 
-        return pixel_values, batch_num_tiles_list
-
-    def _build_multimodal_prompt(
+    def _build_multimodal_prompts(
         self,
         batch_num_tiles_list: list[list[int]],
-        text_prompts: list[str],
+        text_prompts: Sequence[str],
     ) -> list[str]:
-        if len(batch_num_tiles_list) != len(text_prompts):
-            raise ValueError(
-                f"InternVL3 batch mismatch: num_image_batches={len(batch_num_tiles_list)} num_text_prompts={len(text_prompts)}"
-            )
-
         prompts = []
         for num_tiles_list, text_prompt in zip(batch_num_tiles_list, text_prompts, strict=True):
             prompt_segments = []
             for i, tile_count in enumerate(num_tiles_list):
-                token_count = self.model.num_image_token * tile_count
+                token_count = self.num_image_token * tile_count
                 image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * token_count + IMG_END_TOKEN
                 prompt_segments.append(f"Image-{i + 1}: {image_tokens}\n")
             prompts.append("".join(prompt_segments) + text_prompt.strip())
-
         return prompts
 
-    def _prepare_and_fuse_embeddings(
+    def get_fused_image_text_embedding_batched(
         self,
-        prompts: list[str],
-        vit_embeds: torch.Tensor,
+        camera_images: Sequence[torch.Tensor],
+        image_masks: torch.Tensor,
+        text_prompts: Sequence[str],
+        return_cls_only: bool = True,
+    ):
+        """Fused VL embedding from per-camera ``[0, 1]`` image batches (no PIL, no host round-trip).
+
+        Args:
+            camera_images: list of per-camera tensors, each shaped ``(B, C, H, W)`` in ``[0, 1]``.
+            image_masks: bool tensor ``(B, max_views)`` marking present views.
+
+        Returns:
+            A ``(embeddings, valid_mask)`` tuple. With ``return_cls_only=False``, ``embeddings`` is
+            ``(B, L, H)`` and ``valid_mask`` is a ``(B, L)`` bool tensor marking tokens downstream
+            attention may attend to (padding and absent-view tokens are False). With
+            ``return_cls_only=True``, ``embeddings`` is the pooled ``(B, H)`` last-valid-token state
+            and ``valid_mask`` is None.
+        """
+        max_views = int(image_masks.shape[1])
+        batch_size = int(image_masks.shape[0])
+        mean = torch.tensor(IMAGENET_MEAN, device=self.device, dtype=self.model_dtype)
+        std = torch.tensor(IMAGENET_STD, device=self.device, dtype=self.model_dtype)
+        pixel_values = _batched_pixel_values(
+            camera_images, max_views, self.image_size, mean, std, self.model_dtype, self.device
+        )
+        # InternVL3 preprocessing uses a single tile per image (max_num=1).
+        batch_num_tiles_list = [[1] * max_views for _ in range(batch_size)]
+        return self._forward_vlm(
+            pixel_values, batch_num_tiles_list, image_masks, text_prompts, return_cls_only
+        )
+
+    def _mask_absent_image_tokens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         image_masks: torch.Tensor,
         batch_num_tiles_list: list[list[int]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        untruncated_ids = self.tokenizer(prompts, padding=False, truncation=False)["input_ids"]
-        true_sequence_length = max((len(ids) for ids in untruncated_ids), default=0)
+    ) -> torch.Tensor:
+        """Zero attention over the image-context tokens of absent (zero-padded) views.
 
-        if true_sequence_length > self.max_text_length:
-            logging.warning(
-                "InternVL3 prompt truncated in batch: max_length=%s actual_max_length=%s",
-                self.max_text_length,
-                true_sequence_length,
-            )
+        Fully vectorized: runs without any host<->device synchronization.
+        """
+        # A single tile per image (max_num=1), so every image occupies the same number of
+        # context tokens.
+        tiles_per_image = (
+            batch_num_tiles_list[0][0] if batch_num_tiles_list and batch_num_tiles_list[0] else 1
+        )
+        tokens_per_image = self.num_image_token * tiles_per_image
+
+        image_masks = image_masks.to(device=input_ids.device).bool()
+        img_token_mask = input_ids == self.img_context_token_id  # (B, L)
+        # keep[b, k] tells whether the k-th image-context token (ordered view0, view1, ...) survives.
+        per_token_keep = image_masks.repeat_interleave(tokens_per_image, dim=1)  # (B, V * tokens_per_image)
+        # Rank each context token by its running position among the row's context tokens.
+        ctx_index = img_token_mask.to(torch.long).cumsum(dim=1) - 1
+        ctx_index = ctx_index.clamp(min=0, max=per_token_keep.shape[1] - 1)
+        keep_here = torch.gather(per_token_keep, 1, ctx_index)  # (B, L)
+        drop = img_token_mask & ~keep_here
+        return attention_mask.masked_fill(drop, 0)
+
+    def _forward_vlm(
+        self,
+        pixel_values: torch.Tensor,
+        batch_num_tiles_list: list[list[int]],
+        image_masks: torch.Tensor,
+        text_prompts: Sequence[str],
+        return_cls_only: bool,
+    ):
+        if pixel_values.shape[0] == 0:
+            logger.warning("InternVL3 received an empty image batch after preprocessing.")
+            hidden_size = getattr(self.model.config, "hidden_size", None)
+            if hidden_size is None:
+                hidden_size = getattr(self.model.config.text_config, "hidden_size", None)
+            if hidden_size is None:
+                raise RuntimeError("Unable to infer hidden size for empty InternVL3 batch.")
+            return torch.empty(0, hidden_size, device=self.device, dtype=torch.float32), None
+
+        prompts = self._build_multimodal_prompts(batch_num_tiles_list, text_prompts)
 
         model_inputs = self.tokenizer(
-            prompts,
+            list(prompts),
             return_tensors="pt",
-            padding="max_length",
+            padding=True,
             truncation=True,
             max_length=self.max_text_length,
         ).to(self.device)
         input_ids = model_inputs["input_ids"]
-        attention_mask = model_inputs["attention_mask"]
-
-        img_token_mask = input_ids == self.img_context_token_id
-        input_embeds = self.model.language_model.get_input_embeddings()(input_ids).clone()
-        batch_size, _, channels = input_embeds.shape
-        vit_embeds = vit_embeds.reshape(-1, channels).to(device=input_embeds.device, dtype=input_embeds.dtype)
-
-        tokens_per_tile = self.model.num_image_token
-        vit_idx = 0
-        actual_vis_tokens_list = img_token_mask.sum(dim=1).tolist()
-
-        for batch_idx in range(batch_size):
-            expected_vis_tokens = sum(batch_num_tiles_list[batch_idx]) * tokens_per_tile
-            actual_vis_tokens = int(actual_vis_tokens_list[batch_idx])
-            if actual_vis_tokens > expected_vis_tokens:
+        if input_ids.shape[1] >= self.max_text_length:
+            # Truncation cuts from the right, so text is dropped before image placeholders — but a
+            # large max_views * image_seq_length budget can still eat into them. Fail loudly instead
+            # of letting the VLM crash on a placeholder/vision-feature count mismatch.
+            expected_image_tokens = self.num_image_token * sum(batch_num_tiles_list[0])
+            image_token_counts = (input_ids == self.img_context_token_id).sum(dim=1)
+            if not bool((image_token_counts == expected_image_tokens).all()):
                 raise ValueError(
-                    "InternVL3 detected more image placeholder tokens than expected in prompt construction: "
-                    f"batch_idx={batch_idx}, actual={actual_vis_tokens}, expected={expected_vis_tokens}"
+                    f"Prompt truncation at max_text_length={self.max_text_length} cut into the "
+                    f"image placeholder tokens ({expected_image_tokens} expected per sample). "
+                    "Increase max_text_length or reduce max_views."
                 )
-
-            if vit_idx + expected_vis_tokens > vit_embeds.shape[0]:
-                raise ValueError(
-                    "InternVL3 produced fewer image tokens than expected for batch fusion: "
-                    f"need_up_to={vit_idx + expected_vis_tokens}, got={vit_embeds.shape[0]}"
-                )
-
-            item_vit_embeds = vit_embeds[vit_idx : vit_idx + expected_vis_tokens]
-            vit_idx += expected_vis_tokens
-
-            if actual_vis_tokens > 0:
-                input_embeds[batch_idx, img_token_mask[batch_idx]] = item_vit_embeds[:actual_vis_tokens]
-
-            current_token_idx = 0
-            img_token_locations = torch.where(img_token_mask[batch_idx])[0]
-            for image_idx, num_tiles_for_this_image in enumerate(batch_num_tiles_list[batch_idx]):
-                num_tokens_for_this_image = num_tiles_for_this_image * tokens_per_tile
-                if not bool(image_masks[batch_idx, image_idx].item()):
-                    start_offset = current_token_idx
-                    end_offset = min(
-                        current_token_idx + num_tokens_for_this_image,
-                        int(img_token_locations.shape[0]),
-                    )
-                    if start_offset < end_offset:
-                        masked_token_indices = img_token_locations[start_offset:end_offset]
-                        attention_mask[batch_idx, masked_token_indices] = 0
-                current_token_idx += num_tokens_for_this_image
-
-        return input_embeds, attention_mask
-
-    def get_fused_image_text_embedding_from_tensor_images(
-        self,
-        image_tensors: list[Image.Image | torch.Tensor] | list[list[Image.Image | torch.Tensor]],
-        image_mask: torch.Tensor,
-        text_prompt: str | list[str],
-        return_cls_only: bool = True,
-    ):
-        is_batched_input = bool(image_tensors) and isinstance(image_tensors[0], list)
-        if is_batched_input:
-            image_tensors_batch = image_tensors
-        else:
-            image_tensors_batch = [image_tensors]
-
-        batch_size = len(image_tensors_batch)
-        if batch_size == 0:
-            raise ValueError("InternVL3 expects at least one batch item.")
-
-        if isinstance(text_prompt, str):
-            text_prompts = [text_prompt] * batch_size
-        else:
-            text_prompts = text_prompt
-            if len(text_prompts) != batch_size:
-                raise ValueError(
-                    f"InternVL3 batch mismatch: num_text_prompts={len(text_prompts)} num_batches={batch_size}"
-                )
-
-        if image_mask.ndim == 1:
-            image_masks = image_mask.unsqueeze(0)
-        else:
-            image_masks = image_mask
-
-        if image_masks.shape[0] != batch_size:
-            raise ValueError(
-                f"InternVL3 batch mismatch: image_mask_batch={image_masks.shape[0]} num_batches={batch_size}"
-            )
-
-        for batch_idx, image_list in enumerate(image_tensors_batch):
-            if len(image_list) == 0:
-                raise ValueError(f"InternVL3 expects at least one image per batch item, got empty at batch_idx={batch_idx}")
-            if int(image_masks.shape[1]) != len(image_list):
-                raise ValueError(
-                    "InternVL3 mask/image count mismatch: "
-                    f"batch_idx={batch_idx}, num_masks={image_masks.shape[1]}, num_images={len(image_list)}"
-                )
-
-        image_masks = image_masks.to(device=self.device, dtype=torch.bool)
-        pixel_values, batch_num_tiles_list = self._preprocess_images(image_tensors_batch)
-
-        if pixel_values.shape[0] == 0:
-            logging.warning("InternVL3 received an empty image batch after preprocessing.")
-            hidden_size = self.model.language_model.get_input_embeddings().embedding_dim
-            vit_embeds = torch.empty(0, hidden_size, dtype=next(self.model.parameters()).dtype, device=self.device)
-        else:
-            vit_embeds = self.model.extract_feature(pixel_values)
-
-        prompts = self._build_multimodal_prompt(batch_num_tiles_list, text_prompts)
-        inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(
-            prompts,
-            vit_embeds,
-            image_masks,
-            batch_num_tiles_list,
+        attention_mask = self._mask_absent_image_tokens(
+            input_ids, model_inputs["attention_mask"], image_masks, batch_num_tiles_list
         )
 
-        outputs = self.model.language_model(
-            inputs_embeds=inputs_embeds,
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
         fused_hidden = outputs.hidden_states[-1].to(torch.float32)
-
-        return fused_hidden[:, 0, :] if return_cls_only else fused_hidden
+        valid_mask = attention_mask.to(torch.bool)
+        if return_cls_only:
+            # Right-padded causal decoder: the last valid token is the only one that has attended
+            # to the full image + text prompt.
+            positions = torch.arange(valid_mask.shape[1], device=valid_mask.device)
+            last_valid = (valid_mask.long() * positions).argmax(dim=1)
+            batch_index = torch.arange(fused_hidden.shape[0], device=fused_hidden.device)
+            return fused_hidden[batch_index, last_valid], None
+        return fused_hidden, valid_mask
 
     @property
     def device(self) -> torch.device:

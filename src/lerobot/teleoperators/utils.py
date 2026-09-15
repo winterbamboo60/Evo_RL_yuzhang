@@ -91,22 +91,26 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .openarm_leader import OpenArmLeader
 
         return OpenArmLeader(config)
-    elif config.type == "piper_leader":
-        from .piper_leader import PiperLeader
-
-        return PiperLeader(config)
-    elif config.type == "piperx_leader":
-        from .piper_leader import PiperXLeader
-
-        return PiperXLeader(config)
-    elif config.type in {"bi_piper_leader", "bi_piperx_leader"}:
-        from .bi_piper_leader import BiPiperLeader, BiPiperXLeader
-
-        return BiPiperXLeader(config) if config.type == "bi_piperx_leader" else BiPiperLeader(config)
     elif config.type == "bi_openarm_leader":
         from .bi_openarm_leader import BiOpenArmLeader
 
         return BiOpenArmLeader(config)
+    elif config.type == "openarm_mini":
+        from .openarm_mini import OpenArmMini
+
+        return OpenArmMini(config)
+    elif config.type == "bi_openarm_mini":
+        from .bi_openarm_mini import BiOpenArmMini
+
+        return BiOpenArmMini(config)
+    elif config.type == "rebot_102_leader":
+        from .rebot_102_leader import RebotArm102Leader
+
+        return RebotArm102Leader(config)
+    elif config.type == "bi_rebot_102_leader":
+        from .bi_rebot_102_leader import BiRebot102Leader
+
+        return BiRebot102Leader(config)
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))

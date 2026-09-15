@@ -17,11 +17,12 @@
 import logging
 import time
 from functools import cached_property
+
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.motors import MotorCalibration
-from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.piper_sdk import (
     PIPER_ACTION_KEYS,
@@ -291,19 +292,19 @@ class PiperFollower(Robot):
                 joint_targets = [self._offset_to_target(key, action[key]) for key in joint_keys]
 
             joint_commands = [unit_to_milli(value) for value in joint_targets]
-            
+
             # if add_offset:
-                # joint_commands = [
-                #     cmd + offset for cmd, offset in zip(joint_commands, self.config.joint_command_offset)
-                # ]
-                # 手动为从臂所有数据添加偏置
-                # joint_commands[0] = joint_commands[0] - 1670
-                # joint_commands[1] = joint_commands[1] - 104
-                # joint_commands[2] = joint_commands[2] + 408
-                # joint_commands[3] = joint_commands[3]
-                # joint_commands[4] = joint_commands[4] + 24348
-                # joint_commands[5] = joint_commands[5] + 1432
-                # self.robot.piper.JointCtrl(joint_0 - 1670, joint_1 - 104, joint_2 + 408, joint_3, joint_4 + 24348, joint_5 + 1432)
+            # joint_commands = [
+            #     cmd + offset for cmd, offset in zip(joint_commands, self.config.joint_command_offset)
+            # ]
+            # 手动为从臂所有数据添加偏置
+            # joint_commands[0] = joint_commands[0] - 1670
+            # joint_commands[1] = joint_commands[1] - 104
+            # joint_commands[2] = joint_commands[2] + 408
+            # joint_commands[3] = joint_commands[3]
+            # joint_commands[4] = joint_commands[4] + 24348
+            # joint_commands[5] = joint_commands[5] + 1432
+            # self.robot.piper.JointCtrl(joint_0 - 1670, joint_1 - 104, joint_2 + 408, joint_3, joint_4 + 24348, joint_5 + 1432)
 
             self.arm.JointCtrl(*joint_commands)  # MM
             # logging.info(f"follower {joint_commands}")
@@ -314,7 +315,6 @@ class PiperFollower(Robot):
             )
         elif any(key in action for key in joint_keys):
             logger.debug("Ignoring partial Piper joint action. Need all six joint keys to send command.")
-
 
         if self.config.sync_gripper and "gripper.pos" in action:
             if self._use_uncalibrated_passthrough():

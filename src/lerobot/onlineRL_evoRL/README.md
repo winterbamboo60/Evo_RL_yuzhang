@@ -1,118 +1,119 @@
 # onlineRL_evoRL 使用说明
 
-`onlineRL_evoRL` 的新正式采集入口是 `actor_new.py`，它直接包含环境、人工介入、保存、gRPC、PI05 Online Actor head、`B` 切换和 task 热键；`actor.py` 与 `actor_old.py` 保持不变。
+当前 0911 融合版只使用 `actor_new.py` 作为在线 Actor 入口；`scripts/RL_online.sh actor/both`
+也只会启动 `lerobot.onlineRL_evoRL.actor_new`。`actor.py` 与 `actor_old.py` 仅为历史兼容文件，
+不承载新的控制功能。learner 和 gRPC 字节分块协议继续使用当前 LeRobot 0.6.1 实现。
 
-顶层 `actor_mode` 和 `save_format` 决定运行方式：
+当前有效模式固定为：
 
-- `actor_mode=vla_only`：不连接 learner；`save_format` 可选 `lerobot` 或 `transition`。
-- `actor_mode=online_actor`：连接 learner并使用训练后的 Actor head；`save_format` 必须为 `transition`。
-- PI05 Online RL learner：冻结 PI0.5/RLT，只训练完整 action chunk Actor 和 twin-Q Critic。
+- `actor_mode=online_actor`
+- `save_format=transition`
+- `algorithm.type=rlt_chunk`
+- `actor_vla_policy.policy_path` 指向 PI05-RLT 模型；learner 只更新独立 Actor head。
 
-支持以下启动模式：
+纯 VLA 或 VLA+人工录制继续使用 `RL_data.sh` / `RL_data_bimanual.sh`，不再由
+`actor_new` 的 `vla_only` 分支执行。
 
-- online：actor 连接 learner，episode 结束后发送 transitions。
-- actor-only：actor 不连接 learner，episode 结束后按 episode 保存本地数据并生成可视化页面。
-- 离线初始化：learner 先从离线数据集训练 `steps` 次；完成后保持服务运行并等待在线 episode。
-- online + offline：learner 加载离线数据，同时接收 actor 在 episode 结束后发送的在线 transitions。
+在线 Actor 支持单臂/双臂、可选主臂跟随与人工接管、guided RTC、Rerun、当前 compact
+transition 保存以及 episode 结束后的保持/回初始位逻辑。
 
 ## 运行环境
 
 建议从项目根目录启动：
 
 ```bash
-cd /home/yz/projects/Evo-RL-loop-0810
-export PYTHONPATH=/home/yz/projects/Evo-RL-loop-0810/src:$PYTHONPATH
+cd /home/lenovo/code/Evo-RL-loop-0911
+export PYTHONPATH=/home/lenovo/code/Evo-RL-loop-0911/src:$PYTHONPATH
 ```
 
 推荐使用当前项目环境：
 
 ```bash
-source /home/hpc/yuzhang/envs/package_sorting_env/bin/activate
+source /home/lenovo/code/envs/evo_0911/bin/activate
 ```
 
 ## 配置文件
 
-当前参考配置：
+当前默认配置分为 actor 和 learner 两份：
 
 ```bash
-src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json
+src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
+src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
 ```
+
+完整迁移映射见 `src/lerobot/onlineRL_evoRL/configs/README.md`。
 
 关键硬件配置：
 
 - follower：`piper_follower`，`can1`
 - leader：`piper_leader`，`can0`
-- wrist/top OpenCV 相机：默认 `10` 和 `4`
-- task：`Flip the package if the barcode is not facing up. Advantage: positive`
+- wrist/top RealSense：默认 `260422275792` 和 `261822303677`
+- task：`Grab the left cup`，可用 `1/2/3` 切换
 - episode 控制时长：`120s`
 
 使用前按现场修改：
 
-- `env.robot.cameras.wrist.index_or_path`
-- `env.robot.cameras.top.index_or_path`
+- `env.robot.cameras.*.serial_number_or_name`
 - `dataset.root`
 - `output_dir`
-- online 模式下的 `policy.actor_learner_config.learner_host`
+- online 模式下的 `algorithm.actor_learner_config.learner_host/learner_port`
 
 ## Learner：PI05 Online RL
 
 PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic。推荐配置：
 
-`src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json`
+`src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json`
 
 启动命令必须使用带等号的配置参数：
 
 ```bash
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0901
-python -m lerobot.onlineRL_evoRL.learner \
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
+python -m lerobot.rl.learner \
   --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
 
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0901
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
 mkdir /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k
-nohup env PYTHONUNBUFFERED=1 python -m lerobot.onlineRL_evoRL.learner \
+nohup env PYTHONUNBUFFERED=1 python -m lerobot.rl.learner \
     --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
     > /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
 ```
 
 断点重启
 ```bash
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0901
-python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output/checkpoints/last/pretrained_model/train_config.json \
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
+python -m lerobot.rl.learner \
+  --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/learner/checkpoints/last/pretrained_model/train_config.json \
   --resume=true \
   >> /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
 
-# 接续离线rl训练
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0901
-python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/learner_output/checkpoints/last/pretrained_model/train_config.json \
-  --resume=true \
-  --steps=3000 \
-  >> /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
+# rlt_chunk learner 只消费 actor 发送的 compact online replay。
+# 离线 RLT 训练继续使用 scripts/RL_train.sh。
 ```
 
 
 配置文件是基准值；需要临时实验时，可在命令行用同名参数覆盖。参数统一使用 `--参数=值`，布尔值使用小写 `true/false`：
 
 ```bash
-python -m lerobot.onlineRL_evoRL.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/piper_cup_catch_pi05_Leanrer_onlineRL_transition.json \
+python -m lerobot.rl.learner \
+  --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
   --steps=1000 \
-  --policy.online_updates_per_episode=4 \
-  --policy.actor_update_interval=4 \
-  --policy.online_only_after_initialization=false \
+  --algorithm.actor_update_interval=4 \
+  --algorithm.online_step_before_learning=100 \
+  --algorithm.actor_learner_config.learner_port=50051 \
   --batch_size=16 \
-  --gradient_accumulation_steps=16 \
-  --num_workers=2
+  --num_workers=0
 ```
 
 命令行覆盖只适合一次性实验；稳定参数应写回 learner-only JSON，便于 checkpoint 保存完整配置和复现实验。
 
-### 必须准备的输入
+### 0901 历史 learner 参数说明（不可直接用于 0911）
+
+> 本节保留用于理解旧实验记录，其中 `policy.online_updates_per_episode`、
+> `policy.online_only_after_initialization` 和顶层 `gradient_accumulation_steps` 已不属于当前
+> `rlt_chunk` 配置。当前可执行字段以 `configs/README.md` 和迁移后的 learner JSON 为准。
 
 | 配置 | 要求 |
 | --- | --- |
@@ -302,7 +303,8 @@ policy_preprocessor.json
 policy_postprocessor.json
 ```
 
-`reload_on_episode_boundary=true` 时，actor 会在 episode 边界按 `policy_poll_s` 检查 checkpoint 文件变化；发生变化后，下一个 episode 前重新加载 VLA。
+迁移配置固定 `reload_on_episode_boundary=false`。VLA/RLT 基座在一次在线运行中保持不变，
+learner 只通过当前 gRPC 通道更新独立 Actor head。
 
 ## 统一 Actor 模式
 
@@ -317,27 +319,27 @@ python -m lerobot.onlineRL_evoRL.actor_new \
 
 | `actor_mode` | `save_format` | learner 连接 | 动作来源 |
 | --- | --- | --- | --- |
-| `vla_only` | `lerobot` | 否 | VLA |
-| `vla_only` | `transition` | 否 | VLA |
-| `online_actor` | `transition` | 是 | PI05/RLT Online Actor；`B` 可临时切回 VLA |
+| `online_actor` | `transition` | 是 | PI05-RLT Online Actor；`V` 可切换 VLA/Actor |
 
-`online_actor + lerobot` 会在启动前直接报错。内部的 `actor_only.enabled`、`actor_only.save_format` 和 `online_transition.enabled` 由上述两个顶层字段统一设置，不应再作为模式开关。`transition` 使用标准拼写；现有文件名中的 `transion` 只为兼容旧文件名保留。
+`vla_only` 和 `online_actor + lerobot` 都会在 `actor_new` 启动前报错。
 
 在线模式参考配置：
 
 ```bash
-src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_onlineRL_transition.json
-
-
-source /home/lenovo/code/envs/package_sorting_env/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0901
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
 python -m lerobot.onlineRL_evoRL.actor_new \
   --config_path src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
+
+source /home/lenovo/code/envs/evo_0911/bin/activate
+cd /home/lenovo/code/Evo-RL-loop-0911
+python -m lerobot.onlineRL_evoRL.actor_new \
+  --config_path src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_cup_catch_v2_0819_35k.json
 ```
 
-它还需要：`policy.type=pi05_online_rl`、与 learner 相同的 `policy.pretrained_path` 和 `dataset.root`、有效的 `actor_checkpoint_path`，以及一致的 learner host/port。Actor checkpoint 可指向 learner 输出根目录、checkpoint 目录或具体的 `actor_critic.pt`/`model.safetensors`。
+它还需要：`policy.type=pi05_rlt`、`algorithm.type=rlt_chunk`、与 learner 相同的模型/数据配置，以及一致的 learner host/port。`actor_checkpoint_path` 可选；缺失时先用 VLA，收到 learner 权重后自动切换 Online Actor。
 
-`task_hotkeys_path` 可用于两种模式；按 task 键会丢弃当前 episode、切换 `env.task` 并复位。`B` 仅在已加载 Actor head 时切换 Online Actor/VLA，并清空 action chunk 与平滑缓存。
+按 task 键会丢弃当前 episode、切换 `env.task` 并复位。`V` 在已加载 Actor head 时切换 Online Actor/VLA，并清空 RTC/动作缓存；`B` 专用于成功标记。
 
 ### 可选 RTC 动作执行
 
@@ -351,6 +353,7 @@ RTC 默认关闭；不配置时保留原有同步 VLA 路径和 Online Actor 的
 ```json
 "rtc": {
   "enabled": true,
+  "mode": "guided",
   "execution_horizon": 25,
   "prefix_attention_schedule": "LINEAR",
   "max_guidance_weight": 10.0
@@ -364,6 +367,7 @@ RTC 默认关闭；不配置时保留原有同步 VLA 路径和 Online Actor 的
 python -m lerobot.onlineRL_evoRL.actor_new \
   --config_path=src/lerobot/onlineRL_evoRL/configs/actor/<actor-config>.json \
   --rtc.enabled=true \
+  --rtc.mode=guided \
   --rtc.execution_horizon=25 \
   --rtc_action_queue_threshold=32
 ```
@@ -372,7 +376,10 @@ python -m lerobot.onlineRL_evoRL.actor_new \
 会立即废弃 RTC 队列；任务切换、VLA/Actor 切换、episode 边界和关闭进程时，还会等待旧的
 后台推理安全退出后再重置或换权重。
 
-## Actor-only 模式
+## 已停用的 Actor-only 模式（历史说明）
+
+> 0911 当前版本已停用 `actor_new` 的 Actor-only/VLA-only 分支；本节命令不可执行，仅用于
+> 辨认旧输出。纯 VLA 采集请使用 `RL_data.sh` 或 `RL_data_bimanual.sh`。
 
 `actor_mode=vla_only` 不连接 learner，不检查 learner 是否存在。顶层 `save_format` 选择两种保存方式，默认是 `lerobot`；`actor_only` 仅保留输出目录、图片和 viewer 细节：
 
@@ -396,8 +403,8 @@ python -m lerobot.onlineRL_evoRL.actor_new \
 启动命令：
 
 ```bash
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
+cd /home/lenovo/code/Evo-RL-loop-0911
+/home/lenovo/code/envs/evo_0911/bin/python -m lerobot.onlineRL_evoRL.actor_new \
   --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_actorOnly_transition.json
 ```
 
@@ -488,7 +495,10 @@ PY
 - `complementary_info.collector_policy_id`
 - task 和 episode success/failure metadata
 
-### Actor 实时数据显示
+这些业务字段的名称与 dtype 对齐 0901 数据，磁盘结构仍使用当前 LeRobot v3 的
+Parquet、MP4、`meta/episodes` 与流式编码；因此统一字段不等于退回旧存储格式。
+
+## Actor 实时数据显示
 
 配置文件中设置：
 
@@ -514,29 +524,31 @@ PY
 
 当前 actor 内置 HIL 热键，不依赖 `event_config.json` 的质量事件配置。
 
-- `I`：切换人工接管。默认 policy/VLA 控制；按一次进入人工接管，再按一次释放回 policy/VLA。
-- `S`：标记当前 episode 成功并结束。最后一条 transition 写入 `reward=1.0, done=true`。
+- `C`：人工接管/释放。接管时立即暂停 RTC，废弃排队及在途旧动作，并在当前周期读取主臂。
+- `B`：标记当前 episode 成功并结束。最后一条 transition 写入 `reward=1.0, done=true`。
 - `F`：标记当前 episode 失败并结束。最后一条 transition 写入 `reward=0.0, done=true`。
-- 左箭头：放弃当前 episode 并重录，不发送、不保存为有效 episode，双臂保持当前位置。
+- `A`：放弃当前 episode 并重录，不发送、不保存为有效 episode，双臂保持当前位置。
 - `R`：放弃当前 episode，双臂回默认初始位后重录，不发送、不保存为有效 episode。
 - `Esc`：停止 actor。
 
-统一 `actor.py` 在配置 `task_hotkeys_path` 或 `actor_mode=online_actor` 时还支持：
+`actor_new` 还支持：
 
-- `B`：在纯 VLA 和 VLA+Actor 之间切换；Actor 权重不存在时保持纯 VLA。
+- `V`：在纯 VLA 和 VLA+Actor 之间切换；Actor 权重不存在时保持纯 VLA。
 - task 配置中的按键（参考配置为 `1/2/3`）：切换 task，放弃当前 episode 并按 `R` 的流程归位。
 
-`S/F/左箭头` 结束后保持双臂当前位置；`R` 结束后双臂回初始位。
+`B/F/A` 结束后读取从臂最后位置并继续发送保持动作，不关闭使能；`R` 回到 actor 启动时捕获的初始位置。
+单臂和双臂共用按键。`can0.control=false` 时不连接主臂且忽略 `C`；为 `true` 时 policy 阶段
+主臂随从臂目标移动，按 `C` 后立即接管。
 
 ## Reward 设计
 
 当前 reward 是稀疏终止奖励：
 
 - 普通 step：使用环境/processor 当前 reward，通常为 `0.0`。
-- `S`：覆盖最后一步为 `reward=1.0, done=true`。
+- `B`：覆盖最后一步为 `reward=1.0, done=true`。
 - `F`：覆盖最后一步为 `reward=0.0, done=true`。
 - timeout：`truncated=true`，reward 保持当前值。
-- 左箭头 / `R`：当前 episode 丢弃，不进入 learner 或 actor-only 有效保存。
+- `A` / `R`：当前 episode 丢弃，不进入 learner 或本地有效保存。
 
 每条 transition 的 `complementary_info` 包含：
 
@@ -592,24 +604,15 @@ raw robot observation + env.task -> VLA predict_action -> action processor -> en
 语法检查：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python -m compileall -q \
-  /home/yz/projects/Evo-RL-loop-0810/src/lerobot/onlineRL_evoRL \
-  /home/yz/projects/Evo-RL-loop-0810/src/lerobot/configs/train.py
+/home/lenovo/code/envs/evo_0911/bin/python -m compileall -q \
+  /home/lenovo/code/Evo-RL-loop-0911/src/lerobot/onlineRL_evoRL
 ```
 
 配置解析：
 
 ```bash
-/home/yz/projects/env/package_sorting_env/bin/python - <<'PY'
-from lerobot.onlineRL_evoRL import actor_new  # noqa: F401
-from lerobot.configs.train import TrainRLServerPipelineConfig
-cfg = TrainRLServerPipelineConfig.from_pretrained(
-    '/home/yz/projects/Evo-RL-loop-0810/src/lerobot/onlineRL_evoRL/configs/piper_package_sorting_online_rl.json'
-)
-cfg.validate()
-print(cfg.actor_vla_policy)
-print(cfg.actor_only)
-PY
+/home/lenovo/code/envs/evo_0911/bin/python \
+  -m lerobot.onlineRL_evoRL.actor_new --help
 ```
 
 ## 日志
@@ -628,7 +631,7 @@ ${output_dir}/logs/
 
 ## 注意事项
 
-- `actor_vla_policy.enabled=true` 只替换 actor action 生成，不训练 VLA 权重。
-- 旧 `policy.type=sac` 配置仍训练 SAC；新 `policy.type=pi05_online_rl` 配置训练 chunk Actor/Critic。两者的在线 actor 都可由 VLA 采样。
-- actor-only 模式不会向 learner 发送数据。
+- `actor_vla_policy.enabled=true` 只为在线 Actor 提供 VLA/RLT 特征，不训练 VLA 权重。
+- 当前有效组合是 `policy.type=pi05_rlt` 与 `algorithm.type=rlt_chunk`；learner 只更新独立 Actor/Critic。
+- Actor-only/VLA-only 模式已经停用，纯 VLA 采集使用 `RL_data.sh` 或 `RL_data_bimanual.sh`。
 - VLA 推理依赖 `dataset.root` 里的 metadata/stats，确保该路径可读取并包含两路相机和 action/state 统计。

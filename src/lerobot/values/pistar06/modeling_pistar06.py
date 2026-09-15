@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+"""Pistar06 distributional value model and LeRobot policy adapter."""
+
 from __future__ import annotations
 
 import json
@@ -13,16 +15,17 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import torch.nn.functional as functional
-from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from huggingface_hub import hf_hub_download, save_torch_state_dict
 from huggingface_hub.errors import HfHubHTTPError
-from safetensors.torch import save_file
 from torch import Tensor, nn
 
 from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from lerobot.utils.import_utils import _transformers_available
-from lerobot.utils.recording_annotations import EPISODE_SUCCESS, resolve_episode_success_label
+from lerobot.utils.recording_annotations import (
+    EPISODE_SUCCESS,
+    resolve_episode_success_from_mapping,
+)
 from lerobot.values.pistar06.configuration_pistar06 import Pistar06Config
 from lerobot.values.pistar06.processor_pistar06 import PISTAR06_IMAGE_MASK_KEY, PISTAR06_IMAGES_KEY
 
@@ -40,6 +43,8 @@ PISTAR06_SAVE_INFO = "pistar06_save_info.json"
 
 @dataclass
 class EpisodeTargetInfo:
+    """Episode metadata required to compute normalized value targets."""
+
     episode_index: int
     task_index: int
     length: int
@@ -52,10 +57,12 @@ def build_bin_centers(
     bin_max: float,
     device: torch.device | None = None,
 ) -> torch.Tensor:
+    """Create evenly spaced distributional value-bin centers."""
     return torch.linspace(bin_min, bin_max, num_bins, dtype=torch.float32, device=device)
 
 
 def project_values_to_bins(values: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+    """Linearly project scalar targets onto neighboring distributional bins."""
     if values.ndim != 1:
         raise ValueError(f"'values' must be rank-1, got shape={tuple(values.shape)}.")
     if bin_centers.ndim != 1:
@@ -78,6 +85,7 @@ def project_values_to_bins(values: torch.Tensor, bin_centers: torch.Tensor) -> t
 
 
 def expected_value_from_logits(logits: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+    """Convert distribution logits to scalar expected values."""
     # 将模型输出的离散 logits 转成连续的价值预测
     probs = functional.softmax(logits, dim=-1)
     return (probs * bin_centers).sum(dim=-1)
@@ -93,6 +101,7 @@ def compute_normalized_value_targets(
     clip_min: float = -1.0,
     clip_max: float = 0.0,
 ) -> np.ndarray:
+    """Compute normalized per-frame returns from episode outcome and progress."""
     if episode_indices.shape != frame_indices.shape:
         raise ValueError("episode_indices and frame_indices must have the same shape.")
     if c_fail_coef < 0:
@@ -254,7 +263,10 @@ def _load_language_model(
 
 
 class Pistar06Model(nn.Module):
+    """Fuse SigLIP image features and Gemma language features into value logits."""
+
     def __init__(self, cfg: Pistar06Config):
+        """Initialize pretrained encoders and the distributional value head."""
         super().__init__()
         if AutoModel is None or AutoImageProcessor is None:
             raise ImportError("transformers is not installed. Install with `pip install 'lerobot[pi0]'`.")
@@ -400,6 +412,7 @@ class Pistar06Model(nn.Module):
         images: Tensor,
         image_attention_mask: Tensor,
     ) -> Tensor:
+        """Return distributional value logits for a processed batch."""
         if input_ids.ndim != 2:
             raise ValueError(f"'input_ids' must have shape [B, T], got {tuple(input_ids.shape)}.")
         if attention_mask.ndim != 2:
@@ -466,8 +479,11 @@ class Pistar06Model(nn.Module):
 
 
 class Pistar06Policy(PreTrainedPolicy):
+    """LeRobot trainable-policy adapter for the Pistar06 value model."""
+
     config_class = Pistar06Config
     name = "pistar06"
+    _fsdp_wrap_modules = ["Pistar06Model"]
 
     def __init__(
         self,
@@ -475,7 +491,8 @@ class Pistar06Policy(PreTrainedPolicy):
         dataset_meta=None,
         **kwargs: Any,
     ):
-        del dataset_meta, kwargs
+        """Build the value model and optional dataset-index target lookup."""
+        del kwargs
         super().__init__(config)
         self.config = config
         self.model = Pistar06Model(config)
@@ -485,6 +502,95 @@ class Pistar06Policy(PreTrainedPolicy):
             build_bin_centers(config.num_bins, config.bin_min, config.bin_max),
             persistent=False,
         )
+        self.register_buffer(
+            "value_target_lookup",
+            self._build_value_target_lookup(dataset_meta),
+            persistent=False,
+        )
+
+    def _build_value_target_lookup(self, dataset_meta: Any | None) -> Tensor:
+        """Build global-frame-index targets from standard v3 episode metadata.
+
+        This keeps Pistar06 compatible with the stock ``lerobot-train`` loop: the
+        standard processor preserves the global ``index`` field, so no custom
+        training-loop hook is required. Both 0901 ``episode_success`` metadata
+        and current ``success``/``episode_outcome`` aliases are accepted.
+        """
+        if dataset_meta is None:
+            return torch.empty(0, dtype=torch.float32)
+        ensure_readable = getattr(dataset_meta, "ensure_readable", None)
+        if callable(ensure_readable):
+            ensure_readable()
+        episodes_ds = getattr(dataset_meta, "episodes", None)
+        if episodes_ds is None or len(episodes_ds) == 0:
+            return torch.empty(0, dtype=torch.float32)
+
+        episode_info: dict[int, EpisodeTargetInfo] = {}
+        episode_bounds: dict[int, tuple[int, int]] = {}
+        task_max_length: dict[int, int] = {}
+        tasks_df = getattr(dataset_meta, "tasks", None)
+        cumulative_start = 0
+
+        for row in episodes_ds:
+            ep_idx = int(row["episode_index"])
+            start = int(row.get("dataset_from_index", cumulative_start))
+            end = int(row.get("dataset_to_index", start + int(row["length"])))
+            cumulative_start = end
+            length = int(row.get("length", end - start))
+            task_idx = row.get("task_index")
+            if task_idx is None:
+                tasks = row.get("tasks")
+                if tasks is None:
+                    tasks = []
+                if hasattr(tasks, "tolist") and not isinstance(tasks, str):
+                    tasks = tasks.tolist()
+                task_name = tasks[0] if isinstance(tasks, (list, tuple)) else tasks
+                if tasks_df is None or task_name not in tasks_df.index:
+                    raise KeyError(f"Episode {ep_idx} references unknown task {task_name!r}.")
+                task_idx = int(tasks_df.loc[task_name].task_index)
+            task_idx = int(task_idx)
+            label = resolve_episode_success_from_mapping(
+                row,
+                preferred_field=self.config.success_field,
+                default_label=self.config.default_success,
+                require_label=True,
+            )
+            episode_info[ep_idx] = EpisodeTargetInfo(ep_idx, task_idx, length, label == EPISODE_SUCCESS)
+            episode_bounds[ep_idx] = (start, end)
+            task_max_length[task_idx] = max(task_max_length.get(task_idx, 0), length)
+
+        lookup_size = max(end for _, end in episode_bounds.values())
+        lookup = np.full(lookup_size, np.nan, dtype=np.float32)
+        for ep_idx, (start, end) in episode_bounds.items():
+            length = end - start
+            targets = compute_normalized_value_targets(
+                episode_indices=np.full(length, ep_idx, dtype=np.int64),
+                frame_indices=np.arange(length, dtype=np.int64),
+                episode_info=episode_info,
+                task_max_lengths=task_max_length,
+                c_fail_coef=self.config.c_fail_coef,
+                clip_min=self.config.bin_min,
+                clip_max=self.config.bin_max,
+            )
+            lookup[start:end] = targets
+        return torch.from_numpy(lookup)
+
+    def _targets_from_batch_indices(self, batch: dict[str, Any], device: torch.device) -> Tensor:
+        indices = batch.get("index")
+        if indices is None:
+            raise KeyError(
+                f"Missing target key '{self.config.target_key}' and global 'index'; "
+                "the standard LeRobot dataset must preserve its frame index."
+            )
+        indices = torch.as_tensor(indices, device=self.value_target_lookup.device, dtype=torch.long).reshape(-1)
+        if self.value_target_lookup.numel() == 0:
+            raise RuntimeError("Value targets are unavailable because no dataset metadata was supplied.")
+        if bool((indices < 0).any()) or bool((indices >= self.value_target_lookup.numel()).any()):
+            raise IndexError("Batch contains a frame index outside the value-target lookup.")
+        targets = self.value_target_lookup.index_select(0, indices)
+        if bool(torch.isnan(targets).any()):
+            raise KeyError("Batch contains frame indices not covered by selected episode metadata.")
+        return targets.to(device=device, dtype=torch.float32, non_blocking=True)
 
     def _frozen_checkpoint_prefixes(self) -> list[str]:
         prefixes: list[str] = []
@@ -495,12 +601,16 @@ class Pistar06Policy(PreTrainedPolicy):
         return prefixes
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        self.config._save_pretrained(save_directory)
+        """Save full or encoder-elided weights with the current collective-safe format."""
+        from lerobot.distributed.checkpoint import full_model_state_dict
+        from lerobot.distributed.utils import is_main_process
 
         model_to_save = self.module if hasattr(self, "module") else self
-        state_dict = model_to_save.state_dict()
-        excluded_prefixes = self._frozen_checkpoint_prefixes()
+        state_dict = full_model_state_dict(model_to_save)
+        if not state_dict or not is_main_process():
+            return
 
+        excluded_prefixes = self._frozen_checkpoint_prefixes()
         if excluded_prefixes:
             state_dict = {
                 key: tensor
@@ -508,9 +618,10 @@ class Pistar06Policy(PreTrainedPolicy):
                 if not any(key.startswith(prefix) for prefix in excluded_prefixes)
             }
 
-        save_file(state_dict, str(save_directory / SAFETENSORS_SINGLE_FILE))
+        self.config._save_pretrained(save_directory)
+        save_torch_state_dict(state_dict, str(save_directory), max_shard_size="1TB")
         save_info = {
-            "format_version": 1,
+            "format_version": 2,
             "weights_mode": "partial" if excluded_prefixes else "full",
             "freeze_vision_encoder": bool(self.config.freeze_vision_encoder),
             "freeze_language_model": bool(self.config.freeze_language_model),
@@ -586,6 +697,7 @@ class Pistar06Policy(PreTrainedPolicy):
         strict: bool = False,
         **kwargs: Any,
     ) -> Pistar06Policy:
+        """Load full or encoder-elided Pistar06 safetensors checkpoints."""
         save_info = cls._load_save_info(
             pretrained_name_or_path=pretrained_name_or_path,
             force_download=force_download,
@@ -622,18 +734,23 @@ class Pistar06Policy(PreTrainedPolicy):
         )
 
     def get_optim_params(self):
+        """Return all parameters, honoring encoder freeze flags through requires_grad."""
         return self.parameters()
 
     def reset(self):
+        """Reset policy state; Pistar06 has no temporal inference cache."""
         return
 
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: ActionSelectKwargs) -> Tensor:
+        """Reject action prediction because this policy estimates values only."""
         raise RuntimeError("Pistar06Policy is a value model and does not support action prediction.")
 
     def select_action(self, batch: dict[str, Tensor], **kwargs: ActionSelectKwargs) -> Tensor:
+        """Reject action selection because this policy estimates values only."""
         raise RuntimeError("Pistar06Policy is a value model and does not support action selection.")
 
     def predict_value(self, batch: dict[str, Tensor]) -> Tensor:
+        """Predict scalar expected values for a processed batch."""
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         attention_mask = batch[OBS_LANGUAGE_ATTENTION_MASK]
         images = batch[PISTAR06_IMAGES_KEY]
@@ -649,6 +766,7 @@ class Pistar06Policy(PreTrainedPolicy):
         return expected_value_from_logits(logits, bin_centers)
 
     def build_training_raw_batch_hook(self, dataset, targets_cfg):
+        """Build the legacy 0901 raw-batch value-target injection hook."""
         # 根据数据集中的 episode_index 和 frame_index，以及 episode 的成功/失败信息，计算每一帧的价值目标（基于剩余步数和成功/失败惩罚），并构建一个 lookup table。
         # 训练开始前，代码会遍历数据集中所有帧，为每帧预算出一个标量值目标 value_target，公式为：
         # g = -(remaining_steps)                    # 成功 episode
@@ -671,8 +789,6 @@ class Pistar06Policy(PreTrainedPolicy):
         episodes_ds = dataset.meta.episodes.with_format(None)
         episodes = episodes_ds[:]
         n_episodes = len(episodes_ds)
-        has_success = targets_cfg.success_field in episodes_ds.column_names
-
         episode_info: dict[int, EpisodeTargetInfo] = {}
         task_max_length: dict[int, int] = {}
         # 便利每个 episode，记录 episode_index -> (task_index, length, success) 的映射，并统计每个 task_index 的最大 episode 长度（用于后续计算 value target）。
@@ -685,9 +801,10 @@ class Pistar06Policy(PreTrainedPolicy):
                 raise KeyError(f"Episode {ep_idx} references unknown task '{task_name}'.")
             task_index = int(dataset.meta.tasks.loc[task_name].task_index)
 
-            explicit_success = episodes[targets_cfg.success_field][i] if has_success else None
-            resolved_success = resolve_episode_success_label(
-                explicit_success,
+            episode_row = {name: episodes[name][i] for name in episodes_ds.column_names}
+            resolved_success = resolve_episode_success_from_mapping(
+                episode_row,
+                preferred_field=targets_cfg.success_field,
                 default_label=targets_cfg.default_success,
                 require_label=True,
             )
@@ -735,12 +852,7 @@ class Pistar06Policy(PreTrainedPolicy):
         return value_target_hook
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
-        if self.config.target_key not in batch:
-            raise KeyError(
-                f"Missing target key '{self.config.target_key}' in batch. "
-                "Make sure lerobot-value-train target hook is enabled."
-            )
-
+        """Compute the distributional training loss and scalar monitoring metrics."""
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         attention_mask = batch[OBS_LANGUAGE_ATTENTION_MASK]
         images = batch[PISTAR06_IMAGES_KEY]
@@ -748,10 +860,13 @@ class Pistar06Policy(PreTrainedPolicy):
 
         device = next(self.model.parameters()).device
         # 代表当前样本的“价值目标”， 不是即时 reward，而是基于当前帧剩余步数、episode 成功/失败等信息计算出来的归一化未来价值
-        value_target = batch[self.config.target_key]
-        if not isinstance(value_target, Tensor):
-            value_target = torch.as_tensor(value_target)
-        value_target = value_target.to(device=device, dtype=torch.float32, non_blocking=True)
+        if self.config.target_key in batch:
+            value_target = batch[self.config.target_key]
+            if not isinstance(value_target, Tensor):
+                value_target = torch.as_tensor(value_target)
+            value_target = value_target.to(device=device, dtype=torch.float32, non_blocking=True)
+        else:
+            value_target = self._targets_from_batch_indices(batch, device)
         if value_target.ndim == 2 and value_target.shape[-1] == 1:
             value_target = value_target.squeeze(-1)
         if value_target.ndim != 1:

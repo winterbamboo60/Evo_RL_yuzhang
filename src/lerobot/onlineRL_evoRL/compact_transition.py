@@ -1,4 +1,8 @@
-"""Versioned compact episode payload shared by the actor and PI05 learner."""
+"""Versioned compact episode payload shared by the EvoRL actor and learner.
+
+This is the stable wire/storage contract from Evo-RL-loop-0901.  Changes to
+LeRobot's policy or dataset APIs must be adapted before this boundary.
+"""
 
 from __future__ import annotations
 
@@ -48,15 +52,17 @@ def validate_compact_episode(payload: Any) -> dict[str, Any]:
         raise ValueError(f"Expected compact episode schema {SCHEMA_NAME!r}")
     schema_version = payload.get("schema_version")
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-        raise ValueError(f"Unsupported compact episode schema version: {payload.get('schema_version')!r}")
+        raise ValueError(f"Unsupported compact episode schema version: {schema_version!r}")
     transition_layout = payload.get("transition_layout", PRIMITIVE_TRANSITIONS)
     if transition_layout not in {PRIMITIVE_TRANSITIONS, SLIDING_WINDOW_TRANSITIONS}:
         raise ValueError(f"Unsupported compact transition layout: {transition_layout!r}")
-    sliding_window_stride = payload.get("sliding_window_stride", 1)
-    if not isinstance(sliding_window_stride, int) or sliding_window_stride <= 0:
+    stride = payload.get("sliding_window_stride", 1)
+    if not isinstance(stride, int) or stride <= 0:
         raise ValueError("Compact episode sliding_window_stride must be a positive integer")
     primitive_steps = payload.get("primitive_steps")
-    if primitive_steps is not None and (not isinstance(primitive_steps, int) or primitive_steps <= 0):
+    if primitive_steps is not None and (
+        not isinstance(primitive_steps, int) or primitive_steps <= 0
+    ):
         raise ValueError("Compact episode primitive_steps must be a positive integer when provided")
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict) or not metadata.get("task"):

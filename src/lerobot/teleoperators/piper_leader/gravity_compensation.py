@@ -151,10 +151,7 @@ class PiperGravityCompensationLoop:
             ],
             dtype=np.float64,
         )
-        currents = [
-            getattr(getattr(hs, f"motor_{idx}"), "motor_current", None)
-            for idx in range(1, 7)
-        ]
+        currents = [getattr(getattr(hs, f"motor_{idx}"), "motor_current", None) for idx in range(1, 7)]
         return q_rad, v_rad, currents
 
     def _compute_gravity_torque(self, q_rad: np.ndarray, v_rad: np.ndarray) -> np.ndarray:
@@ -199,22 +196,22 @@ class PiperGravityCompensationLoop:
                 for idx in range(1, 7)
             ]
 
-        # logger.info(
-        #     "Piper MIT diagnostic: loop_hz=%.1f ctrl_mode=%s mode_feed=%s arm_status=%s "
-        #     "err_code=%s enabled=%s q_deg=%s v_rad_s=%s tau_model_nm=%s tau_cmd_nm=%s "
-        #     "current_raw=%s",
-        #     loop_hz,
-        #     ctrl_mode,
-        #     mode_feed,
-        #     arm_status,
-        #     err_code,
-        #     enabled or "unavailable",
-        #     np.round(np.rad2deg(q_rad), 3).tolist(),
-        #     np.round(v_rad, 4).tolist(),
-        #     np.round(tau_model, 4).tolist(),
-        #     np.round(tau_cmd, 4).tolist(),
-        #     currents,
-        # )
+        logger.debug(
+            "Piper MIT diagnostic: loop_hz=%.1f ctrl_mode=%s mode_feed=%s arm_status=%s "
+            "err_code=%s enabled=%s q_deg=%s v_rad_s=%s tau_model_nm=%s tau_cmd_nm=%s "
+            "current_raw=%s",
+            loop_hz,
+            ctrl_mode,
+            mode_feed,
+            arm_status,
+            err_code,
+            enabled or "unavailable",
+            np.round(np.rad2deg(q_rad), 3).tolist(),
+            np.round(v_rad, 4).tolist(),
+            np.round(tau_model, 4).tolist(),
+            np.round(tau_cmd, 4).tolist(),
+            currents,
+        )
 
     def _run(self) -> None:
         cycles = 0
@@ -230,9 +227,7 @@ class PiperGravityCompensationLoop:
 
                 q_rad, v_rad, currents = self._read_q_v()
                 tau_model = self._compute_gravity_torque(q_rad, v_rad)
-                tau_cmd = np.clip(
-                    self._tx_ratio * tau_model, -self._torque_limit, self._torque_limit
-                )
+                tau_cmd = np.clip(self._tx_ratio * tau_model, -self._torque_limit, self._torque_limit)
 
                 for idx in range(6):
                     self._arm.JointMitCtrl(
@@ -248,9 +243,7 @@ class PiperGravityCompensationLoop:
                 if start_t >= next_log_t:
                     elapsed = start_t - rate_start_t
                     try:
-                        self._log_diagnostics(
-                            q_rad, v_rad, tau_model, tau_cmd, currents, cycles / elapsed
-                        )
+                        self._log_diagnostics(q_rad, v_rad, tau_model, tau_cmd, currents, cycles / elapsed)
                     except Exception:
                         logger.exception("Failed to read Piper MIT diagnostic snapshot.")
                     cycles = 0

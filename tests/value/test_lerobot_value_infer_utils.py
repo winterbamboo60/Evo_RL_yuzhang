@@ -1,12 +1,19 @@
 #!/usr/bin/env python
 
-import numpy as np
+from pathlib import Path
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from lerobot.datasets.io_utils import load_info, write_info, write_table_one_row_group_per_episode
+from lerobot.datasets.utils import DatasetInfo
 from lerobot.scripts.lerobot_value_infer import (
     _binarize_advantages,
     _compute_dense_rewards_from_targets,
     _compute_n_step_advantages,
     _compute_task_thresholds,
+    _write_columns_in_place,
 )
 
 
@@ -54,3 +61,37 @@ def test_compute_task_thresholds_and_binarize_with_interventions():
     )
 
     assert indicators.tolist() == [0, 1, 1, 0, 1]
+
+
+def test_write_columns_in_place_preserves_current_parquet_layout(tmp_path: Path):
+    write_info(
+        DatasetInfo(
+            codebase_version="v3.0",
+            fps=30,
+            features={
+                "index": {"dtype": "int64", "shape": (1,), "names": None},
+                "episode_index": {"dtype": "int64", "shape": (1,), "names": None},
+            },
+            total_episodes=2,
+            total_frames=3,
+        ),
+        tmp_path,
+    )
+    parquet_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    table = pa.table({"index": [0, 1, 2], "episode_index": [0, 0, 1]})
+    write_table_one_row_group_per_episode(table, parquet_path)
+
+    _write_columns_in_place(
+        dataset_root=tmp_path,
+        absolute_indices=np.array([0, 1, 2], dtype=np.int64),
+        columns={"complementary_info.value": np.array([-0.5, -0.25, 0.0], dtype=np.float32)},
+        feature_infos={
+            "complementary_info.value": {"dtype": "float32", "shape": (1,), "names": None}
+        },
+    )
+
+    rewritten = pq.read_table(parquet_path)
+    assert rewritten["complementary_info.value"].to_pylist() == [-0.5, -0.25, 0.0]
+    assert pq.read_metadata(parquet_path).num_row_groups == 2
+    assert load_info(tmp_path).features["complementary_info.value"]["shape"] == (1,)

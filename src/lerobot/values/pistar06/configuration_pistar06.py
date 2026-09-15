@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+"""Configuration for the standalone Pistar06 value policy."""
+
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -7,6 +9,7 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.recording_annotations import normalize_episode_success_label
 
 
 @PreTrainedConfig.register_subclass("pistar06")
@@ -30,6 +33,13 @@ class Pistar06Config(PreTrainedConfig):
     target_key: str = "observation.value_target"
     loss_weight_key: str = "observation.value_loss_weight"
     task_index_feature: str = "task_index"
+
+    # Episode-level supervision. These defaults also let the model train through
+    # the stock ``lerobot-train`` entry point; ``lerobot-value-train`` exposes
+    # the same values under ``--targets.*`` and copies them here during validation.
+    success_field: str = "episode_success"
+    default_success: str = "failure"
+    c_fail_coef: float = 1.0
 
     # Tokenizer / model shape
     tokenizer_max_length: int = 200
@@ -68,6 +78,7 @@ class Pistar06Config(PreTrainedConfig):
     )
 
     def __post_init__(self) -> None:
+        """Validate model, target, optimizer, and scheduler settings."""
         super().__post_init__()
 
         if not self.vision_repo_id:
@@ -84,6 +95,14 @@ class Pistar06Config(PreTrainedConfig):
             raise ValueError("'value.target_key' must be non-empty.")
         if not self.loss_weight_key:
             raise ValueError("'value.loss_weight_key' must be non-empty.")
+        if not self.success_field:
+            raise ValueError("'policy.success_field' must be non-empty.")
+        normalized_default = normalize_episode_success_label(self.default_success)
+        if normalized_default is None:
+            raise ValueError("'policy.default_success' must be either 'success' or 'failure'.")
+        self.default_success = normalized_default
+        if self.c_fail_coef < 0:
+            raise ValueError("'policy.c_fail_coef' must be non-negative.")
         if not self.loss_weight_key.startswith("observation."):
             raise ValueError("'value.loss_weight_key' must start with 'observation.'.")
         if self.max_state_dim <= 0:
@@ -127,11 +146,13 @@ class Pistar06Config(PreTrainedConfig):
             raise ValueError("'value.scheduler_decay_lr' must be >= 0.")
 
     def validate_features(self) -> None:
+        """Accept observation and task features inferred from the dataset."""
         # Value model consumes observation + task text, and supervises with a scalar target key.
         # The training loop injects target tensors into `target_key`.
         return
 
     def get_optimizer_preset(self) -> AdamWConfig:
+        """Return the default AdamW configuration for value training."""
         return AdamWConfig(
             lr=self.optimizer_lr,
             weight_decay=self.optimizer_weight_decay,
@@ -139,6 +160,7 @@ class Pistar06Config(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
+        """Return the default warmup and cosine-decay schedule."""
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,
@@ -148,12 +170,15 @@ class Pistar06Config(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
+        """Use only the current observation."""
         return None
 
     @property
     def action_delta_indices(self) -> None:
+        """Do not request action deltas for the value model."""
         return None
 
     @property
     def reward_delta_indices(self) -> None:
+        """Do not request reward deltas for the value model."""
         return None
