@@ -9,6 +9,9 @@
 export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/home/lenovo/code/Evo-RL-loop-0911}"
 export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/home/lenovo/code/envs/evo_0911}"
 
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/root/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
+
 source "$EVORL_ENV_ROOT/bin/activate"
 cd "$EVORL_PROJECT_ROOT"
 ```
@@ -61,8 +64,9 @@ rsync -P \
 目标目录必须尚不存在，安装脚本不会覆盖已有环境：
 
 ```bash
+cd "$EVORL_PROJECT_ROOT"
 bash scripts/ci/env/install_evo_0911.sh \
-  --archive /cloud/uploads/evo_0911-YYYYMMDD-HHMMSS-*.tar.gz \
+  --archive /mnt/cfs/0z9lxh/yuzhang/env/evo_0911_tar/evo_0911-20260915-200900-9bc743912816-dirty-ubuntu24.04-x86_64-py312-cu128.tar.gz \
   --dest "$EVORL_ENV_ROOT"
 ```
 
@@ -76,6 +80,60 @@ bash scripts/ci/env/install_evo_0911.sh \
 - CAN、RealSense、udev 权限、`can-utils` 和 `ethtool` 由宿主机准备。
 
 若系统或架构不同，不要强行使用二进制归档，应在目标机从 `uv.lock` 重建环境。
+
+## 3.1 从 uv.lock 重建环境
+
+当目标机系统版本与环境归档不兼容时，应直接在环境最终存放位置重新创建；不要复制或移动
+已有虚拟环境。以下命令要求 `$EVORL_ENV_ROOT` 尚不存在：
+
+```bash
+cd "$EVORL_PROJECT_ROOT"
+
+uv venv --python 3.12 "$EVORL_ENV_ROOT"
+
+UV_PROJECT_ENVIRONMENT="$EVORL_ENV_ROOT" \
+uv sync \
+  --locked \
+  --python 3.12 \
+  --extra evo
+```
+
+安装完成后，在当前终端激活并验证：
+
+```bash
+source "$EVORL_ENV_ROOT/bin/activate"
+hash -r
+
+command -v python
+python -c 'import sys, lerobot; print(sys.executable); print(lerobot.__file__)'
+lerobot-train --help >/dev/null
+```
+
+Python 应位于 `$EVORL_ENV_ROOT/bin/python`，LeRobot 源码应位于
+`$EVORL_PROJECT_ROOT/src/lerobot`。`uv sync` 默认会 editable 安装当前项目，不需要再次重装
+LeRobot。
+
+`--locked` 要求严格遵循 `uv.lock`。不要同时修改 `pytorch-cu128` 等命名索引，否则 uv
+可能判定锁文件需要更新。下载较慢时优先设置共享缓存、超时和重试次数，而不改变索引：
+
+```bash
+export UV_CACHE_DIR=/mnt/cfs/0z9lxh/yuzhang/env/uv-cache
+export UV_HTTP_TIMEOUT=600
+export UV_HTTP_RETRIES=10
+```
+
+运行安装脚本不会激活父 shell，安装后仍需在当前终端执行 `source`。查看环境中的包时优先使用：
+
+```bash
+python -m pip list
+python -m pip show lerobot
+# 不依赖环境内的 pip 命令：
+uv pip list --python "$EVORL_ENV_ROOT/bin/python"
+```
+
+editable 安装时，`pip show lerobot` 的 `Location` 位于环境目录，而
+`Editable project location` 位于项目源码目录，这是正常状态。CAN、RealSense、udev 权限及
+NVIDIA 驱动等宿主机依赖仍需单独配置。
 
 ## 4. 可选：重新安装云端 LeRobot 源码
 
@@ -158,7 +216,7 @@ python -m lerobot.scripts.lerobot_edit_dataset \
     --operation.concatenate_data false
 
 ## 查看并编辑数据集
-python scripts/ci/dataset_checker.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2/0915_1
+python scripts/ci/dataset_checker.py /mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask
 
 ## 修改数据集task
 python scripts/ci/replace_dataset_task.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged --task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." --output-suffix "_newTask"
@@ -211,20 +269,21 @@ nohup bash scripts/RL_train.sh \
 两卡 PI0.5 示例（只需在单卡命令中选择显卡并增加 `--num_gpus 2`）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/RL_train.sh \
-    --DATASET_ROOT /home/lenovo/datasets/20260914_bipiper_cube_catch_v1-1_merged \
-    --history_pretrained_path /home/lenovo/outputs/0914_pi05_sft_cube_catch_belt_dual_double_30000 \
-    --OUTPUT_DIR /home/lenovo/outputs/0915_pi05_sft_cube_catch_belt_dual_v11_ddp2 \
-    --policy_type pi05 \
+nohup env CUDA_VISIBLE_DEVICES=0,1 bash scripts/RL_train.sh \
+    --DATASET_ROOT /mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+    --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/outputs/0915_pi05_sft_cube_catch_belt_dual_double/checkpoints/040000/pretrained_model \
+    --OUTPUT_DIR /mnt/cfs/0z9lxh/yuzhang/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_ddp2 \
+    --policy_type pi05_rlt \
     --num_gpus 2 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --steps 1000 \
-    --save_freq 200 \
-    --train_expert_only true \
+    --batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --steps 2000 \
+    --save_freq 1000 \
+    --train_expert_only false \
     --tensorboard \
     -- \
-    --policy.compile_model=false
+    --policy.compile_model=false \
+    > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_ddp2.log" 2>&1 < /dev/null &
 ```
 
 四卡时改为 `CUDA_VISIBLE_DEVICES=0,1,2,3` 和 `--num_gpus 4`。显卡编号的数量必须不小于
