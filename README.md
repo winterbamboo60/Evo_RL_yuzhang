@@ -335,6 +335,45 @@ nohup bash scripts/RL_train.sh \
     > /home/lenovo/outputs/logs/0914_pi05_rlt_sft_cube_catch_belt_dual_double_30000_needDelete.log 2>&1 &
 
 # 模型推理
+
+## `RL_data.sh` 的 VLA 加载设备
+
+传入 `--policy.path` 后，`RL_data.sh` 默认使用 `--policy.device cuda`。脚本会把同一个设备值
+同时传给策略加载器和 `lerobot-rollout --device`，保证 checkpoint 加载与后续推理位于同一张卡，
+避免加载完成后再跨设备搬运。对于 PI0.5/PI0.5-RLT checkpoint，CUDA 模式会使用直接 GPU
+加载路径；启动硬件前会先检查 CUDA 是否可用、请求的逻辑 GPU 是否存在，并打印实际显卡名称。
+
+不传设备参数时使用当前默认 CUDA 设备，单进程通常是逻辑 `cuda:0`：
+
+```bash
+bash scripts/RL_data.sh \
+  --dataset.root /path/to/rollout_dataset \
+  --dataset.single_task "Grab the cube" \
+  --wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /path/to/checkpoint
+```
+
+在多卡机器上运行单个采集进程时，可以显式选择逻辑 GPU，例如使用第二张可见卡：
+
+```bash
+bash scripts/RL_data.sh \
+  --dataset.root /path/to/rollout_dataset \
+  --dataset.single_task "Grab the cube" \
+  --wrist_camera.index_or_path 260422275792 \
+  --top_camera.index_or_path 6 \
+  --policy.path /path/to/checkpoint \
+  --policy.device cuda:1
+```
+
+`--device cuda:1` 是 `--policy.device cuda:1` 的等价简写。也可以通过
+`CUDA_VISIBLE_DEVICES` 选择物理 GPU：例如 `CUDA_VISIBLE_DEVICES=2` 时，程序中的 `cuda` 或
+`cuda:0` 指向物理 GPU 2；此时进程只看见一张卡，不应再指定 `cuda:1`。允许使用 `cpu`、
+`mps` 或 `xpu`，但 `cpu` 不会启用直接 CUDA 加载，VLA 加载和推理会明显更慢。
+
+该规则只针对单进程数据采集。`RL_train.sh` 的单机多卡 DDP 必须保持 `--device cuda`，由
+`torchrun` 为每个 rank 绑定自己的 GPU；训练时不要写死 `cuda:0` 或其他 `cuda:N`。
+
 ## 单臂 VLA 仅推理：
 不连接 can0，C 键禁用；需要人工介入时追加 --can0.control true
 

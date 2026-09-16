@@ -7,12 +7,13 @@
 # /home/hpc/yuzhang/envs/package_sorting_env/bin/conda-unpack
 # ```
 # 用法：
-#   ./lerobot_record.sh \
+#   ./RL_data.sh \
 #     --dataset.root <数据存放目录> \
 #     --dataset.single_task <任务指令> \
 #     --wrist_camera.index_or_path <手腕摄像头设备索引或视频路径> \
 #     --top_camera.index_or_path <顶部摄像头设备索引或视频路径> \
 #     [--policy.path <策略模型路径>] \
+#     [--policy.device cuda|cuda:N|cpu] \
 #     [--can0.control true|false] \
 # 只需要传入以下参数：
 # DATASET_ROOT：采集的数据目标存放目录
@@ -20,6 +21,7 @@
 # WRIST_CAM：手腕摄像头的设备索引或视频文件路径
 # TOP_CAM：顶部摄像头的设备索引或视频文件路径
 # POLICY_PATH：（可选）策略模型路径；若无则纯人工录制；若有则默认仅 VLA 推理、不连接 can0
+# POLICY_DEVICE：VLA 加载及推理设备，默认 cuda；单进程可用 cuda:N 指定逻辑 GPU
 # CAN0_CONTROL：仅 VLA 模式使用；true 恢复 can0 人工介入，false（默认）完全不连接或控制 can0
 # 输出：
 # 打印DATASET_ROOT所在位置
@@ -131,6 +133,7 @@ SINGLE_TASK=""
 WRIST_CAM=""
 TOP_CAM=""
 POLICY_PATH=""
+POLICY_DEVICE="cuda"
 VLA_CAN0_CONTROL="false"
 SUCCESS_KEY="b"
 FAILURE_KEY="f"
@@ -154,6 +157,8 @@ while [[ $# -gt 0 ]]; do
         --wrist_camera.gain|--wrist_camera.manual_gain) WRIST_GAIN="$2"; shift 2 ;;
         --wrist_camera.white_balance|--wrist_camera.white_balance_kelvin) WRIST_WHITE_BALANCE="$2"; shift 2 ;;
         --policy.path) POLICY_PATH="$2"; shift 2 ;;
+        --policy.device|--device) POLICY_DEVICE="$2"; shift 2 ;;
+        --policy.device=*|--device=*) POLICY_DEVICE="${1#*=}"; shift ;;
         --can0.control|--vla.can0_control) VLA_CAN0_CONTROL="$2"; shift 2 ;;
         --can0.control=*|--vla.can0_control=*) VLA_CAN0_CONTROL="${1#*=}"; shift ;;
         --rtc.enabled) RTC_ENABLED="$2"; shift 2 ;;
@@ -195,6 +200,38 @@ fi
 if [[ -n "$POLICY_PATH" && ! -f "$POLICY_PATH/config.json" ]]; then
     echo "[错误] --policy.path 不是当前 LeRobot checkpoint：$POLICY_PATH" >&2
     exit 1
+fi
+if [[ ! "$POLICY_DEVICE" =~ ^(cuda(:[0-9]+)?|cpu|mps|xpu)$ ]]; then
+    echo "[错误] --policy.device/--device 必须是 cuda、cuda:N、cpu、mps 或 xpu：$POLICY_DEVICE" >&2
+    exit 1
+fi
+if [[ -n "$POLICY_PATH" && "$POLICY_DEVICE" == cuda* ]]; then
+    if ! PYTHON_BIN="$(command -v python)" || [[ ! -x "$PYTHON_BIN" ]]; then
+        echo "[错误] 当前 PATH 中找不到可执行的 python；请先激活 LeRobot 环境" >&2
+        exit 1
+    fi
+    if ! "$PYTHON_BIN" - "$POLICY_DEVICE" <<'PY'
+import sys
+
+import torch
+
+requested = torch.device(sys.argv[1])
+if not torch.cuda.is_available():
+    raise SystemExit(f"CUDA 不可用，无法在 {requested} 上加载 VLA")
+
+device_count = torch.cuda.device_count()
+device_index = requested.index if requested.index is not None else torch.cuda.current_device()
+if device_index >= device_count:
+    raise SystemExit(
+        f"请求的逻辑设备 {requested} 不存在；当前 CUDA_VISIBLE_DEVICES 下仅有 {device_count} 张 GPU"
+    )
+
+print(f"[CUDA] VLA 将使用 {requested}（逻辑 GPU {device_index}: {torch.cuda.get_device_name(device_index)}）")
+PY
+    then
+        echo "[错误] VLA CUDA 设备检查失败" >&2
+        exit 1
+    fi
 fi
 
 CAMERAS="{
@@ -251,6 +288,7 @@ if [[ -z "$POLICY_PATH" ]]; then
         "--reset_episode_key=${RESET_KEY}"
     )
 else
+    echo "[模型] checkpoint=${POLICY_PATH} policy.device=${POLICY_DEVICE} rollout.device=${POLICY_DEVICE}"
     CMD=(
         lerobot-rollout
         "${COMMON[@]}"
@@ -261,6 +299,8 @@ else
         "--strategy.intervention_key=${INTERVENTION_KEY}"
         "--strategy.reset_key=${RESET_KEY}"
         "--policy.path=${POLICY_PATH}"
+        "--policy.device=${POLICY_DEVICE}"
+        "--device=${POLICY_DEVICE}"
         --fps=30
         --return_to_initial_position=false
     )

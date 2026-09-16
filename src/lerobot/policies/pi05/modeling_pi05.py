@@ -51,6 +51,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
 )
+from lerobot.utils.device_utils import resolve_safetensors_device
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..common.vla_utils import (
@@ -71,6 +72,90 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+def _materialize_pi05_meta_buffers(model: nn.Module, device: str) -> None:
+    """Recreate small non-persistent Transformers buffers omitted from safetensors."""
+    unresolved = []
+    target_device = torch.device(device)
+    for module_name, module in model.named_modules():
+        meta_buffer_names = [
+            name for name, buffer in module._buffers.items() if buffer is not None and buffer.is_meta
+        ]
+        if not meta_buffer_names:
+            continue
+
+        if meta_buffer_names == ["position_ids"] and hasattr(module, "num_positions"):
+            module._buffers["position_ids"] = torch.arange(module.num_positions, device=target_device).expand(
+                (1, -1)
+            )
+            continue
+
+        if meta_buffer_names == ["embed_scale"] and hasattr(module, "scalar_embed_scale"):
+            module._buffers["embed_scale"] = torch.tensor(
+                module.scalar_embed_scale,
+                device=target_device,
+            )
+            continue
+
+        if set(meta_buffer_names) <= {"inv_freq", "original_inv_freq"} and hasattr(module, "config"):
+            reference = type(module)(module.config, device=target_device)
+            for name in meta_buffer_names:
+                module._buffers[name] = reference._buffers[name]
+            continue
+
+        unresolved.extend(f"{module_name}.{name}" if module_name else name for name in meta_buffer_names)
+
+    if unresolved:
+        raise RuntimeError(f"Unsupported PI0.5 meta buffers: {unresolved[:5]}")
+
+
+def _materialize_pi05_missing_parameters(
+    model: nn.Module,
+    missing_keys: set[str],
+    device: str,
+) -> set[str]:
+    """Initialize known checkpoint additions without materializing the base model."""
+    remaining = set(missing_keys)
+    target_device = torch.device(device)
+    core_model = getattr(model, "model", None)
+
+    rlt_prefix = "model.rlt_module."
+    if core_model is not None and getattr(core_model, "rlt_module", None) is not None:
+        rlt_missing = {key for key in remaining if key.startswith(rlt_prefix)}
+        if rlt_missing:
+            from ..pi05_rlt.rlt_token_transformer import RLTTokenTransformer
+
+            config = model.config
+            rlt_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
+            with torch.device(target_device):
+                core_model.rlt_module = RLTTokenTransformer(
+                    input_dim=config.rlt_input_dim,
+                    embed_dim=config.rlt_embed_dim,
+                    num_rl_tokens=config.rlt_num_rl_tokens,
+                    prefix_seq_len=config.rlt_prefix_seq_len,
+                    num_layers=config.rlt_num_layers,
+                    num_heads=config.rlt_num_heads,
+                    mlp_ratio=config.rlt_mlp_ratio,
+                    dropout_rate=config.rlt_dropout_rate,
+                ).to(dtype=rlt_dtype)
+            remaining -= rlt_missing
+
+    proprio_prefix = "model.proprio_history_proj."
+    proprio_missing = {key for key in remaining if key.startswith(proprio_prefix)}
+    meta_projection = getattr(core_model, "proprio_history_proj", None)
+    if proprio_missing and meta_projection is not None:
+        with torch.device(target_device):
+            core_model.proprio_history_proj = nn.Linear(
+                meta_projection.in_features,
+                meta_projection.out_features,
+                bias=meta_projection.bias is not None,
+                device=target_device,
+                dtype=meta_projection.weight.dtype,
+            )
+        remaining -= proprio_missing
+
+    return remaining
 
 
 def _prepare_trained_rtc_prefix(
@@ -906,6 +991,7 @@ class PI05Policy(PreTrainedPolicy):
             config: Policy configuration class instance.
         """
         require_package("transformers", extra="pi")
+        skip_device_placement = kwargs.pop("_skip_device_placement", False)
         super().__init__(config)
         config.validate_features()
         self.config = config
@@ -918,7 +1004,11 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # from_pretrained can construct this module under a meta or CUDA default-device
+        # context. In that case every tensor is already on the intended construction device and
+        # calling to(config.device) either fails for meta tensors or performs redundant work.
+        if not skip_device_placement:
+            self.model.to(config.device)
 
         self.reset()
 
@@ -961,11 +1051,12 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        model = None
+        direct_cuda_load = torch.device(config.device).type == "cuda"
 
-        # Load state dict (expects keys with "model." prefix)
+        # Load state dict (expects keys with "model." prefix). CUDA checkpoints are read directly
+        # onto the rank-local GPU. A complete checkpoint can then be assigned into a meta-initialized
+        # module without ever materializing the randomly initialized model or checkpoint on CPU.
         try:
             print(f"Loading model from: {pretrained_name_or_path}")
             try:
@@ -984,12 +1075,76 @@ class PI05Policy(PreTrainedPolicy):
                 )
                 from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
+                load_device = resolve_safetensors_device(config.device) if direct_cuda_load else "cpu"
+                assign_state_dict = direct_cuda_load
+
+                used_meta_init = False
+                if direct_cuda_load:
+                    try:
+                        with torch.device("meta"):
+                            model = cls(config, _skip_device_placement=True, **kwargs)
+                        used_meta_init = True
+                    except Exception as e:
+                        logging.warning(
+                            "PI0.5 meta initialization is unavailable (%s); using CPU staging.",
+                            e,
+                        )
+                        load_device = "cpu"
+                        assign_state_dict = False
+                        model = cls(config, **kwargs)
+
+                    if used_meta_init:
+                        # Inspect only the safetensors header before allocating checkpoint tensors.
+                        # Cross-type PI0.5 -> RLT and older MEM checkpoints need fresh parameters.
+                        # Known small additions are initialized directly on the target GPU; unknown
+                        # additions retain the legacy CPU-staged path for a bounded GPU peak.
+                        from safetensors import safe_open
+
+                        with safe_open(resolved_file, framework="pt", device="cpu") as handle:
+                            header_state = {
+                                key: torch.empty(0, device="meta")
+                                for key in handle.keys()  # noqa: SIM118 - safe_open is not iterable
+                            }
+                        fixed_header_state = model._fix_pytorch_state_dict_keys(
+                            header_state, model.config, log_warnings=False
+                        )
+                        header_keys = {
+                            key if key.startswith("model.") else f"model.{key}" for key in fixed_header_state
+                        }
+                        missing_from_checkpoint = set(model.state_dict()) - header_keys
+                        if missing_from_checkpoint:
+                            unhandled_missing = _materialize_pi05_missing_parameters(
+                                model,
+                                missing_from_checkpoint,
+                                load_device,
+                            )
+                            if unhandled_missing:
+                                logging.info(
+                                    "Checkpoint omits %d unsupported PI0.5 tensors; using CPU staging "
+                                    "to initialize them safely.",
+                                    len(unhandled_missing),
+                                )
+                                load_device = "cpu"
+                                assign_state_dict = False
+                                used_meta_init = False
+                                model = cls(config, **kwargs)
+                            else:
+                                logging.info(
+                                    "Initialized %d checkpoint additions directly on %s.",
+                                    len(missing_from_checkpoint),
+                                    load_device,
+                                )
+                else:
+                    model = cls(config, **kwargs)
+
+                if used_meta_init:
+                    logging.info("Loading PI0.5 checkpoint directly onto %s.", load_device)
+                original_state_dict = load_file(resolved_file, device=load_device)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise RuntimeError(
+                    f"Could not read PI0.5 checkpoint from {pretrained_name_or_path}: {e}"
+                ) from e
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1011,8 +1166,25 @@ class PI05Policy(PreTrainedPolicy):
 
             remapped_state_dict = model._prepare_pretrained_state_dict(remapped_state_dict)
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # assign=True makes the CUDA safetensors storage the parameter storage. The optimizer
+            # is created only after make_policy returns, so replacing Parameter objects here is
+            # safe and avoids another full device-to-device copy.
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_state_dict,
+                strict=strict,
+                assign=assign_state_dict,
+            )
+
+            if used_meta_init:
+                _materialize_pi05_meta_buffers(model, load_device)
+
+            remaining_meta = [
+                name for name, tensor in (*model.named_parameters(), *model.named_buffers()) if tensor.is_meta
+            ]
+            if remaining_meta:
+                raise RuntimeError(
+                    f"Direct PI0.5 checkpoint load left meta tensors materialized: {remaining_meta[:5]}"
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1038,7 +1210,7 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+            raise RuntimeError(f"Could not load PI0.5 state dict from {pretrained_name_or_path}: {e}") from e
 
         return model
 
@@ -1056,7 +1228,7 @@ class PI05Policy(PreTrainedPolicy):
         return state_dict
 
     def _fix_pytorch_state_dict_keys(
-        self, state_dict, model_config
+        self, state_dict, model_config, log_warnings: bool = True
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
         """Fix state dict keys to match current model architecture."""
         import re
@@ -1077,7 +1249,8 @@ class PI05Policy(PreTrainedPolicy):
                     self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
                 )
                 if expert_uses_adarms:
-                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
+                    if log_warnings:
+                        logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
                     continue
 
             if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
@@ -1086,7 +1259,8 @@ class PI05Policy(PreTrainedPolicy):
                     self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
                 )
                 if expert_uses_adarms:
-                    logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
+                    if log_warnings:
+                        logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
                     continue
 
             # Handle MLP naming changes for pi05
@@ -1097,11 +1271,12 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
             # Also handle state_proj which shouldn't exist in pi05
             if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
+                if log_warnings:
+                    logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
             # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
+            if log_warnings and "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
 
