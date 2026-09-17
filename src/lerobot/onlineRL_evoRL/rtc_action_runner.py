@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RTCChunkPrediction:
+    """Action chunk returned by either the VLA or online Actor predictor."""
+
     actions: torch.Tensor
     apply_prefix_fusion: bool = False
 
@@ -61,6 +63,7 @@ class RTCActionChunkRunner:
         robot_type: str | None,
         chunk_predictor: RTCChunkPredictor,
     ) -> None:
+        """Initialize the independent callback-driven RTC queue."""
         self.policy = policy
         self.postprocessor = postprocessor
         self.rtc = rtc
@@ -94,7 +97,12 @@ class RTCActionChunkRunner:
             if self.device.type == "cuda" and getattr(self.policy.config, "use_amp", False)
             else nullcontext()
         )
-        with torch.inference_mode(), amp:
+        # Match the RL_data RTC engine: the policy owns its no-grad inference
+        # boundary, while guided RTC may locally re-enable autograd for the
+        # action/noise input. inference_mode would make that local Jacobian
+        # calculation impossible. Keep this callback in no_grad so online
+        # Actor-head parameters still never accumulate an inference graph.
+        with torch.no_grad(), amp:
             prediction = self.chunk_predictor(
                 observation_frame, inference_delay, previous_actions, task, robot_type
             )
@@ -183,6 +191,7 @@ class RTCActionChunkRunner:
         return fused
 
     def get_action(self, observation_frame: dict[str, np.ndarray]) -> torch.Tensor:
+        """Return one queued action and schedule chunk replenishment when needed."""
         if self.closed:
             raise RuntimeError("RTC runner is closed")
         if self.paused:
@@ -199,24 +208,30 @@ class RTCActionChunkRunner:
         return action.unsqueeze(0)
 
     def pause(self) -> None:
+        """Reject policy actions while intervention or GPU handoff is active."""
         self.paused = True
 
     def resume(self) -> None:
+        """Allow policy actions after reset or GPU acquisition completes."""
         self.paused = False
 
     def invalidate_pending_actions(self) -> None:
+        """Clear queued actions and invalidate an in-flight stale chunk."""
         self.generation += 1
         self.action_queue.clear()
         self.latency_tracker.reset()
 
     def wait_for_idle(self) -> None:
+        """Wait for the current chunk computation and collect or discard it."""
         self._collect_inference(wait=True)
 
     def reset(self) -> None:
+        """Invalidate asynchronous action state and wait for a clean boundary."""
         self.invalidate_pending_actions()
         self.wait_for_idle()
 
     def close(self) -> None:
+        """Stop accepting actions and shut down the inference executor."""
         if self.closed:
             return
         self.closed = True

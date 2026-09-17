@@ -463,34 +463,119 @@ bash scripts/RL_data_bimanual.sh \
 
 ## 在线 RL：actor_new + 人工介入 + RTC
 
-在线 Actor 只从 `actor_new` 启动；learner 和传输协议仍使用当前 LeRobot 实现。单臂或双臂由
-JSON 中的 `env.robot.type` / `env.teleop.type` 决定。双臂主臂配置应为 `bi_piper_leader`，
-其中左、右端口分别配置 can0、can2。
+在线 Actor 从 `lerobot.onlineRL_evoRL.actor_new` 启动，Learner 从
+`lerobot.onlineRL_evoRL.learner` 启动；两端通过 `scripts/RL_online.sh` 统一预检和运行。当前默认
+JSON 是 0915 双臂 Piper 配置，左、右主臂端口分别为 can0、can2。
+
+### 启动前准备离线 compact 特征
+
+当前 0915 Learner 配置启用了 20000 step 的离线 Actor/Critic 预训练。Learner 不再读取原始
+LeRobotDataset，也不会为离线阶段加载 5B PI0.5；必须先用独立提取器把原始数据转换为与在线
+Actor 保存格式相同的 compact episode：
+
+```text
+<compact_dataset_path>/
+├── manifest.json
+├── episode_000000/
+│   ├── compact_episode.pt
+│   └── metadata.json
+└── episode_000001/
+    ├── compact_episode.pt
+    └── metadata.json
+```
+
+当前 Learner JSON 要求最终目录为：
+
+```text
+/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2
+```
+
+单 GPU 提取示例：
 
 ```bash
-PIPER_ONLINE_RL_ACTOR_CONFIG=src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
-bash scripts/RL_online.sh actor \
-  --can0.control=true \
-  --rtc.enabled=true \
-  --rtc.mode=guided \
-  --rtc.execution_horizon=25 \
-  --rtc_action_queue_threshold=32
+cd /home/lenovo/code/Evo-RL-loop-0911
+EVORL_EXTRACT_DATASET_ROOT=/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+EVORL_EXTRACT_OUTPUT_DIR=/home/lenovo/datasets/offline_rlt_20260915_bipiper_cube_catch_v2-1_merged_newTask_compact_stride2_range0-10_needDelete \
+EVORL_EXTRACT_POLICY_PATH=/home/lenovo/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k \
+EVORL_EXTRACT_BATCH_SIZE=16 \
+bash scripts/RL_extract_offline_features.sh --episodes 0:20
+bash scripts/RL_extract_offline_features.sh --episodes 0:1247
+```
+
+算力充足的云端服务器推荐用单机多卡；脚本通过 `torchrun` 启动，每个进程独占一张 GPU，按
+完整 episode 分片，不做梯度同步：
+
+```bash
+cd /cloud/Evo-RL-loop-0911
+EVORL_ENV_ROOT=/cloud/envs/evo_0911 \
+EVORL_EXTRACT_GPUS=4 \
+EVORL_EXTRACT_BATCH_SIZE=32 \
+EVORL_EXTRACT_WORKERS=8 \
+EVORL_EXTRACT_STORAGE_DTYPE=float32 \
+EVORL_EXTRACT_DATASET_ROOT=/cloud/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+EVORL_EXTRACT_OUTPUT_DIR=/cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2 \
+EVORL_EXTRACT_POLICY_PATH=/cloud/models/pretrained_model \
+bash scripts/RL_extract_offline_features.sh --episodes 0:1247
+```
+
+`EVORL_EXTRACT_BATCH_SIZE` 和 `EVORL_EXTRACT_WORKERS` 都是**每个 GPU 进程**的值；先用较小
+batch 验证显存，再逐步增加。`--episodes` 使用 Python 风格的左闭右开范围，所以 `0:1247`
+表示 episode 0 到 1246；省略时处理数据集中的全部 episode。程序默认断点续跑并显示每张 GPU
+的帧级 `z_rl` 进度条，已经完整且模型身份/stride 相符的 episode 会跳过。需要重新导出时可传
+`--no-resume`，但必须先把冲突的旧 episode 目录移走。
+
+云端模型的实际路径通常与机器人本机不同。此时只设置 `EVORL_EXTRACT_POLICY_PATH` 指向云端
+checkpoint；不要设置 `EVORL_EXTRACT_FEATURE_MODEL_PATH`。提取器会继续使用 Learner JSON 中的
+`policy.pretrained_path` 作为特征身份，使结果回传后能通过本机 Learner 的契约检查。
+
+提取成功时才会生成全局 `manifest.json`。回传前可检查：
+
+```bash
+COMPACT_DIR=/cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2
+/cloud/envs/evo_0911/bin/python -c \
+  'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); m=json.loads((p/"manifest.json").read_text()); print(json.dumps(m, indent=2, ensure_ascii=False)); assert m["expected_episodes"] == m["completed_episodes"]; assert len(list(p.glob("episode_*/compact_episode.pt"))) == m["completed_episodes"]' \
+  "$COMPACT_DIR"
+```
+
+将整个输出目录复制到 Learner JSON 的 `offline_pretraining.compact_dataset_path`，不要只复制
+`.pt` 文件：
+
+```bash
+rsync -a --info=progress2 \
+  /cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2/ \
+  lenovo@<robot-ip>:/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2/
+```
+
+预检会要求 `manifest.json` 完整、episode 文件数一致，并要求 Learner 顶层 `dataset=null`。
+随后正常启动 Learner；它会先显示 `Offline compact loading`，再显示
+`Offline Actor/Critic training`，完成指定步数后保存并向 Actor 下发初始在线 Actor 权重。更完整
+的参数、断点续跑和故障排查见
+[onlineRL_evoRL 使用说明](src/lerobot/onlineRL_evoRL/README.md)。
+
+启动 Learner：
+
+```bash
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash scripts/RL_online.sh learner
+```
+
+启动 Actor：
+
+```bash
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash scripts/RL_online.sh actor
 ```
 
 同时启动 learner 和 actor：
 
 ```bash
-PIPER_ONLINE_RL_ACTOR_CONFIG=src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
-PIPER_ONLINE_RL_LEARNER_CONFIG=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
-bash scripts/RL_online.sh both \
-  --can0.control=true \
-  --rtc.enabled=true \
-  --rtc.mode=guided
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash scripts/RL_online.sh both
 ```
 
 `both` 模式后面的命令行覆盖只传给 `actor_new`，避免 `can0`、RTC 等硬件参数被 learner
 误解析。learner 参数应修改 learner JSON，或者用 `RL_online.sh learner --参数=值` 单独启动。
-不设置上述两个变量时，脚本默认使用这套 0901-40k 的 0911 适配配置。
+不设置配置环境变量时，脚本默认使用 0915 双臂 PI05-RLT 的配对配置。
 
 统一按键：`C` 人工介入/释放、`B` 成功、`F` 失败、`A` 放弃并重录、`R` 回初始位并重录、
 `Esc` 退出；`V` 切换 VLA/Online Actor。`can0.control=false` 时完全不连接主臂并禁用 `C`，

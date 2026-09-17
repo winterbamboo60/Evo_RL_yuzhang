@@ -1,0 +1,259 @@
+{
+  "actor_mode": "online_actor",
+  "save_format": "transition",
+  "can0": {
+    "control": false
+  },
+  "rtc": {
+    "enabled": true,
+    "mode": "guided",
+    "prefix_attention_schedule": "LINEAR",
+    "max_guidance_weight": 10.0,
+    "execution_horizon": 25,
+    "debug": false,
+    "debug_maxlen": 100
+  },
+  "rtc_action_queue_threshold": 32,
+  "dataset": {
+    "repo_id": "local/20260915_bipiper_cube_catch_v2-1_merged_newTask",
+    "root": "/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask",
+    "streaming": false
+  },
+  "env": {
+    "type": "gym_manipulator",
+    "task": "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket.",
+    "fps": 30,
+    "features": {
+      "agent_pos": {"type": "STATE", "shape": [14]},
+      "action": {"type": "ACTION", "shape": [14]},
+      "left_wrist": {"type": "VISUAL", "shape": [480, 640, 3]},
+      "left_top": {"type": "VISUAL", "shape": [480, 640, 3]},
+      "right_wrist": {"type": "VISUAL", "shape": [480, 640, 3]}
+    },
+    "features_map": {
+      "agent_pos": "observation.state",
+      "action": "action",
+      "left_wrist": "observation.images.left_wrist",
+      "left_top": "observation.images.left_top",
+      "right_wrist": "observation.images.right_wrist"
+    },
+    "name": "real_robot",
+    "robot": {
+      "type": "bi_piper_follower",
+      "id": "my_bi_piper_follower",
+      "left_arm_config": {
+        "port": "can1",
+        "speed_ratio": 50,
+        "require_calibration": true,
+        "enable_on_connect": true,
+        "disable_on_disconnect": false,
+        "cameras": {
+          "wrist": {
+            "type": "intelrealsense",
+            "serial_number_or_name": "260422275773",
+            "width": 640,
+            "height": 480,
+            "fps": 30,
+            "use_rgb": true,
+            "use_depth": false,
+            "warmup_s": 2,
+            "exposure_mode": "manual",
+            "exposure": 10000,
+            "gain": 16,
+            "white_balance": 3860
+          },
+          "top": {
+            "type": "opencv",
+            "index_or_path": 18,
+            "width": 640,
+            "height": 480,
+            "fps": 30
+          }
+        }
+      },
+      "right_arm_config": {
+        "port": "can3",
+        "speed_ratio": 50,
+        "require_calibration": true,
+        "enable_on_connect": true,
+        "disable_on_disconnect": false,
+        "cameras": {
+          "wrist": {
+            "type": "intelrealsense",
+            "serial_number_or_name": "260422275792",
+            "width": 640,
+            "height": 480,
+            "fps": 30,
+            "use_rgb": true,
+            "use_depth": false,
+            "warmup_s": 2,
+            "exposure_mode": "manual",
+            "exposure": 10000,
+            "gain": 16,
+            "white_balance": 3860
+          }
+        }
+      }
+    },
+    "teleop": {
+      "type": "bi_piper_leader",
+      "id": "my_bi_piper_leader",
+      "left_arm_config": {
+        "port": "can0",
+        "manual_control": false,
+        "command_speed_ratio": 50,
+        "require_calibration": true,
+        "disable_on_disconnect": false
+      },
+      "right_arm_config": {
+        "port": "can2",
+        "manual_control": false,
+        "command_speed_ratio": 50,
+        "require_calibration": true,
+        "disable_on_disconnect": false
+      },
+      "process_isolation": true
+    },
+    "processor": {
+      "control_mode": "bi_piper_leader",
+      "observation": {
+        "add_joint_velocity_to_observation": false,
+        "add_current_to_observation": false,
+        "add_ee_pose_to_observation": false,
+        "display_cameras": true
+      },
+      "image_preprocessing": null,
+      "gripper": {"use_gripper": true, "gripper_penalty": 0.0},
+      "reset": {
+        "fixed_reset_joint_positions": null,
+        "reset_time_s": 1.0,
+        "control_time_s": 120.0,
+        "terminate_on_success": true
+      },
+      "inverse_kinematics": null,
+      "reward_classifier": null,
+      "max_gripper_pos": 100.0
+    }
+  },
+  "policy": {
+    "type": "pi05_rlt",
+    "input_features": {
+      "observation.state": {"type": "STATE", "shape": [14]},
+      "observation.images.left_wrist": {"type": "VISUAL", "shape": [3, 480, 640]},
+      "observation.images.left_top": {"type": "VISUAL", "shape": [3, 480, 640]},
+      "observation.images.right_wrist": {"type": "VISUAL", "shape": [3, 480, 640]}
+    },
+    "output_features": {
+      "action": {"type": "ACTION", "shape": [14]}
+    },
+    "pretrained_path": "/home/lenovo/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "chunk_size": 50,
+    "n_action_steps": 50,
+    "action_feature_names": [
+      "left_joint_1.pos",
+      "left_joint_2.pos",
+      "left_joint_3.pos",
+      "left_joint_4.pos",
+      "left_joint_5.pos",
+      "left_joint_6.pos",
+      "left_gripper.pos",
+      "right_joint_1.pos",
+      "right_joint_2.pos",
+      "right_joint_3.pos",
+      "right_joint_4.pos",
+      "right_joint_5.pos",
+      "right_joint_6.pos",
+      "right_gripper.pos"
+    ],
+    "text_tokenizer_name": "/home/lenovo/modelZoo/paligemma-3b-pt-224",
+    "compile_model": false,
+    "gradient_checkpointing": true,
+    "train_expert_only": false,
+    "rlt_alpha": 1.0,
+    "rlt_input_dim": 2048,
+    "rlt_embed_dim": 2048,
+    "rlt_num_rl_tokens": 1,
+    "rlt_prefix_seq_len": 1024,
+    "rlt_num_layers": 2,
+    "rlt_num_heads": 8,
+    "rlt_mlp_ratio": 4.0,
+    "rlt_dropout_rate": 0.0,
+    "rlt_image_only": false,
+    "rlt_use_mask": true,
+    "acp_enabled": false,
+    "acp_indicator_field": "complementary_info.indicator_field",
+    "acp_indicator_dropout_prob": 0.3,
+    "push_to_hub": false,
+    "repo_id": "local_policy_model"
+  },
+  "algorithm": {
+    "type": "rlt_chunk",
+    "actor_hidden_dims": [256, 256, 256],
+    "critic_hidden_dims": [256, 256, 256],
+    "num_critics": 2,
+    "fixed_std": 0.002,
+    "reference_dropout_prob": 0.5,
+    "q_weight": 0.1,
+    "bc_weight": 5.0,
+    "discount": 0.96,
+    "critic_target_update_weight": 0.005,
+    "actor_update_interval": 4,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "grad_clip_norm": 10.0,
+    "online_steps": 1000000,
+    "online_step_before_learning": 100,
+    "online_buffer_capacity": 100000,
+    "offline_buffer_capacity": 100000,
+    "storage_device": "cpu",
+    "actor_rollout_deterministic": false,
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "policy_parameters_push_frequency": 4,
+      "queue_get_timeout": 2.0
+    },
+    "concurrency": {
+      "actor": "threads",
+      "learner": "threads",
+      "multiprocessing_context": "spawn"
+    }
+  },
+  "mixer": "online_offline",
+  "online_ratio": 1.0,
+  "gpu_handoff": {
+    "enabled": true,
+    "update_quota_threshold": 200,
+    "updates_per_episode": 40,
+    "learner_release_timeout_s": 600.0
+  },
+  "output_dir": "/home/lenovo/datasets/online_rl_outbox/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k/actor/output",
+  "job_name": "0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k_actor",
+  "resume": false,
+  "seed": 1000,
+  "wandb": {"enable": false},
+  "tensorboard": {"enable": false},
+  "actor_vla_policy": {
+    "enabled": true,
+    "policy_path": "/home/lenovo/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k",
+    "policy_poll_s": 5.0,
+    "reload_on_episode_boundary": false
+  },
+  "actor_only": {
+    "enabled": false,
+    "save_format": "transition"
+  },
+  "online_transition": {
+    "enabled": true,
+    "save_local_copy": true,
+    "episode_output_dir": "/home/lenovo/datasets/online_rl_outbox/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k/actor/episodes",
+    "save_lerobot_copy": true,
+    "lerobot_output_dir": "/home/lenovo/datasets/online_rl_outbox/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k/actor/lerobot_dataset",
+    "feature_batch_size": 16,
+    "sliding_window_stride": 2
+  },
+  "actor_checkpoint_path": "/home/lenovo/datasets/online_rl_outbox/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k/learner",
+  "task_hotkeys_path": null
+}

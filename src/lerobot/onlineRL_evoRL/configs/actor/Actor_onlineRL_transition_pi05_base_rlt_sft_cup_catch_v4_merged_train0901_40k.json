@@ -170,6 +170,8 @@
       "multiprocessing_context": "spawn"
     }
   },
+  "mixer": "online_offline",
+  "online_ratio": 1.0,
   "output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/actor/output",
   "job_name": "pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911_actor",
   "resume": false,

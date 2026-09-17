@@ -1,637 +1,472 @@
-# onlineRL_evoRL 使用说明
+# onlineRL_evoRL
 
-当前 0911 融合版只使用 `actor_new.py` 作为在线 Actor 入口；`scripts/RL_online.sh actor/both`
-也只会启动 `lerobot.onlineRL_evoRL.actor_new`。`actor.py` 与 `actor_old.py` 仅为历史兼容文件，
-不承载新的控制功能。learner 和 gRPC 字节分块协议继续使用当前 LeRobot 0.6.1 实现。
+本目录是 PI05-RLT 双臂 Piper 在线强化学习的完整运行时。Actor、独立 learner、在线 episode 组装、人工接管、RTC、GPU handoff、checkpoint、配置约束和启动前预检都由本目录维护；只复用 LeRobot 的 replay/trainer 等底层数据结构和 gRPC protobuf 字节传输。
 
-当前有效模式固定为：
+当前可执行入口：
 
-- `actor_mode=online_actor`
-- `save_format=transition`
-- `algorithm.type=rlt_chunk`
-- `actor_vla_policy.policy_path` 指向 PI05-RLT 模型；learner 只更新独立 Actor head。
+- Learner：`python -m lerobot.onlineRL_evoRL.learner`
+- Actor：`python -m lerobot.onlineRL_evoRL.actor_new`
+- 离线特征提取：`python -m lerobot.onlineRL_evoRL.extract_offline_features`
+- 配置预检：`python -m lerobot.onlineRL_evoRL.preflight`
+- 在线推荐启动脚本：`scripts/RL_online.sh`
+- 离线提取推荐启动脚本：`scripts/RL_extract_offline_features.sh`
 
-纯 VLA 或 VLA+人工录制继续使用 `RL_data.sh` / `RL_data_bimanual.sh`，不再由
-`actor_new` 的 `vla_only` 分支执行。
+不要再使用 python -m lerobot.rl.learner 启动本项目。该入口不会经过本目录的 PI05-RLT 配置约束。
 
-在线 Actor 支持单臂/双臂、可选主臂跟随与人工接管、guided RTC、Rerun、当前 compact
-transition 保存以及 episode 结束后的保持/回初始位逻辑。
+## 当前双臂任务
 
-## 运行环境
+默认启动脚本指向以下配对配置：
 
-建议从项目根目录启动：
+- Learner：configs/learner/Leanrer_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json
+- Actor：configs/actor/Actor_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json
+- 数据集：/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask
+- 离线 compact 数据：/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2
+- 已准备模型：/home/lenovo/outputs/pretrained_model
+- 在线输出：/home/lenovo/datasets/online_rl_outbox/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k
 
-```bash
-cd /home/lenovo/code/Evo-RL-loop-0911
-export PYTHONPATH=/home/lenovo/code/Evo-RL-loop-0911/src:$PYTHONPATH
-```
+当前模型和数据集均为：
 
-推荐使用当前项目环境：
+- policy.type = pi05_rlt
+- algorithm.type = rlt_chunk
+- observation.state = 14 维
+- action = 14 维
+- 三路图像：left_wrist、left_top、right_wrist
+- chunk_size = 50
+- 数据集与控制频率 = 30 FPS
 
-```bash
-source /home/lenovo/code/envs/evo_0911/bin/activate
-```
+双臂 CAN 分配：
 
-## 配置文件
+- 左 follower：can1
+- 右 follower：can3
+- 左 leader：can0
+- 右 leader：can2
 
-当前默认配置分为 actor 和 learner 两份：
+四个端口必须唯一。启动前仍应确认 CAN 设备存在、机械臂完成标定且急停与工作空间安全。
 
-```bash
-src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
-src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
-```
+## 与 0901 方案的区别
 
-完整迁移映射见 `src/lerobot/onlineRL_evoRL/configs/README.md`。
+0901 目录中保存了一份完整 learner 分叉，但其 RL_online.sh 仍然启动 lerobot.rl.learner，导致目录内实现事实上没有执行。当前入口不再委托 `lerobot.rl.learner`，EvoRL 的训练生命周期在本目录内闭合。
 
-关键硬件配置：
+当前方案采用明确边界：
 
-- follower：`piper_follower`，`can1`
-- leader：`piper_leader`，`can0`
-- wrist/top RealSense：默认 `260422275792` 和 `261822303677`
-- task：`Grab the left cup`，可用 `1/2/3` 切换
-- episode 控制时长：`120s`
+1. scripts/RL_online.sh 从 lerobot.onlineRL_evoRL.learner 启动。
+2. learner.py 独立管理服务、compact replay、更新额度、GPU handoff 和 checkpoint，不导入 `lerobot.rl.learner`。
+3. actor_new.py 仍是唯一硬件 Actor。
+4. preflight.py 在连接硬件前检查模型、数据集、14 维特征、三路相机、CAN 端口和配置配对。
+5. Learner 只从 policy 配置读取 RLT 维度并构造小型 actor/critic，不实例化 5B PI0.5。
 
-使用前按现场修改：
+因此，在线项目入口、训练状态机和任务约束都在本目录；公共模块不再决定 EvoRL learner 的模型加载和生命周期。
 
-- `env.robot.cameras.*.serial_number_or_name`
-- `dataset.root`
-- `output_dir`
-- online 模式下的 `algorithm.actor_learner_config.learner_host/learner_port`
+## 在线数据流
 
-## Learner：PI05 Online RL
+1. Actor 从双臂 Piper 和三路相机取得 observation。
+2. PI05-RLT VLA 产生参考 action chunk，并提取 z_rl、proprio 和 ref_action。
+3. RTC 执行动作；按 C 可切换人工接管。
+4. episode 结束后，Actor 构造 sliding-window compact transitions。
+5. Actor 必须先把 compact episode 保存到 `episode_output_dir`。
+6. 本地保存成功后，同一个 compact payload 经 gRPC 发送给 Learner。
+7. `save_lerobot_copy=true` 时，同一 accepted episode 还写成与 RL_data 兼容的标准 LeRobotDataset。
+8. Learner 将 compact transitions 写入 online replay。
+9. 每个去重后的完整 episode 增加 `gpu_handoff.updates_per_episode` 额度；额度达到双方相同的 `update_quota_threshold` 后触发一轮训练。
+10. 启用 handoff 时 Actor 先释放 PI0.5 CUDA 内存，Learner 执行恰好 threshold 次更新并释放 CUDA，再把在线 actor 权重和 handoff ID 发回 Actor。
+11. Actor 重新加载 PI0.5 和最新在线 actor 权重，所有机械臂归位后恢复采集。
 
-PI05 learner 冻结 PI0.5/RLT，只训练 action-chunk Actor 和 twin-Q Critic。推荐配置：
+当前 0915 Learner 启用了可选的离线启动阶段，但不再读取原始 LeRobotDataset，也不会实例化 5B PI05。原始数据先由独立的 `extract_offline_features` 程序转换为与 Actor 本地保存完全相同的 `episode_xxxxxx/compact_episode.pt + metadata.json`；Learner 从 `compact_dataset_path` 加载这些文件，再训练 RLT Actor/Critic 20000 step。
 
-`src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json`
+提取程序显示每张 GPU 的帧级 `z_rl` 进度条；Learner 分别显示 `Offline compact loading` 和 `Offline Actor/Critic training`。所有离线 episode 都按成功处理（仅 terminal reward=1），所有有效 action 都按人工介入示教处理。离线训练完成后会保存并下发初始 Actor 权重，释放离线 replay，再启动 gRPC 服务进入原在线循环；离线 replay 不与在线 replay 混采。
 
-启动命令必须使用带等号的配置参数：
+## 离线 compact 数据准备与预训练
 
-```bash
-source /home/lenovo/code/envs/evo_0911/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0911
-python -m lerobot.rl.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
+### 数据边界与输出格式
 
-source /home/lenovo/code/envs/evo_0911/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0911
-mkdir /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k
-nohup env PYTHONUNBUFFERED=1 python -m lerobot.rl.learner \
-    --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
-    > /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
-```
+原始 LeRobotDataset 只由独立提取器读取。提取器在 `torch.inference_mode()` 下加载 PI0.5，批量
+提取 `z_rl`、proprio 和 reference action，再按 sliding window 生成与在线 Actor 本地保存兼容的
+compact transition。这个过程只做推理，不训练 Actor/Critic，也不会产生梯度。
 
-断点重启
-```bash
-source /home/lenovo/code/envs/evo_0911/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0911
-python -m lerobot.rl.learner \
-  --config_path=/home/lenovo/datasets/online_rl_outbox/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k_0911/learner/checkpoints/last/pretrained_model/train_config.json \
-  --resume=true \
-  >> /home/lenovo/datasets/online_rl_outbox/logs/pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k/Leanrer_onlineRL_transition.log 2>&1 < /dev/null &
+Learner 顶层 `dataset` 必须为 `null`。它只读取提取后的 compact 数据、构造小型 RLT
+Actor/Critic 并完成配置的离线训练，不再加载原始图像、视频或 5B PI0.5。每个离线 episode
+统一按成功示教处理：仅 terminal reward 为 1，所有有效 action 的 intervention mask 为真。
 
-# rlt_chunk learner 只消费 actor 发送的 compact online replay。
-# 离线 RLT 训练继续使用 scripts/RL_train.sh。
-```
-
-
-配置文件是基准值；需要临时实验时，可在命令行用同名参数覆盖。参数统一使用 `--参数=值`，布尔值使用小写 `true/false`：
-
-```bash
-python -m lerobot.rl.learner \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json \
-  --steps=1000 \
-  --algorithm.actor_update_interval=4 \
-  --algorithm.online_step_before_learning=100 \
-  --algorithm.actor_learner_config.learner_port=50051 \
-  --batch_size=16 \
-  --num_workers=0
-```
-
-命令行覆盖只适合一次性实验；稳定参数应写回 learner-only JSON，便于 checkpoint 保存完整配置和复现实验。
-
-### 0901 历史 learner 参数说明（不可直接用于 0911）
-
-> 本节保留用于理解旧实验记录，其中 `policy.online_updates_per_episode`、
-> `policy.online_only_after_initialization` 和顶层 `gradient_accumulation_steps` 已不属于当前
-> `rlt_chunk` 配置。当前可执行字段以 `configs/README.md` 和迁移后的 learner JSON 为准。
-
-| 配置 | 要求 |
-| --- | --- |
-| `policy.pretrained_path` | 本地 PI0.5+RLT checkpoint；权重必须包含 RLT。 |
-| `policy.tokenizer_name` | 本地 PaliGemma tokenizer 目录，离线运行时不要填写远程模型名。 |
-| `dataset.root` | LeRobotDataset 根目录，必须有 data、videos、`meta/tasks.parquet`、`meta/episodes` 和 stats。 |
-| `output_dir` | learner checkpoint 和日志目录。 |
-| `policy.dtype` | 当前只支持 `float32` 或 `bfloat16`。 |
-
-PI05 learner 必须有离线 dataset。learner-only 配置不需要 `env`、机器人、teleop、相机端口、`actor_vla_policy` 或 `actor_only`。
-
-### task 来源
-
-learner 不接受外部统一 task，也不读取 `env.task`。
-
-`LeRobotDataset.__getitem__` 根据每一帧的 `task_index` 查询 `meta/tasks.parquet`，生成对应的 `batch["task"]`。因此三任务数据可以混合训练，同一个 batch 中的每个样本使用自己的 task 文本。
-
-在线 actor 已有的 episode metadata 会携带 task；learner 将它与同一 episode 的 transitions 配对，并且只接受出现在离线 dataset `meta/tasks.parquet` 中的 task，未知 task 会直接报错。
-
-### reward 与人工介入
-
-离线 parquet 不需要预先存在 `next.reward`。learner 从 episode metadata 动态构造稀疏 reward：
-
-- 非末帧：`reward=0`
-- `episode_success=success` 的末帧：`reward=1, done=true`
-- `episode_success=failure` 的末帧：`reward=0, done=true`
-- 缺失或非法 `episode_success`：启动失败
-
-人工介入严格按逐帧来源判断：
+输出目录结构如下：
 
 ```text
-complementary_info.collector_policy_id == "human"
+<output_dir>/
+├── manifest.json
+├── rank_000_manifest.json
+├── rank_001_manifest.json
+├── episode_000000/
+│   ├── compact_episode.pt
+│   └── metadata.json
+└── episode_000001/
+    ├── compact_episode.pt
+    └── metadata.json
 ```
 
-为 true 时，Actor BC target 使用数据集实际 action；否则使用冻结 VLA 的 reference action。不再使用 `complementary_info.is_intervention`，也没有可覆盖该语义的 `offline_intervention_field` 参数。
+`manifest.json` 记录源数据、模型身份、期望/完成 episode 数、transition 数、源帧数、stride、
+world size 和存储 dtype。只有所有请求的 episode 都成功写入，且输出中没有额外 episode 时，rank
+0 才会原子写入全局 manifest。每个 episode 也通过临时目录原子落盘，避免中断后把半写入文件
+误判为完成。
 
-### 数据加载与内存
+### 查看帮助
 
-离线训练沿用标准 `lerobot-train` 的 DataLoader 模式：
+```bash
+cd /home/lenovo/code/Evo-RL-loop-0911
+bash scripts/RL_extract_offline_features.sh --help
+```
 
-1. DataLoader 按 `batch_size` 惰性解码视频，不再把全部帧转换成 Python transition list。
-2. action 查询 `[0, chunk_size)`，observation 查询当前时刻和 `+chunk_size` 两个时刻。
-3. 根据 episode 边界生成 reward、done、intervention、valid mask 和 bootstrap mask。
-4. 当前/下一 observation 批量提取冻结 PI0.5/RLT 特征。
-5. 离线初始化阶段使用全离线 batch；收到在线 episode 后，在线阶段按配置使用纯在线或 online/offline 混合 batch。
+脚本默认使用当前 0915 Learner JSON 作为特征维度、相机、chunk size 和模型身份契约。云端应有
+同一版本的仓库、该配置文件、原始 LeRobotDataset 和 PI0.5 checkpoint。
 
-内存上限主要由 `batch_size × num_workers × prefetch_factor`、模型和 online replay 决定，不再随离线数据集总图像数线性增长。离线 replay 不再创建，也不会写入 checkpoint。
+### 单 GPU 提取
 
-### 两阶段训练流程
+```bash
+cd /home/lenovo/code/Evo-RL-loop-0911
+EVORL_EXTRACT_DATASET_ROOT=/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+EVORL_EXTRACT_OUTPUT_DIR=/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2 \
+EVORL_EXTRACT_POLICY_PATH=/home/lenovo/outputs/pretrained_model \
+EVORL_EXTRACT_BATCH_SIZE=8 \
+EVORL_EXTRACT_WORKERS=4 \
+bash scripts/RL_extract_offline_features.sh --episodes 0:1247
+```
 
-1. learner 启动后先执行 `steps` 次离线初始化更新，同时可接收并缓存在线 episode。
-2. 离线初始化完成后不自动退出，也不继续空转训练；没有在线 episode 时只等待。
-3. 每接收并校验一个完整 compact episode（旧 raw 格式仍与 metadata 配对），就向累计额度增加 `policy.online_updates_per_episode` 次更新。多个 episode 会按 FIFO 配对，更新额度可以累加。
-4. 在线 replay 累积保留所有已接收的在线 transition。`online_only_after_initialization=false` 时每个在线 batch 各取一半 online 和 offline；设为 `true` 时完全不再采样原离线 dataset。
-5. `Ctrl+C` 或终止信号会设置 shutdown event，停止等待并关闭 gRPC 与队列。
+### 单机多 GPU 提取
 
-### 阶段与采样参数
+推荐通过 wrapper 启动。`EVORL_EXTRACT_GPUS=N` 会调用 `torchrun --standalone
+--nproc-per-node N`，每个进程固定使用一张 GPU，并以 `episodes[rank::world_size]` 的方式分配
+完整 episode。进程间不做模型或梯度同步。
 
-| 参数 | 当前示例 | 用法与精确含义 |
-| --- | ---: | --- |
-| `steps` | `200` | **仅表示离线初始化更新次数，不是总训练步数，也不是退出条件。** 达到该值后 learner 保持运行，等待在线 episode。 |
-| `policy.online_updates_per_episode` | `4` | 每接收一个完整在线 episode 增加 4 次有效 optimizer update；当前每 2 个 episode 同步一次，因此一批执行 8 次 Critic 更新。 |
-| `policy.online_only_after_initialization` | `false` | `false`：在线阶段每个 micro batch 混合 online/offline；`true`：离线初始化结束后只采样 online replay。该参数不会跳过最初的 `steps` 次初始化。 |
-| `batch_size` | `16` | 单次前后向的 micro batch。混合模式每个 micro batch 为 8 个 online 和 8 个 offline 样本。 |
-| `gradient_accumulation_steps` | `16` | 累计 16 个 micro batch 后执行一次 optimizer step；单卡 effective batch 为 `16 × 16 = 256`。 |
-| `num_workers` | `4` | 离线 DataLoader worker 数。显存或主存紧张时先减 `batch_size`，并相应增加累计次数以维持 effective batch。 |
-| `policy.online_buffer_capacity` | `100000` | online compact feature replay 最多保存的 sliding-window transition 数，不是 episode 数。增大它主要增加 CPU 内存和 checkpoint 体积。 |
-| `policy.actor_update_interval` | `4` | Critic 每次有效 step 都更新，Actor 每 4 次 Critic step 更新一次。 |
-| `log_freq` / `save_freq` | `5 / 100` | 每多少个累计 `learner_step` 记录日志/保存 checkpoint；`save_freq` 仅在 `save_checkpoint=true` 时生效。 |
+```bash
+cd /cloud/Evo-RL-loop-0911
+EVORL_ENV_ROOT=/cloud/envs/evo_0911 \
+EVORL_EXTRACT_GPUS=4 \
+EVORL_EXTRACT_BATCH_SIZE=32 \
+EVORL_EXTRACT_WORKERS=8 \
+EVORL_EXTRACT_STRIDE=2 \
+EVORL_EXTRACT_STORAGE_DTYPE=float32 \
+EVORL_EXTRACT_DATASET_ROOT=/cloud/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+EVORL_EXTRACT_OUTPUT_DIR=/cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2 \
+EVORL_EXTRACT_POLICY_PATH=/cloud/models/pretrained_model \
+bash scripts/RL_extract_offline_features.sh --episodes 0:1247
+```
 
-如果目标是对齐 RLinf 的每轮 8 次 Critic 更新，且保持当前每 2 个 episode 同步一次，设置：
+每张 GPU 都有独立的帧级 `GPU <rank>/<world_size> z_rl` 进度条。上例中的 batch size 32 和
+workers 8 都是**每个 GPU 进程**的值，四卡总推理 batch 上限为 128，总 DataLoader worker
+数为 32。显存不足时先降低 `EVORL_EXTRACT_BATCH_SIZE`；CPU 内存、文件句柄或视频解码压力过高
+时降低 `EVORL_EXTRACT_WORKERS`。
+
+也可绕过 wrapper 直接启动：
+
+```bash
+cd /cloud/Evo-RL-loop-0911
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+/cloud/envs/evo_0911/bin/torchrun --standalone --nproc-per-node 4 \
+  -m lerobot.onlineRL_evoRL.extract_offline_features \
+  --config-path src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json \
+  --dataset-root /cloud/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+  --dataset-repo-id local/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+  --output-dir /cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2 \
+  --policy-path /cloud/models/pretrained_model \
+  --batch-size 32 \
+  --num-workers 8 \
+  --stride 2 \
+  --episodes 0:1247
+```
+
+### 参数说明
+
+Wrapper 通过以下环境变量配置：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `EVORL_ENV_ROOT` | `/home/lenovo/code/envs/evo_0911` | Python/torchrun 环境根目录 |
+| `EVORL_EXTRACT_CONFIG` | 当前 0915 Learner JSON | 提供 policy、env 和 feature contract |
+| `EVORL_EXTRACT_DATASET_ROOT` | 无，必填 | 原始 LeRobotDataset 根目录 |
+| `EVORL_EXTRACT_OUTPUT_DIR` | 无，必填 | compact 输出目录；不要混用不同 episode 集合或契约 |
+| `EVORL_EXTRACT_DATASET_REPO_ID` | `local/offline_feature_extraction` | 写入 metadata 的源数据身份 |
+| `EVORL_EXTRACT_GPUS` | `1` | 本机使用的 GPU/进程数量 |
+| `EVORL_EXTRACT_BATCH_SIZE` | `8` | 每个 GPU 进程的推理 batch size |
+| `EVORL_EXTRACT_WORKERS` | `4` | 每个 GPU 进程的 DataLoader worker 数 |
+| `EVORL_EXTRACT_STRIDE` | `2` | sliding-window stride，当前须与 Learner 的 2 一致 |
+| `EVORL_EXTRACT_STORAGE_DTYPE` | `float32` | compact 张量存储类型：`float32`、`float16` 或 `bfloat16` |
+| `EVORL_EXTRACT_POLICY_PATH` | Learner JSON 的模型路径 | 当前机器实际加载的 checkpoint |
+| `EVORL_EXTRACT_FEATURE_MODEL_PATH` | Learner JSON 的模型路径 | 写入 payload 的模型身份；仅修改契约时使用 |
+
+Wrapper 后面可以继续传原生 CLI 参数：
+
+- `--episodes 0:1247`：左闭右开范围，即 episode 0 到 1246。
+- `--episodes 0:100,200:300:2`：支持逗号组合和步长。
+- 省略 `--episodes`：处理数据集全部 episode。
+- `--max-episodes N`：从解析后的 episode 列表截取前 N 个，适合小规模验证。
+- `--resume` / `--no-resume`：默认开启断点续跑。
+- `--device cuda`：单进程设备；多卡时各 rank 自动映射到对应 CUDA 设备。
+
+`float16`/`bfloat16` 可减少产物体积和读取 I/O，但当前 Learner replay 最终使用 float32
+storage，因此不会等比例降低训练期 replay 内存。第一次正式提取建议保留 `float32`；使用低精度前
+先抽取少量 episode，比较离线训练稳定性。
+
+### 云端模型路径与特征契约
+
+云端 checkpoint 路径与机器人本机不同时，只设置 `EVORL_EXTRACT_POLICY_PATH`。例如云端从
+`/cloud/models/pretrained_model` 实际加载模型，但 payload 仍默认写入 Learner JSON 中的
+`/home/lenovo/outputs/pretrained_model` 作为模型身份，这样回传后可以直接通过本机契约检查。
+
+不要仅因云端目录不同就设置 `EVORL_EXTRACT_FEATURE_MODEL_PATH`。该变量会改变产物中的模型
+身份，只有同时有意修改 Learner 的 `policy.pretrained_path` 契约时才使用。
+
+### 断点续跑
+
+默认 `--resume`。模型身份和 stride 一致、且 `compact_episode.pt` 与 `metadata.json` 均有效的
+episode 会被跳过；缺失或不兼容的已有 episode 目录会报
+`Existing episode is incomplete or incompatible`，不会被静默覆盖。人工确认后将该 episode 目录
+移走，再用完全相同的命令继续即可。
+
+不要在同一个输出目录先后请求不同的 episode 集合，例如先提取 `0:100`，再直接提取
+`0:1247`。全局 manifest 要求输出中的 episode 恰好等于本次请求集合。小规模验证应使用独立的
+测试输出目录；`--no-resume` 也应只配合空目录或全新的输出目录使用。
+
+### 完整性检查与回传
+
+只有成功生成全局 `manifest.json` 的目录才能交给 Learner。云端提取完成后运行：
+
+```bash
+COMPACT_DIR=/cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2
+/cloud/envs/evo_0911/bin/python -c \
+  'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); m=json.loads((p/"manifest.json").read_text()); print(json.dumps(m, indent=2, ensure_ascii=False)); assert m["expected_episodes"] == m["completed_episodes"]; assert len(list(p.glob("episode_*/compact_episode.pt"))) == m["completed_episodes"]' \
+  "$COMPACT_DIR"
+```
+
+然后将整个目录回传到 Learner JSON 的 `offline_pretraining.compact_dataset_path`。尾部 `/` 表示
+复制目录内容，`manifest.json`、每个 episode 的 metadata 和 `.pt` 都必须保留：
+
+```bash
+rsync -a --info=progress2 \
+  /cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2/ \
+  lenovo@<robot-ip>:/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2/
+```
+
+### 启动 Learner
+
+当前 Learner 配置关键字段为：
 
 ```json
 {
-  "steps": 1000,
-  "batch_size": 16,
-  "gradient_accumulation_steps": 16,
-  "policy": {
-    "online_updates_per_episode": 4,
-    "actor_update_interval": 4,
-    "online_only_after_initialization": false
+  "dataset": null,
+  "offline_pretraining": {
+    "enabled": true,
+    "steps": 20000,
+    "feature_batch_size": 16,
+    "sliding_window_stride": 2,
+    "compact_dataset_path": "/home/lenovo/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_pi05_rlt_compact_stride2"
   }
 }
 ```
 
-只想让在线阶段使用新数据时，仅把 `online_only_after_initialization` 改为 `true`；离线 dataset 仍会用于启动时的 meta、task、stats 和前 `steps` 次初始化。
-
-### 模型与优化参数
-
-| 参数 | 当前示例 | 用法与精确含义 |
-| --- | ---: | --- |
-| `policy.pretrained_path` | 本地 checkpoint | 实际加载的 PI0.5+RLT 权重目录。该 checkpoint 必须与数据集的 observation/action features 兼容。 |
-| `policy.use_rlt` | `true` | 启用并读取 RLT 特征；本 learner 依赖 `z_rl`，应保持为 `true`。 |
-| `policy.base_policy_path` | 与 `pretrained_path` 相同 | 当前 PI05 Online RL learner 不单独读取此字段；保留是为了配置兼容。需要更换基座时必须修改 `pretrained_path`。 |
-| `policy.chunk_size` / `policy.n_action_steps` | `50 / 50` | Actor 输出的完整 action chunk 长度和训练 horizon；当前实现要求二者严格相等。 |
-| `policy.z_dim` | `2048` | 冻结 RLT 输出特征维度，必须与所加载 checkpoint 一致。 |
-| `policy.proprio_dim` | `7` | 本体状态维度，必须与数据集和 checkpoint 一致。 |
-| `policy.actor_hidden_dims` / `policy.critic_hidden_dims` | `[256,256,256]` | Actor 使用 Tanh 隐藏层；Critic 使用 Linear→LayerNorm→Tanh，均与 RLinf Stage 2 对齐。 |
-| `policy.num_critics` | `2` | Q 网络数量；当前实现至少需要 2 个。 |
-| `policy.fixed_std` | `0.002` | 固定高斯噪声加在 raw mean 上，再经过 Tanh；Actor loss、TD target 和非确定性在线 rollout 都实际使用。 |
-| `policy.actor_rollout_deterministic` | `false` | `false` 用于在线训练采集并加入固定噪声；纯评估时设为 `true`。两种模式都不使用 reference dropout。 |
-| `policy.reference_dropout_prob` | `0.5` | Actor 训练时丢弃冻结 VLA reference action 条件的概率，用于避免 Actor 只复制 reference；范围 `[0,1]`。 |
-| `policy.q_weight` / `policy.bc_weight` | `0.1 / 5.0` | Actor loss 为 `-q_weight × Q + bc_weight × masked_BC`。增大前者更偏向奖励，增大后者更贴近人工动作/VLA reference。 |
-| `policy.discount` | `0.96` | chunk 内 reward 折扣以及完整窗口 bootstrap 折扣，范围 `(0,1]`。 |
-| `policy.critic_target_update_weight` | `0.005` | target Critic 的 Polyak 软更新系数；越小更新越平滑，范围 `(0,1]`。 |
-| `policy.actor_lr` / `policy.critic_lr` | `3e-4 / 3e-4` | learner 实际使用的 Actor/Critic Adam 学习率。 |
-| `policy.grad_clip_norm` | `10.0` | Actor 与 Critic 各自的梯度范数裁剪上限。 |
-
-PI0.5/RLT 骨干在本 learner 中被冻结；日志里的 `bc_loss` 下降表示新 Actor 更接近 BC target，不表示 VLA 骨干正在更新。通用 `optimizer` 和 `scheduler` 仍不控制这里的两个 Adam optimizer；`gradient_accumulation_steps` 现已由 PI05 learner 使用。学习率和裁剪继续使用 `policy.actor_lr`、`policy.critic_lr` 与 `policy.grad_clip_norm`。
-
-### 资源、服务与输出参数
-
-| 参数 | 建议/当前示例 | 用法与精确含义 |
-| --- | ---: | --- |
-| `policy.device` | `cuda` | 冻结骨干、Actor/Critic 和计算 batch 所在设备。 |
-| `policy.storage_device` | `cpu` | online replay 特征的存储设备。保持 `cpu` 可避免 replay 长期占用显存。 |
-| `policy.offload_to_cpu_while_waiting` | `true`（默认 `false`） | 为 `true` 时，没有待执行的在线更新会将模型和 Adam 动量迁到 CPU，并在收到新数据后恢复到 `policy.device`。这会增加 CPU 内存占用和恢复训练延迟；CUDA context 仍可能保留少量显存。 |
-| `policy.dtype` | `bfloat16` | 骨干计算精度；当前只接受 `bfloat16` 或 `float32`，不能写 `float16`。 |
-| `dataset.streaming` | `false` | 当前 PI05 learner 强制要求 `false`。 |
-| `policy.tokenizer_name` | 本地目录 | PaliGemma tokenizer 资产路径；离线机器必须提前准备本地文件。 |
-| `policy.actor_learner_config.learner_port` | `50051` | learner gRPC 监听端口；必须与发送数据的一侧一致且未被占用。 |
-| `policy.actor_learner_config.learner_host` | `127.0.0.1` | learner gRPC 的绑定地址。同机使用 `127.0.0.1`；跨机器可绑定实际网卡 IP 或 `0.0.0.0`，发送端需连接 learner 的可达 IP。 |
-| `policy.actor_learner_config.queue_get_timeout` | `2.0` | 内部队列等待超时秒数；影响无数据等待和退出响应速度，不是网络训练超时。 |
-| `output_dir` | 新目录 | 日志和 checkpoint 根目录。`resume=false` 时目录必须不存在。 |
-| `resume` | `false` | 恢复时设为 `true`，并让配置指向已有 run/checkpoint；恢复会加载累计 step、optimizer 和已保存的 online replay。 |
-
-`policy.actor_learner_config.policy_parameters_push_frequency` 当前不被 PI05 learner 使用，因为该路径尚未向 actor 部署新 Actor 参数。`policy.online_steps` 仅控制 actor 的环境交互上限，不控制 learner，因此 learner-only 配置有意省略它。
-
-PI05 learner 同样不使用 `utd_ratio`、`offline_buffer_capacity`、`feature_extract_batch_size`、`offline_intervention_field` 或 `async_prefetch`。不要添加这些字段来调节当前 learner。日志中的阶段与计数器含义固定：
-
-- `training_phase`：`offline_initialization` 或 `online`
-- `learner_step`：离线和在线阶段累计的模型更新次数
-- `interaction_step`：actor 环境交互
-- `online_episode_count`：本次运行已接收的在线 episode 数
-- `pending_online_update_steps`：尚未执行的在线更新额度
-
-### Checkpoint
-
-PI05 learner 只保存可训练的 Actor、Critic 和 target Critic，不重复保存冻结的 VLA/RLT 权重：
-
-```text
-checkpoints/<learner_step>/
-  actor_critic.pt
-  manifest.json
-  pretrained_model/
-    train_config.json
-    config.json
-  training_state/
-  replay_online/       # 只有收到在线数据后才存在
-checkpoints/last
-```
-
-`manifest.json` 同时记录基座路径、特征维度、RLinf-compatible Actor/噪声架构、effective batch 和 Critic:Actor 更新比。恢复及在线 Actor 加载会校验架构版本；旧 ReLU/post-tanh-noise Stage 2 checkpoint 会被拒绝。恢复时先从 `policy.pretrained_path` 加载冻结 VLA/RLT，再加载 `actor_critic.pt`。optimizer、`learner_step`、`interaction_step`、更新额度、episode 计数和 online replay 都会恢复。
-
-离线 dataset 始终从 `dataset.root` 读取，不复制进 checkpoint。checkpoint 名称中的 step 是离线和在线阶段累计的 `learner_step`。
-
-## VLA Actor 配置
-
-`actor_vla_policy.enabled=false` 时，actor 使用原 SAC policy 生成动作。
-
-开启 VLA 推理：
-
-```json
-"actor_vla_policy": {
-  "enabled": true,
-  "policy_path": "/home/yz/projects/outputs/pi05_base_smovla_v3_0720/train/checkpoints/050000/pi05_base_smovla_v3_0720_50k",
-  "policy_poll_s": 5.0,
-  "reload_on_episode_boundary": true
-}
-```
-
-VLA 加载逻辑与 `RL_data.sh --policy.path` 对齐：
-
-```text
-PreTrainedConfig.from_pretrained(policy_path)
-make_policy(policy_cfg, ds_meta=LeRobotDatasetMetadata(...))
-make_pre_post_processors(policy_cfg, pretrained_path=policy_path, dataset_stats=...)
-predict_action(raw_robot_observation, task=env.task)
-```
-
-VLA checkpoint 目录需要包含类似文件：
-
-```text
-config.json
-model.safetensors
-policy_preprocessor.json
-policy_postprocessor.json
-```
-
-迁移配置固定 `reload_on_episode_boundary=false`。VLA/RLT 基座在一次在线运行中保持不变，
-learner 只通过当前 gRPC 通道更新独立 Actor head。
-
-## 统一 Actor 模式
-
-启动入口固定为：
-
-```bash
-python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/actor/<actor-config>.json
-```
-
-配置矩阵：
-
-| `actor_mode` | `save_format` | learner 连接 | 动作来源 |
-| --- | --- | --- | --- |
-| `online_actor` | `transition` | 是 | PI05-RLT Online Actor；`V` 可切换 VLA/Actor |
-
-`vla_only` 和 `online_actor + lerobot` 都会在 `actor_new` 启动前报错。
-
-在线模式参考配置：
-
-```bash
-source /home/lenovo/code/envs/evo_0911/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0911
-python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json
-
-source /home/lenovo/code/envs/evo_0911/bin/activate
-cd /home/lenovo/code/Evo-RL-loop-0911
-python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_base_cup_catch_v2_0819_35k.json
-```
-
-它还需要：`policy.type=pi05_rlt`、`algorithm.type=rlt_chunk`、与 learner 相同的模型/数据配置，以及一致的 learner host/port。`actor_checkpoint_path` 可选；缺失时先用 VLA，收到 learner 权重后自动切换 Online Actor。
-
-按 task 键会丢弃当前 episode、切换 `env.task` 并复位。`V` 在已加载 Actor head 时切换 Online Actor/VLA，并清空 RTC/动作缓存；`B` 专用于成功标记。
-
-### 可选 RTC 动作执行
-
-RTC 默认关闭；不配置时保留原有同步 VLA 路径和 Online Actor 的 `_actor_actions` chunk 缓存。
-开启后，VLA 和 Online Actor 的完整动作块都交给同一个 RTC 执行队列，逐拍取出的动作再经过
-平滑、夹爪处理和 robot processor 后发送给机械臂。Online Actor 模式下不会再使用
-`_actor_actions`，避免双重动作队列。
-
-配置文件中可加入：
-
-```json
-"rtc": {
-  "enabled": true,
-  "mode": "guided",
-  "execution_horizon": 25,
-  "prefix_attention_schedule": "LINEAR",
-  "max_guidance_weight": 10.0
-},
-"rtc_action_queue_threshold": 32
-```
-
-也可以仅在启动时覆盖：
-
-```bash
-python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path=src/lerobot/onlineRL_evoRL/configs/actor/<actor-config>.json \
-  --rtc.enabled=true \
-  --rtc.mode=guided \
-  --rtc.execution_horizon=25 \
-  --rtc_action_queue_threshold=32
-```
-
-`rtc.enabled=false` 时顶层开关会明确禁用 checkpoint 中可能保存的 RTC 配置。开始人工接管时
-会立即废弃 RTC 队列；任务切换、VLA/Actor 切换、episode 边界和关闭进程时，还会等待旧的
-后台推理安全退出后再重置或换权重。
-
-## 已停用的 Actor-only 模式（历史说明）
-
-> 0911 当前版本已停用 `actor_new` 的 Actor-only/VLA-only 分支；本节命令不可执行，仅用于
-> 辨认旧输出。纯 VLA 采集请使用 `RL_data.sh` 或 `RL_data_bimanual.sh`。
-
-`actor_mode=vla_only` 不连接 learner，不检查 learner 是否存在。顶层 `save_format` 选择两种保存方式，默认是 `lerobot`；`actor_only` 仅保留输出目录、图片和 viewer 细节：
-
-- `transition`：保存与在线发送完全相同的 compact episode，同时可生成 JSON、JPEG 和 HTML viewer；要求启用 PI05+RLT VLA。
-- `lerobot`：沿用原有 LeRobotDataset 保存逻辑，保存 Parquet、视频和 metadata。
-
-### 方式一：保存 transition 包
-
-配置文件中设置：
-
-```json
-"actor_mode": "vla_only",
-"save_format": "transition",
-"actor_only": {
-  "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_transition_episodes",
-  "save_episode_images": true,
-  "save_episode_viewer": true
-}
-```
-
-启动命令：
+回传完成后正常启动：
 
 ```bash
 cd /home/lenovo/code/Evo-RL-loop-0911
-/home/lenovo/code/envs/evo_0911/bin/python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_actorOnly_transition.json
+bash scripts/RL_online.sh learner
 ```
 
-输出目录可以已经存在；重新启动时会从现有最大 episode 编号继续写入。保存结构：
+预检先验证 manifest 的期望/完成 episode 数和实际文件数。Learner 随后显示
+`Offline compact loading` 进度条，将 compact transition 装入临时离线 replay；再显示
+`Offline Actor/Critic training` 进度条，训练配置的 20000 step。完成后保存并下发初始 Actor
+权重，释放离线 replay，再启动 gRPC 服务进入原有在线循环。离线 replay 不与后续在线 replay
+混采；在线旧数据仍由在线 replay/checkpoint 独立保留。
 
-```text
-actor_transition_episodes/
-  episode_000000/
-    metadata.json
-    compact_episode.pt
-    frames.json
-    images/
-      observation.images.top/
-      observation.images.wrist/
-    viewer.html
-```
+Actor 配置中的训练 `dataset.root` 仍用于 task metadata、特征契约和归一化处理，但不进入当前 learner replay 混采。
 
-打开某个 episode 的 `viewer.html` 即可查看 top/wrist 图像、task、reward、
-done/truncated、action、state、介入状态和 VLA checkpoint 信息。
+每个 episode 结束后，Actor 会像 RL_data 一样持续刷新 follower 的终止姿态，并同步任何可执行 leader，直到复位、下一 episode 或 handoff 完成，避免等待保存和训练时机械臂下坠。Actor 首次启动及每次重新获得 GPU 后都会把全部关节移动到 0，并把夹爪设置为 `max_gripper_pos`（当前为 100.0）。
 
-### 方式二：保存标准 LeRobotDataset
+## 启动前预检
 
-配置文件中设置：
+在仓库根目录执行：
 
-```json
-"actor_mode": "vla_only",
-"save_format": "lerobot",
-"actor_only": {
-  "episode_output_dir": "/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_lerobot_dataset",
-  "save_episode_images": true,
-  "save_episode_viewer": true
-}
-```
+    cd /home/lenovo/code/Evo-RL-loop-0911
+    /home/lenovo/code/envs/evo_0911/bin/python -m lerobot.onlineRL_evoRL.preflight \
+      --learner-config src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json \
+      --actor-config src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json \
+      --mode both
 
-启动命令：
+预检不会连接机械臂，也不会加载完整模型到 GPU。它会检查：
 
-```bash
-cd /home/hpc/yuzhang/Evo-RL-loop-0817
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python -m lerobot.onlineRL_evoRL.actor_new \
-  --config_path src/lerobot/onlineRL_evoRL/configs/actor/piper_cup_catch_pi05_Actor_actorOnly_lerobot.json
-```
+- actor/learner 都是 pi05_rlt + rlt_chunk；
+- 两端 policy 和 algorithm 关键字段一致；
+- 模型目录包含 config、safetensors 和 pre/postprocessor；
+- 模型的特征、chunk 和 RLT 参数与配置一致；
+- 数据集 info.json 的状态、动作、相机和 action names 与模型一致；
+- Learner 顶层 `dataset` 始终为 `null`；启用离线阶段时，compact 目录必须有完整
+  `manifest.json`，期望/完成 episode 数必须相等，实际 episode 文件数也必须一致；
+- 双端 GPU handoff 的 enabled、threshold 和 updates_per_episode 一致；threshold 不固定为 200；
+- compact 本地副本必开，启用 LeRobot 副本时两个输出目录存在配置且互不相同；
+- actor_checkpoint_path 指向 Learner output_dir；
+- Piper robot/teleop 类型和四个 CAN 端口正确；
+- RTC execution_horizon 不超过 chunk_size。
 
-`lerobot` 方式要求 `episode_output_dir` 在启动时不存在，因此每次新建数据集应使用新目录；
-不要与 `transition` 方式共用同一目录。`save_episode_images` 和 `save_episode_viewer` 仅对
-`transition` 方式生效，`lerobot` 方式固定由 LeRobotDataset 写入视频。
+RL_online.sh 会自动执行对应模式的预检。预检失败时不会启动 Learner 或连接硬件。
 
-保存结构：
+## 启动方式
 
-```text
-actor_lerobot_dataset/
-  data/
-    chunk-000/
-      file-000.parquet
-  meta/
-    episodes/
-    info.json
-    stats.json
-    tasks.parquet
-  videos/
-    observation.images.top/
-    observation.images.wrist/
-```
+先看实际默认配置：
 
-数据集使用 `dataset.repo_id` 作为 repo id，使用 `env.fps` 作为帧率。可以用 Python 读取：
+    bash scripts/RL_online.sh --help
 
-```bash
-PYTHONPATH=/home/hpc/yuzhang/Evo-RL-loop-0817/src \
-/home/hpc/yuzhang/envs/package_sorting_env/bin/python - <<'PY'
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+推荐用两个终端，便于独立观察日志和停止进程。
 
-dataset = LeRobotDataset(
-    repo_id="local_data",
-    root="/home/hpc/yuzhang/outputs/online_rl_outbox/pi05_base_smovla_v3_0720_RLT_30K/actor_lerobot_dataset",
-)
-print(dataset)
-print(dataset[0]["action"])
-PY
-```
+终端 1：
 
-标准数据集中保存的主要字段与 `RL_data.sh` 一致：
+    cd /home/lenovo/code/Evo-RL-loop-0911
+    bash scripts/RL_online.sh learner
 
-- `observation.state`
-- `observation.images.top` / `observation.images.wrist`
-- `action`：实际传入 CAN1 从臂的动作
-- `complementary_info.policy_action`
-- `complementary_info.is_intervention`
-- `complementary_info.state`
-- `complementary_info.collector_policy_id`
-- task 和 episode success/failure metadata
+终端 2：
 
-这些业务字段的名称与 dtype 对齐 0901 数据，磁盘结构仍使用当前 LeRobot v3 的
-Parquet、MP4、`meta/episodes` 与流式编码；因此统一字段不等于退回旧存储格式。
+    cd /home/lenovo/code/Evo-RL-loop-0911
+    bash scripts/RL_online.sh actor
 
-## Actor 实时数据显示
+也可以同时启动：
 
-配置文件中设置：
+    cd /home/lenovo/code/Evo-RL-loop-0911
+    bash scripts/RL_online.sh both
 
-```json
-"processor": {
-  "observation": {
-    "display_cameras": true
-  }
-}
-```
+both 模式把日志写到：
 
-启用后，Actor 使用与 `scripts/RL_data.sh --display_data=true` 相同的 Rerun
-显示逻辑，实时显示处理后的摄像头图像、机械臂观测状态，以及策略或人工干预后
-选中的动作。Actor 不再为该配置调用 `cv2.imshow()`。
+- outputs/online_rl/logs/learner.log
+- outputs/online_rl/logs/actor.log
 
-设置为 `false` 时不启动 Rerun：
+需要临时替换配置时，使用：
 
-```json
-"display_cameras": false
-```
+    PIPER_ONLINE_RL_LEARNER_CONFIG=/abs/learner.json \
+    PIPER_ONLINE_RL_ACTOR_CONFIG=/abs/actor.json \
+    bash scripts/RL_online.sh both
 
-## 热键和 Episode 规则
+both 模式后附的 Draccus 参数只传给 Actor；Learner 参数应写入其独立 JSON 或使用单独 learner 命令。
 
-当前 actor 内置 HIL 热键，不依赖 `event_config.json` 的质量事件配置。
+## Actor 热键
 
-- `C`：人工接管/释放。接管时立即暂停 RTC，废弃排队及在途旧动作，并在当前周期读取主臂。
-- `B`：标记当前 episode 成功并结束。最后一条 transition 写入 `reward=1.0, done=true`。
-- `F`：标记当前 episode 失败并结束。最后一条 transition 写入 `reward=0.0, done=true`。
-- `A`：放弃当前 episode 并重录，不发送、不保存为有效 episode，双臂保持当前位置。
-- `R`：放弃当前 episode，双臂回默认初始位后重录，不发送、不保存为有效 episode。
-- `Esc`：停止 actor。
+- C：切换人工接管
+- B：结束当前 episode，标记成功，reward = 1
+- F：结束当前 episode，标记失败，reward = 0
+- A：放弃并重录当前 episode
+- R：复位并重录当前 episode
+- ESC：停止 Actor
 
-`actor_new` 还支持：
+Learner 权重可用后，V 可在 VLA 与在线 Actor 间切换。若配置 task_hotkeys_path，还可以用配置中的任务键切换 task；当前默认值为 null，因此任务提示由 env.task 固定提供。
 
-- `V`：在纯 VLA 和 VLA+Actor 之间切换；Actor 权重不存在时保持纯 VLA。
-- task 配置中的按键（参考配置为 `1/2/3`）：切换 task，放弃当前 episode 并按 `R` 的流程归位。
+热键优先使用 pynput 全局监听；不可用时回退到当前 TTY。若两者都不可用，日志会明确提示热键被禁用。
 
-`B/F/A` 结束后读取从臂最后位置并继续发送保持动作，不关闭使能；`R` 回到 actor 启动时捕获的初始位置。
-单臂和双臂共用按键。`can0.control=false` 时不连接主臂且忽略 `C`；为 `true` 时 policy 阶段
-主臂随从臂目标移动，按 `C` 后立即接管。
+## 关键配置规则
 
-## Reward 设计
+Learner：
 
-当前 reward 是稀疏终止奖励：
+- `policy.type=pi05_rlt`、`algorithm.type=rlt_chunk`、`online_ratio=1.0` 是一组完整契约：PI05-RLT 产出 RLT 特征，rlt_chunk 消费 compact action-chunk transition，1.0 表示 mixer 只从该在线 replay 取样。
+- Learner 的 `dataset` 必须始终为 `null`；启用离线阶段时必须提供完整的 `compact_dataset_path`。
+- 当前 0915 配置的离线阶段为 20000 step、sliding-window stride 2；在线阶段仍使用独立的 online replay。
+- 独立提取器使用 `torch.inference_mode()`；Actor 和 Critic 的梯度只存在于 learner 的小型 RLT heads。
+- `gpu_handoff.update_quota_threshold` 是一次 handoff 训练额度，actor 和 learner 只要求取值相同；当前配置为 200。
+- `gpu_handoff.updates_per_episode` 当前为 40，因此当前每 5 个 accepted episode 触发一次 handoff。
+- `algorithm.online_step_before_learning` 仍只约束在线 replay warmup，与启动时的离线 Actor/Critic 预训练分开计数。
+- algorithm.online_steps 是 Actor interaction loop 上限并参与 checkpoint 编号；Learner 本身在收到退出信号前持续运行。顶层 steps 不是当前在线循环的停止计数。
+- save_freq 以 optimization step 为单位。
+- resume=false 时，已有 checkpoints/last 会阻止覆盖。
+- resume=true 时，从 output_dir/checkpoints/last 恢复 optimizer、algorithm 和 interaction step。
 
-- 普通 step：使用环境/processor 当前 reward，通常为 `0.0`。
-- `B`：覆盖最后一步为 `reward=1.0, done=true`。
-- `F`：覆盖最后一步为 `reward=0.0, done=true`。
-- timeout：`truncated=true`，reward 保持当前值。
-- `A` / `R`：当前 episode 丢弃，不进入 learner 或本地有效保存。
+Actor：
 
-每条 transition 的 `complementary_info` 包含：
+- actor_mode 必须为 online_actor。
+- save_format 必须为 transition。
+- online_transition.enabled 和 actor_vla_policy.enabled 必须为 true。
+- `online_transition.save_local_copy` 必须为 `true`；compact transition 本地副本不可关闭。
+- `online_transition.episode_output_dir` 保存传输用的 `compact_episode.pt` 与 metadata。
+- `online_transition.save_lerobot_copy` 控制是否额外保存标准 LeRobotDataset；当前双臂配置为 `true`。
+- `online_transition.lerobot_output_dir` 是 LeRobotDataset 根目录，必须与 compact 目录不同且首次启动时不能已存在。
+- actor_vla_policy.policy_path 应与 policy.pretrained_path 指向同一模型。
+- actor_checkpoint_path 必须等于 Learner output_dir。
+- RTC execution_horizon 当前为 25，不能大于 chunk_size 50。
+- sliding_window_stride 当前为 2；增大可减少发送样本量，但会降低窗口密度。
+- 每个 episode 结束立即进入持续保持姿态；首次启动和每次 GPU reacquire 后强制执行全零关节、最大夹爪归位。
 
-```text
-discrete_penalty
-is_intervention
-intervention_state
-success
-failure
-actor_policy_is_vla
-policy_action
-```
+## Checkpoint 与权重同步
 
-当前配置 `policy.num_discrete_actions=null` 时，`discrete_penalty` 不参与 SAC 主损失。
+Learner checkpoint 不复制或保存冻结的 5B PI0.5，包含：
 
-## 数据流
+- algorithm：在线 actor、critic ensemble 和 target critic；
+- training_state：optimizer、离线/在线独立 step、离线完成标记、剩余额度、episode 去重集合和 handoff ID；
+- compact_replay.pt：纯在线 compact replay 的持久化副本；
+- train_config.json：PI0.5 特征契约和源 checkpoint 引用。
 
-Online SAC actor：
+实时下发给 Actor 的是 rlt_chunk actor 权重，不是整套 PI05-RLT 大模型。Actor 在 episode 边界接收最新权重；Learner 尚未下发时，Actor 使用 VLA 参考动作继续运行。
 
-```text
-processed observation -> SACPolicy.select_action -> action processor -> env.step -> transition -> learner
-```
+## 常见故障
 
-Online VLA actor：
+预检报告模型目录不存在：
 
-```text
-raw robot observation + env.task -> VLA predict_action -> action processor -> env.step -> transition -> learner
-```
+确认两个 JSON 中 policy.pretrained_path 和 actor_vla_policy.policy_path。当前有效目录是 /home/lenovo/outputs/pretrained_model。
 
-Actor 2 的 VLA+Actor 模式：
+预检报告模型字段不一致：
 
-```text
-raw robot observation + selected task -> frozen VLA/RLT -> z_rl + proprio + ref_action
-                                     -> trained chunk Actor -> postprocessor -> robot action
-                                     -> transition -> learner
-```
+不要只改在线 JSON 的维度或相机键。模型 config.json、数据集 meta/info.json、Actor policy、Learner policy 和 env.features/features_map 必须共同一致。
 
-PI05 learner：
+Learner 一启动就退出：
 
-```text
-offline DataLoader batch + meta task/reward/intervention -> frozen PI0.5/RLT features
-                   -> optional online replay mix -> chunk Actor + twin-Q update -> checkpoint
-```
+查看 Learner output_dir 是否已有 checkpoints/last。继续训练应设置 resume=true；新实验应换 output_dir。both 模式也会把启动阶段错误打印到终端并保留 learner.log。
 
-Actor-only VLA：
+预检报告 `compact manifest is missing`：
 
-```text
-raw robot observation + env.task -> VLA predict_action -> action processor -> env.step -> transition -> local episode files
-```
+离线提取尚未完成，或云端产物没有被整体复制到
+`offline_pretraining.compact_dataset_path`。不要创建空 manifest 绕过检查；确认全局
+`manifest.json`、所有 `episode_*/compact_episode.pt` 和对应 `metadata.json` 均已回传。
 
-## 验证命令
+预检报告 compact episode 数与 manifest 不一致：
 
-语法检查：
+回传中断、漏传了 episode，或把不同提取任务写进了同一目录。重新执行 rsync 补齐文件，并用
+本节的完整性检查命令验证；不同 `--episodes`、stride 或模型契约必须使用不同输出目录。
 
-```bash
-/home/lenovo/code/envs/evo_0911/bin/python -m compileall -q \
-  /home/lenovo/code/Evo-RL-loop-0911/src/lerobot/onlineRL_evoRL
-```
+提取器报告 `Existing episode is incomplete or incompatible`：
 
-配置解析：
+该目录可能是中断残留，或者由不同模型身份/stride 生成。先查看该 episode 的 `metadata.json`，
+确认无须保留后将整个冲突 episode 目录移到输出目录之外，再用原命令断点续跑。提取器不会自动
+覆盖它。
 
-```bash
-/home/lenovo/code/envs/evo_0911/bin/python \
-  -m lerobot.onlineRL_evoRL.actor_new --help
-```
+提取器 CUDA OOM：
 
-## 日志
+`EVORL_EXTRACT_BATCH_SIZE` 是每卡值，先减小该值；增加 GPU 数只会把 episode 分片到更多独立
+进程，不会分摊单个模型的显存。`EVORL_EXTRACT_STORAGE_DTYPE` 控制落盘张量类型，不代表
+PI0.5 推理本身会以该精度加载，因此不能把它当作主要的显存开关。
 
-日志写入：
+云端提取成功，但本机报告 feature model 不匹配：
 
-```text
-${output_dir}/logs/
-```
+云端路径不同应只通过 `EVORL_EXTRACT_POLICY_PATH` 指定实际 checkpoint，不应覆盖
+`EVORL_EXTRACT_FEATURE_MODEL_PATH`。若已经用错误身份完成提取，应使用正确契约重新导出，或在
+明确确认模型相同后统一修改配置和产物契约；不要关闭校验。
 
-常见文件：
+Actor 无法连接 127.0.0.1:50051：
 
-- `learner_${job_name}.log`
-- `actor_${job_name}.log`
-- 多进程模式下的 `actor_policy_*.log`、`actor_transitions_*.log`、`actor_interactions_*.log`
+先确认 Learner 仍在运行，再确认两端 algorithm.actor_learner_config 的 host/port 完全一致。跨机器运行时，Learner host 不能继续使用仅本机可见的 127.0.0.1。
 
-## 注意事项
+Actor 找不到初始在线权重：
 
-- `actor_vla_policy.enabled=true` 只为在线 Actor 提供 VLA/RLT 特征，不训练 VLA 权重。
-- 当前有效组合是 `policy.type=pi05_rlt` 与 `algorithm.type=rlt_chunk`；learner 只更新独立 Actor/Critic。
-- Actor-only/VLA-only 模式已经停用，纯 VLA 采集使用 `RL_data.sh` 或 `RL_data_bimanual.sh`。
-- VLA 推理依赖 `dataset.root` 里的 metadata/stats，确保该路径可读取并包含两路相机和 action/state 统计。
+启用离线阶段时，Learner 完成预训练后会在 output_dir/algorithm 保存 Actor/Critic，并在启动服务后发送初始 Actor 权重。Actor 只把权重标记为可用，仍保持 VLA 输出；必须主动按 V 才会切换到在线 Actor。
+
+Actor 报告 LeRobotDataset 输出目录已存在：
+
+标准 LeRobotDataset writer 为避免覆盖已有数据，要求 `lerobot_output_dir` 首次启动时不存在。请为新一次采集换新目录，或先人工确认并迁移旧目录；compact `episode_output_dir` 支持按 episode 编号续写。
+
+显存或推理频率不足：
+
+三路 480x640 图像最终按模型的 image_resolution 处理。优先检查 GPU 占用、RTC horizon、feature_batch_size 和相机 FPS，不要通过删除相机特征绕过，因为那会破坏模型与数据集契约。
+
+## 无硬件验证
+
+以下检查不会驱动机械臂：
+
+    bash -n scripts/RL_extract_offline_features.sh
+    bash scripts/RL_extract_offline_features.sh --help
+    bash -n scripts/RL_online.sh
+    bash scripts/RL_online.sh --help
+    /home/lenovo/code/envs/evo_0911/bin/python -m lerobot.onlineRL_evoRL.preflight \
+      --learner-config src/lerobot/onlineRL_evoRL/configs/learner/Leanrer_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json \
+      --actor-config src/lerobot/onlineRL_evoRL/configs/actor/Actor_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json \
+      --mode both
+
+最后一条预检在启用离线阶段时要求 compact 数据已经放到配置路径；尚未回传时因 manifest 缺失
+而失败是预期行为。

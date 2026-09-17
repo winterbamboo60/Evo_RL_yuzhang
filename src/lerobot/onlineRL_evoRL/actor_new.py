@@ -9,8 +9,8 @@ unchanged.
 # Canonical actor helpers below are intentional compatibility re-exports.
 # ruff: noqa: F401
 
-
 import contextlib
+import gc
 import inspect
 import json
 import logging
@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue as ThreadQueue
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -54,7 +55,7 @@ from lerobot.rl.actor import (
     use_threads,
 )
 from lerobot.rl.algorithms.factory import make_algorithm
-from lerobot.transport.utils import python_object_to_bytes
+from lerobot.transport.utils import bytes_to_state_dict, python_object_to_bytes
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
@@ -80,6 +81,7 @@ from .chunk_transition import build_sliding_window_transitions, sliding_window_o
 from .compact_transition import (
     SCHEMA_NAME,
     SLIDING_WINDOW_TRANSITIONS,
+    compact_episode_to_bytes,
     make_compact_episode,
     save_compact_episode,
 )
@@ -95,12 +97,19 @@ from .keyboard_control import (
     stop_keyboard_listener,
 )
 from .piper_episode_control import (
+    PoseHoldController,
+    default_home_action,
     follow_policy_action,
     hold_arms_current_pose,
     home_arms_to_default,
     set_leader_manual_control,
 )
 from .rtc_action_runner import RTCActionChunkRunner, RTCChunkPrediction
+from .wire import (
+    ACTOR_GPU_RELEASED,
+    WEIGHT_HANDOFF_ID_FIELD,
+    make_control_message,
+)
 
 
 @dataclass
@@ -153,8 +162,6 @@ def _find_actor_checkpoint(path: str | None) -> Path | None:
     for item in (
         candidate / "actor_critic.pt",
         candidate / "checkpoints/last/actor_critic.pt",
-        candidate / "pretrained_model/model.safetensors",
-        candidate / "checkpoints/last/pretrained_model/model.safetensors",
         candidate / "algorithm/model.safetensors",
         candidate / "checkpoints/last/algorithm/model.safetensors",
     ):
@@ -170,7 +177,8 @@ def _normalize_actor_config(cfg: ActorPipelineConfig) -> None:
     cfg.validate()
     if cfg.actor_mode == "online_actor" and _find_actor_checkpoint(cfg.actor_checkpoint_path) is None:
         logging.warning(
-            "No local Actor checkpoint found at %s; actor_new will use VLA until learner weights arrive.",
+            "No local Actor checkpoint found at %s; actor_new will remain on VLA. "
+            "Press V after learner weights arrive to select the online Actor.",
             cfg.actor_checkpoint_path,
         )
 
@@ -197,7 +205,7 @@ def _build_actor_control(cfg: ActorPipelineConfig) -> ActorControl:
         cfg=cfg,
         task_hotkeys=task_hotkeys,
         dataset_meta=dataset_meta,
-        use_actor=cfg.actor_mode == "online_actor",
+        use_actor=False,
     )
 
 
@@ -238,6 +246,10 @@ class ActorKeyboardController(KeyboardController):
                 self.control.use_actor = not self.control.use_actor
                 if self.control.smoother is not None:
                     self.control.smoother.reset()
+                logging.info(
+                    "[ACTOR] V selected %s output",
+                    "online Actor" if self.control.use_actor else "VLA",
+                )
                 continue
             task = self.control.task_hotkeys.tasks[key]
             if self.control.runtime is not None:
@@ -487,6 +499,43 @@ class ActorEpisodeWriter:
             self.dataset.finalize()
 
 
+class ActorEpisodeWriters:
+    """Fan one accepted episode out to all configured local formats."""
+
+    def __init__(self, writers: list[ActorEpisodeWriter]) -> None:
+        """Create a non-empty local writer fan-out."""
+        if not writers:
+            raise ValueError("At least one actor episode writer is required")
+        self.writers = writers
+
+    def configure_robot(self, robot: Any) -> None:
+        """Provide the same hardware feature contract to every writer."""
+        for writer in self.writers:
+            writer.configure_robot(robot)
+
+    def save_episode(
+        self,
+        *,
+        transitions: list[Transition],
+        metadata: dict[str, Any],
+        compact_episode: dict[str, Any],
+    ) -> dict[str, Path]:
+        """Persist the same accepted episode in every configured format."""
+        paths = {}
+        for writer in self.writers:
+            paths[writer.save_format] = writer.save_episode(
+                transitions=transitions,
+                metadata=metadata,
+                compact_episode=compact_episode,
+            )
+        return paths
+
+    def finalize(self) -> None:
+        """Finalize every writer, including video encoding and metadata."""
+        for writer in self.writers:
+            writer.finalize()
+
+
 class ActorVLARuntime:
     """Current LeRobot policy/processor adapter with the legacy EvoRL API."""
 
@@ -625,6 +674,15 @@ class ActorVLARuntime:
         if self._rtc_runner is not None:
             self._rtc_runner.close()
             self._rtc_runner = None
+        self.policy = None
+        self.preprocessor = None
+        self.postprocessor = None
+        self.policy_cfg = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def reload_if_changed(self) -> None:
         now = time.monotonic()
@@ -662,7 +720,11 @@ class ActorVLARuntime:
 
     @torch.no_grad()
     def build_compact_episode(
-        self, transitions: list[Transition], metadata: dict[str, Any], batch_size: int
+        self,
+        transitions: list[Transition],
+        metadata: dict[str, Any],
+        batch_size: int,
+        robot_type: str | None = None,
     ) -> dict[str, Any]:
         if not transitions:
             raise ValueError("Cannot build a compact episode from no transitions")
@@ -683,20 +745,26 @@ class ActorVLARuntime:
         feature_index_set = set(feature_indices)
         features_by_observation: dict[int, dict[str, torch.Tensor]] = {}
         normalized_actions = []
+        feature_device = get_safe_torch_device(self.policy_cfg.device)
         for start in range(0, len(observations), batch_size):
             items = []
             for observation, action in zip(
                 observations[start : start + batch_size], actions[start : start + batch_size], strict=True
             ):
-                raw = {
-                    key: value.squeeze(0)
-                    if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == 1
-                    else value
+                raw_observation = {
+                    key: value.detach().cpu().numpy()
+                    if isinstance(value, torch.Tensor)
+                    else np.asarray(value)
                     for key, value in observation.items()
                 }
-                raw[ACTION] = action.squeeze(0) if action.ndim > 1 and action.shape[0] == 1 else action
-                raw["task"] = metadata["task"]
-                items.append(self.preprocessor(raw))
+                model_input = prepare_observation_for_inference(
+                    raw_observation,
+                    feature_device,
+                    task=metadata["task"],
+                    robot_type=robot_type,
+                )
+                model_input[ACTION] = torch.as_tensor(action).detach().reshape(-1).to(feature_device)
+                items.append(self.preprocessor(model_input))
             batch = {
                 key: torch.cat([item[key] for item in items], dim=0)
                 for key, value in items[0].items()
@@ -767,16 +835,20 @@ class OnlineActorRuntime(ActorVLARuntime):
     def __init__(self, control: ActorControl):
         super().__init__(control.cfg)
         self.control = control
+        self.algorithm = None
+        self._actor_checkpoint = _find_actor_checkpoint(self.cfg.actor_checkpoint_path)
+        self._build_algorithm()
+        control.policy = self.policy
+        control.runtime = self
+        if self._actor_checkpoint is not None:
+            self._load_algorithm_actor()
+
+    def _build_algorithm(self) -> None:
         algorithm_cfg = self.cfg.algorithm
         if algorithm_cfg is None or getattr(algorithm_cfg, "type", None) != "rlt_chunk":
             raise ValueError("online_actor requires algorithm.type=rlt_chunk")
         algorithm_cfg.policy_config = self.policy_cfg
         self.algorithm = make_algorithm(algorithm_cfg, self.policy)
-        self._actor_checkpoint = _find_actor_checkpoint(self.cfg.actor_checkpoint_path)
-        control.policy = self.policy
-        control.runtime = self
-        if self._actor_checkpoint is not None:
-            self._load_algorithm_actor()
 
     def _load_algorithm_actor(self) -> None:
         checkpoint = self._actor_checkpoint
@@ -805,6 +877,24 @@ class OnlineActorRuntime(ActorVLARuntime):
                     device=self.policy_cfg.device,
                 )
         self.control.actor_available = True
+
+    def release_gpu(self) -> None:
+        """Drop every CUDA-owning inference object while preserving robot transport state."""
+        self.quiesce_action_state()
+        self.algorithm = None
+        self.control.policy = None
+        super().close()
+        logging.info("[ACTOR] released PI0.5 and online Actor CUDA allocations")
+
+    def acquire_gpu(self, weights: dict[str, Any]) -> None:
+        """Reload PI0.5 and apply the learner weights for the completed handoff."""
+        super().reload()
+        self._build_algorithm()
+        self.algorithm.load_weights(weights, device=self.policy_cfg.device)
+        self.control.policy = self.policy
+        self.control.actor_available = True
+        self.reset_action_state()
+        logging.info("[ACTOR] reacquired GPU and loaded learner Actor weights")
 
     def reset_action_state(self) -> None:
         algorithm = getattr(self, "algorithm", None)
@@ -950,8 +1040,12 @@ def run_actor_online(
     shutdown_event: Any | None = None,
     actor_control: ActorControl | None = None,
 ):
-    """Connect to the canonical learner and run actor_new's hardware loop."""
-    _normalize_actor_config(cfg)
+    """Connect to the configured EvoRL learner and run the hardware loop.
+
+    ``actor_cli`` normalizes and validates the configuration before creating
+    runtime directories. Revalidating here would reject the ``output_dir``
+    immediately after ``actor_cli`` creates its ``logs`` subdirectory.
+    """
     actor_control = actor_control or _build_actor_control(cfg)
     shutdown_event = shutdown_event or ProcessSignalHandler(use_threads(cfg)).shutdown_event
     learner_cfg = _runtime_config(cfg).actor_learner_config
@@ -991,21 +1085,35 @@ def run_actor_online(
             daemon=True,
         ),
     ]
-    for worker in workers:
-        worker.start()
-
-    writer = None
-    if cfg.online_transition.save_local_copy:
-        output_dir = cfg.online_transition.episode_output_dir or str(
-            Path(cfg.output_dir) / "online_transitions"
-        )
-        writer = ActorEpisodeWriter(
+    compact_output_dir = cfg.online_transition.episode_output_dir or str(
+        Path(cfg.output_dir) / "online_transitions"
+    )
+    writers = [
+        ActorEpisodeWriter(
             cfg,
             save_format="transition",
-            output_dir=output_dir,
+            output_dir=compact_output_dir,
             save_images=False,
             save_viewer=False,
         )
+    ]
+    if cfg.online_transition.save_lerobot_copy:
+        lerobot_output_dir = cfg.online_transition.lerobot_output_dir or str(
+            Path(cfg.output_dir) / "lerobot_dataset"
+        )
+        writers.append(
+            ActorEpisodeWriter(
+                cfg,
+                save_format="lerobot",
+                output_dir=lerobot_output_dir,
+                save_images=True,
+                save_viewer=True,
+            )
+        )
+    writer = ActorEpisodeWriters(writers)
+    for worker in workers:
+        worker.start()
+
     try:
         act_with_policy(
             cfg=cfg,
@@ -1021,17 +1129,18 @@ def run_actor_online(
         raise
     finally:
         shutdown_event.set()
-        if writer is not None:
+        try:
             writer.finalize()
-        for worker in workers:
-            worker.join(timeout=max(float(learner_cfg.queue_get_timeout) + 1.0, 3.0))
-            if worker.is_alive():
-                logging.warning("[ACTOR] background worker did not exit before timeout: %s", worker)
-        for queue in (transitions_queue, interactions_queue, parameters_queue):
-            queue.close()
-            queue.cancel_join_thread()
-        if grpc_channel is not None:
-            grpc_channel.close()
+        finally:
+            for worker in workers:
+                worker.join(timeout=max(float(learner_cfg.queue_get_timeout) + 1.0, 3.0))
+                if worker.is_alive():
+                    logging.warning("[ACTOR] background worker did not exit before timeout: %s", worker)
+            for queue in (transitions_queue, interactions_queue, parameters_queue):
+                queue.close()
+                queue.cancel_join_thread()
+            if grpc_channel is not None:
+                grpc_channel.close()
 
 
 def act_with_policy(
@@ -1041,7 +1150,7 @@ def act_with_policy(
     parameters_queue: Queue,
     transitions_queue: Queue,
     interactions_queue: Queue,
-    actor_episode_writer: ActorEpisodeWriter | None = None,
+    actor_episode_writer: ActorEpisodeWriter | ActorEpisodeWriters | None = None,
     actor_control: ActorControl | None = None,
 ) -> None:
     """Collect online episodes with policy-follow, immediate C takeover and RTC."""
@@ -1051,13 +1160,13 @@ def act_with_policy(
         raise ValueError("online actor requires env")
 
     display_data = bool(
-        cfg.env.processor.observation is not None
-        and cfg.env.processor.observation.display_cameras
+        cfg.env.processor.observation is not None and cfg.env.processor.observation.display_cameras
     )
     rerun_started = False
     online_env = None
     teleop = None
     runtime = None
+    pose_holder = None
     try:
         if display_data:
             init_rerun(session_name="evorl_actor_new")
@@ -1081,7 +1190,8 @@ def act_with_policy(
         if not actor_control.actor_available:
             actor_control.use_actor = False
             logging.warning(
-                "[ACTOR] No local Actor weights yet; using VLA until learner parameters arrive."
+                "[ACTOR] No local Actor weights yet; remaining on VLA. "
+                "Press V after learner weights arrive to select the online Actor."
             )
         keyboard = ActorKeyboardController(actor_control)
         keyboard_state = KeyboardState()
@@ -1094,6 +1204,7 @@ def act_with_policy(
         episode_steps = 0
         intervention_steps = 0
         episode_index = 0
+        actor_session_id = uuid4().hex
         episode_limit = getattr(cfg.env, "episode_length", None)
         if episode_limit is None:
             reset_cfg = getattr(cfg.env.processor, "reset", None)
@@ -1102,6 +1213,20 @@ def act_with_policy(
                 episode_limit = max(int(round(control_time_s * cfg.env.fps)), 1)
         online_env.reset()
         set_leader_manual_control(teleop, False)
+        home_target = default_home_action(
+            robot,
+            max_gripper_pos=cfg.env.processor.max_gripper_pos,
+        )
+        home_arms_to_default(
+            robot,
+            teleop,
+            target_action=home_target,
+            fps=cfg.env.fps or 30,
+        )
+        pose_holder = PoseHoldController(robot, teleop, fps=cfg.env.fps or 30)
+        episodes_since_handoff = 0
+        handoff_id = 0
+        episodes_per_handoff = cfg.gpu_handoff.update_quota_threshold // cfg.gpu_handoff.updates_per_episode
 
         def action_to_dict(action: Any) -> dict[str, float]:
             if isinstance(action, dict):
@@ -1136,11 +1261,54 @@ def act_with_policy(
             observation_processor.reset()
             online_env.reset()
 
-        def finish_episode(
-            *, outcome: str | None, discard: bool, reset_to_home: bool, timeout: bool
-        ) -> None:
-            nonlocal episode_index
+        def perform_gpu_handoff() -> None:
+            nonlocal handoff_id
+            while True:
+                try:
+                    parameters_queue.get_nowait()
+                except Empty:
+                    break
+            handoff_id += 1
+            runtime.release_gpu()
+            interactions_queue.put(
+                python_object_to_bytes(
+                    make_control_message(
+                        ACTOR_GPU_RELEASED,
+                        handoff_id=handoff_id,
+                        accepted_episodes=episodes_per_handoff,
+                    )
+                )
+            )
+            logging.info("[ACTOR] waiting for learner handoff=%d", handoff_id)
+            deadline = time.monotonic() + cfg.gpu_handoff.learner_release_timeout_s
+            weights = None
+            while not shutdown_event.is_set() and time.monotonic() < deadline:
+                try:
+                    candidate = bytes_to_state_dict(
+                        parameters_queue.get(timeout=min(0.2, max(deadline - time.monotonic(), 0.01)))
+                    )
+                except Empty:
+                    continue
+                response_id = candidate.get(WEIGHT_HANDOFF_ID_FIELD)
+                if isinstance(response_id, torch.Tensor):
+                    response_id = int(response_id.item())
+                if response_id != handoff_id:
+                    logging.warning(
+                        "[ACTOR] ignored stale learner weights handoff=%s while waiting for %d",
+                        response_id,
+                        handoff_id,
+                    )
+                    continue
+                weights = candidate
+                break
+            if weights is None:
+                raise TimeoutError(f"Learner did not release GPU for handoff={handoff_id}")
+            runtime.acquire_gpu(weights)
+
+        def finish_episode(*, outcome: str | None, discard: bool, reset_to_home: bool, timeout: bool) -> None:
+            nonlocal episode_index, episodes_since_handoff
             runtime.quiesce_action_state()
+            pose_holder.start()
             metadata = {
                 "Episodic reward": episode_reward,
                 "episodic_reward": episode_reward,
@@ -1155,28 +1323,28 @@ def act_with_policy(
                 "actor_policy_type": "online_actor" if actor_control.use_actor else "vla",
                 "actor_policy_path": str(runtime.policy_path),
                 "episode_index": episode_index,
+                "episode_id": f"{cfg.job_name}:{actor_session_id}:{episode_index}",
                 **get_frequency_stats(policy_timer),
             }
+            accepted_episode = False
             if transitions and not discard:
-                payload = runtime.algorithm.serialize_episode_for_transport(
+                compact = runtime.build_compact_episode(
                     transitions,
-                    runtime.preprocessor,
-                    task=cfg.env.task,
-                    policy_path=str(runtime.policy_path),
+                    metadata,
+                    cfg.online_transition.feature_batch_size,
+                    robot_type=getattr(robot, "robot_type", getattr(robot, "name", None)),
                 )
-                transitions_queue.put(payload)
-                interactions_queue.put(python_object_to_bytes(metadata))
+                payload = compact_episode_to_bytes(compact)
                 if actor_episode_writer is not None:
-                    compact = runtime.build_compact_episode(
-                        transitions,
-                        metadata,
-                        cfg.online_transition.feature_batch_size,
-                    )
-                    actor_episode_writer.save_episode(
+                    saved_paths = actor_episode_writer.save_episode(
                         transitions=transitions,
                         metadata=metadata,
                         compact_episode=compact,
                     )
+                    logging.info("[ACTOR] episode=%d saved locally: %s", episode_index, saved_paths)
+                transitions_queue.put(payload)
+                interactions_queue.put(python_object_to_bytes(metadata))
+                accepted_episode = True
                 logging.info(
                     "[ACTOR] episode=%d queued steps=%d outcome=%s bytes=%d",
                     episode_index,
@@ -1187,21 +1355,35 @@ def act_with_policy(
             else:
                 logging.info("[ACTOR] episode=%d discarded; no payload sent", episode_index)
 
-            had_parameters = _queue_has_items(parameters_queue)
-            update_policy_parameters(runtime.algorithm, parameters_queue, device)
-            if had_parameters and not actor_control.actor_available:
-                actor_control.actor_available = True
-                actor_control.use_actor = True
-                logging.info("[ACTOR] First learner Actor weights loaded; switching from VLA to Actor")
-            if reset_to_home:
+            did_handoff = False
+            if accepted_episode:
+                episodes_since_handoff += 1
+            if cfg.gpu_handoff.enabled and episodes_since_handoff >= episodes_per_handoff:
+                perform_gpu_handoff()
+                episodes_since_handoff = 0
+                did_handoff = True
+            elif not cfg.gpu_handoff.enabled:
+                had_parameters = _queue_has_items(parameters_queue)
+                update_policy_parameters(runtime.algorithm, parameters_queue, device)
+                if had_parameters and not actor_control.actor_available:
+                    actor_control.actor_available = True
+                    logging.info(
+                        "[ACTOR] First learner Actor weights loaded; output remains VLA until V is pressed"
+                    )
+
+            reset_cfg = getattr(cfg.env.processor, "reset", None)
+            reset_time_s = float(getattr(reset_cfg, "reset_time_s", 0.0) or 0.0)
+            if did_handoff or reset_to_home:
+                pose_holder.stop()
                 home_arms_to_default(
                     robot,
                     teleop,
-                    target_action=online_env.initial_action,
+                    target_action=home_target,
                     fps=cfg.env.fps or 30,
                 )
             else:
-                hold_arms_current_pose(robot, teleop)
+                pose_holder.wait(reset_time_s)
+                pose_holder.stop()
             episode_index += 1
             policy_timer.reset()
             reset_episode()
@@ -1239,9 +1421,7 @@ def act_with_policy(
             if pending is not None:
                 reward = 1.0 if outcome == EPISODE_SUCCESS else 0.0
                 terminal = outcome in {EPISODE_SUCCESS, EPISODE_FAILURE}
-                pending["complementary_info"]["success"] = torch.tensor(
-                    [float(outcome == EPISODE_SUCCESS)]
-                )
+                pending["complementary_info"]["success"] = torch.tensor([float(outcome == EPISODE_SUCCESS)])
                 pending["complementary_info"]["failure"] = torch.tensor([float(outcome == EPISODE_FAILURE)])
                 transitions.append(
                     Transition(
@@ -1319,10 +1499,13 @@ def act_with_policy(
             if cfg.env.fps:
                 precise_sleep(max(1.0 / cfg.env.fps - (time.perf_counter() - tick_start), 0.0))
     finally:
+        if pose_holder is not None and pose_holder.active:
+            with contextlib.suppress(Exception):
+                pose_holder.stop()
         if "listener" in locals():
             stop_keyboard_listener(listener)
         if runtime is not None:
-            runtime.close()
+            runtime.release_gpu()
         if teleop is not None and teleop.is_connected:
             teleop.disconnect()
         if online_env is not None:

@@ -53,7 +53,7 @@ downloadyuzhang() {
 	echo "用法： d <filename>"
         return 1
     fi
-    DOWNLOAD_URL="http://192.168.110.115:20181/yuzhang/download.php"
+    DOWNLOAD_URL="http://111.22.6.97:20181/yuzhang/download.php"
     REMOTE_FILE="$1"
     if [ -f "${REMOTE_FILE}" ]; then
         rm "${REMOTE_FILE}"
@@ -64,6 +64,16 @@ downloadyuzhang() {
 }
 
 数据上传A800
+uploadyuzhang() {
+    if [ $# -eq 0 ]; then
+        return 1
+    fi
+    UPLOAD_URL="http://111.22.6.97:20181/yuzhang/upload.php"
+    LOCAL_FILE="$1"
+    curl -X POST -F "file=@$LOCAL_FILE" "$UPLOAD_URL" -o /dev/null
+}
+
+
 
 Step2. 查看所有CAN口号
 # 检查 ethtool 是否已安装

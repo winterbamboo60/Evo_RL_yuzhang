@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EvoRL online actor/learner launcher for the fused LeRobot environment.
+# EvoRL PI05-RLT online actor/learner launcher.
 #
 # Usage:
 #   PIPER_ONLINE_RL_LEARNER_CONFIG=/path/learner.json bash scripts/RL_online.sh learner
@@ -13,8 +13,8 @@ ENV_ROOT="${EVORL_ENV_ROOT:-/home/lenovo/code/envs/evo_0911}"
 PYTHON_BIN="${ENV_ROOT}/bin/python"
 MODE="${1:-both}"
 CONFIG_ROOT="${REPO_ROOT}/src/lerobot/onlineRL_evoRL/configs"
-DEFAULT_ACTOR_CONFIG="${CONFIG_ROOT}/actor/Actor_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json"
-DEFAULT_LEARNER_CONFIG="${CONFIG_ROOT}/learner/Leanrer_onlineRL_transition_pi05_base_rlt_sft_cup_catch_v4_merged_train0901_40k.json"
+DEFAULT_ACTOR_CONFIG="${CONFIG_ROOT}/actor/Actor_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json"
+DEFAULT_LEARNER_CONFIG="${CONFIG_ROOT}/learner/Leanrer_onlineRL_transition_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_sft30k_rlt2k.json"
 SHARED_CONFIG="${PIPER_ONLINE_RL_CONFIG:-}"
 ACTOR_CONFIG="${PIPER_ONLINE_RL_ACTOR_CONFIG:-${SHARED_CONFIG:-$DEFAULT_ACTOR_CONFIG}}"
 LEARNER_CONFIG="${PIPER_ONLINE_RL_LEARNER_CONFIG:-${SHARED_CONFIG:-$DEFAULT_LEARNER_CONFIG}}"
@@ -24,8 +24,8 @@ if [[ "$MODE" == "-h" || "$MODE" == "--help" ]]; then
   echo "Actor config:   PIPER_ONLINE_RL_ACTOR_CONFIG (default: ${DEFAULT_ACTOR_CONFIG})"
   echo "Learner config: PIPER_ONLINE_RL_LEARNER_CONFIG (default: ${DEFAULT_LEARNER_CONFIG})"
   echo "PIPER_ONLINE_RL_CONFIG remains a compatibility override for both paths."
-  echo "In 'both' mode, trailing overrides are applied only to actor_new; edit/override the learner JSON separately."
-  echo "Uses ${PYTHON_BIN}; actor_new owns hardware control while learner and gRPC byte transport stay canonical."
+  echo "In 'both' mode, trailing overrides are applied only to actor_new."
+  echo "Both processes start from lerobot.onlineRL_evoRL; shared RL/transport primitives remain reusable."
   exit 0
 fi
 
@@ -65,8 +65,15 @@ if missing:
 PY_CHECK
 }
 
+run_preflight() {
+  "$PYTHON_BIN" -m lerobot.onlineRL_evoRL.preflight \
+    --learner-config "$LEARNER_CONFIG" \
+    --actor-config "$ACTOR_CONFIG" \
+    --mode "$MODE"
+}
+
 run_learner() {
-  "$PYTHON_BIN" -m lerobot.rl.learner --config_path "$LEARNER_CONFIG" "$@"
+  "$PYTHON_BIN" -m lerobot.onlineRL_evoRL.learner --config_path "$LEARNER_CONFIG" "$@"
 }
 
 run_actor() {
@@ -74,14 +81,12 @@ run_actor() {
 }
 
 check_python_deps
+run_preflight
 case "$MODE" in
   learner) run_learner "$@" ;;
   actor) run_actor "$@" ;;
   both)
-    # ActorPipelineConfig has hardware/RTC-only fields that the canonical
-    # learner config intentionally does not accept. In combined mode, CLI
-    # overrides therefore belong to actor_new; learner values come from its
-    # dedicated JSON.
+    # Actor-only overrides are not forwarded to the learner's dedicated JSON.
     run_learner >"${LOG_DIR}/learner.log" 2>&1 &
     learner_pid=$!
     cleanup() {
@@ -90,7 +95,17 @@ case "$MODE" in
       fi
     }
     trap cleanup EXIT INT TERM
-    sleep 5
+    # The optional offline feature/pretraining phase owns the shared GPU. Do
+    # not construct the Actor's PI05 runtime until learner has released CUDA
+    # and started its transport service.
+    until grep -q "independent EvoRL gRPC server started" "${LOG_DIR}/learner.log" 2>/dev/null; do
+      if ! kill -0 "$learner_pid" >/dev/null 2>&1; then
+        echo "Learner exited during startup. Last log lines:" >&2
+        tail -n 80 "${LOG_DIR}/learner.log" >&2 || true
+        wait "$learner_pid"
+      fi
+      sleep 1
+    done
     run_actor "$@" >"${LOG_DIR}/actor.log" 2>&1
     ;;
 esac

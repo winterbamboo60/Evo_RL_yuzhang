@@ -154,6 +154,8 @@
       "multiprocessing_context": "spawn"
     }
   },
+  "mixer": "online_offline",
+  "online_ratio": 1.0,
   "output_dir": "/home/lenovo/datasets/online_rl_outbox/pi05_base_cup_catch_v2_0819_35k_0911/actor/output",
   "job_name": "pi05_base_cup_catch_v2_0819_35k_0911_actor",
   "resume": false,
