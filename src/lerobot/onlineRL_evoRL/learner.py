@@ -21,7 +21,7 @@ from torch.multiprocessing import Queue
 from tqdm.auto import tqdm
 
 from lerobot.common.train_utils import get_step_checkpoint_dir, update_last_checkpoint
-from lerobot.common.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import TensorBoardLogger, WandBLogger
 from lerobot.configs import parser
 from lerobot.optim import load_optimizer_state, save_optimizer_state
 from lerobot.rl.buffer import ReplayBuffer
@@ -379,7 +379,11 @@ def _ingest_compact_episodes(
     return accepted
 
 
-def _process_interactions(interaction_queue: Queue, wandb_logger: WandBLogger | None):
+def _process_interactions(
+    interaction_queue: Queue,
+    wandb_logger: WandBLogger | None,
+    tensorboard_logger: TensorBoardLogger | None,
+):
     latest_release_id = None
     while not interaction_queue.empty():
         message = bytes_to_python_object(interaction_queue.get())
@@ -390,8 +394,11 @@ def _process_interactions(interaction_queue: Queue, wandb_logger: WandBLogger | 
                 latest_release_id = handoff_id
                 logging.info("[LEARNER] actor confirmed GPU release for handoff=%d", handoff_id)
             continue
-        if wandb_logger and isinstance(message, dict) and "Interaction step" in message:
-            wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
+        if isinstance(message, dict) and "Interaction step" in message:
+            if wandb_logger:
+                wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
+            if tensorboard_logger:
+                tensorboard_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
     return latest_release_id
 
 
@@ -438,6 +445,7 @@ def _run_offline_pretraining(
     cfg: LearnerPipelineConfig,
     runtime: LearnerRuntime,
     wandb_logger: WandBLogger | None,
+    tensorboard_logger: TensorBoardLogger | None,
     shutdown_event: Any,
 ) -> bool:
     """Load compact features, train both RLT heads, and release startup CUDA state."""
@@ -481,17 +489,25 @@ def _run_offline_pretraining(
                 values = stats.to_log_dict()
                 bar.update(1)
                 bar.set_postfix(_progress_postfix(values), refresh=False)
-                if progress.offline_step % cfg.log_freq == 0 and wandb_logger:
-                    wandb_logger.log_dict(
-                        d={
-                            **values,
-                            "Offline pretraining step": progress.offline_step,
-                            "Algorithm step": progress.algorithm_step,
-                            "offline_replay_size": len(offline_replay),
-                        },
-                        mode="train",
-                        custom_step_key="Algorithm step",
-                    )
+                if progress.offline_step % cfg.log_freq == 0:
+                    log_values = {
+                        **values,
+                        "Offline pretraining step": progress.offline_step,
+                        "Algorithm step": progress.algorithm_step,
+                        "offline_replay_size": len(offline_replay),
+                    }
+                    if wandb_logger:
+                        wandb_logger.log_dict(
+                            d=log_values,
+                            mode="train",
+                            custom_step_key="Algorithm step",
+                        )
+                    if tensorboard_logger:
+                        tensorboard_logger.log_dict(
+                            d=log_values,
+                            mode="train",
+                            custom_step_key="Algorithm step",
+                        )
                 if (
                     cfg.save_checkpoint
                     and cfg.save_freq > 0
@@ -528,6 +544,7 @@ def _run_offline_pretraining(
 def _run_training_loop(
     cfg: LearnerPipelineConfig,
     wandb_logger: WandBLogger | None,
+    tensorboard_logger: TensorBoardLogger | None,
     shutdown_event: Any,
     transition_queue: Queue,
     interaction_queue: Queue,
@@ -560,7 +577,7 @@ def _run_training_loop(
         if accepted:
             progress.pending_updates += accepted * handoff.updates_per_episode
             logging.info("[LEARNER] pending update quota=%d", progress.pending_updates)
-        release_id = _process_interactions(interaction_queue, wandb_logger)
+        release_id = _process_interactions(interaction_queue, wandb_logger, tensorboard_logger)
         if release_id is not None:
             actor_release_id = release_id
 
@@ -603,9 +620,9 @@ def _run_training_loop(
                 )
                 logging.info("[LEARNER] online_step=%d stats=%s", progress.online_step, values)
                 if wandb_logger:
-                    wandb_logger.log_dict(
-                        d=values, mode="train", custom_step_key="Optimization step"
-                    )
+                    wandb_logger.log_dict(d=values, mode="train", custom_step_key="Optimization step")
+                if tensorboard_logger:
+                    tensorboard_logger.log_dict(d=values, mode="train", custom_step_key="Algorithm step")
 
         progress.pending_updates -= threshold
         if handoff.enabled:
@@ -635,7 +652,10 @@ def _run_training_loop(
 
 
 def _start_runtime(
-    cfg: LearnerPipelineConfig, wandb_logger: WandBLogger | None, shutdown_event: Any
+    cfg: LearnerPipelineConfig,
+    wandb_logger: WandBLogger | None,
+    tensorboard_logger: TensorBoardLogger | None,
+    shutdown_event: Any,
 ) -> None:
     transition_queue = Queue()
     interaction_queue = Queue()
@@ -647,6 +667,7 @@ def _start_runtime(
             cfg,
             runtime,
             wandb_logger,
+            tensorboard_logger,
             shutdown_event,
         )
         if has_offline_initialization:
@@ -672,6 +693,7 @@ def _start_runtime(
         _run_training_loop(
             cfg,
             wandb_logger,
+            tensorboard_logger,
             shutdown_event,
             transition_queue,
             interaction_queue,
@@ -699,10 +721,10 @@ def train(cfg: LearnerPipelineConfig, job_name: str | None = None) -> None:
     init_logging(log_file=str(log_file), display_pid=not use_threads(cfg))
     logging.info("[LEARNER] independent onlineRL_evoRL runtime; no generic learner delegation")
     logging.info(pformat(cfg.to_dict()))
-    if cfg.wandb.enable and cfg.wandb.project:
-        wandb_logger = WandBLogger(cfg)
-    else:
-        wandb_logger = None
+    wandb_logger = WandBLogger(cfg) if cfg.wandb.enable and cfg.wandb.project else None
+    tensorboard_cfg = getattr(cfg, "tensorboard", None)
+    tensorboard_logger = TensorBoardLogger(cfg) if getattr(tensorboard_cfg, "enable", False) else None
+    if wandb_logger is None and tensorboard_logger is None:
         logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
     set_seed(cfg.seed)
     torch.backends.cudnn.benchmark = True
@@ -710,7 +732,11 @@ def train(cfg: LearnerPipelineConfig, job_name: str | None = None) -> None:
     shutdown_event = ProcessSignalHandler(
         use_threads(cfg), display_pid=not use_threads(cfg)
     ).shutdown_event
-    _start_runtime(cfg, wandb_logger, shutdown_event)
+    try:
+        _start_runtime(cfg, wandb_logger, tensorboard_logger, shutdown_event)
+    finally:
+        if tensorboard_logger:
+            tensorboard_logger.finish()
 
 
 @parser.wrap()

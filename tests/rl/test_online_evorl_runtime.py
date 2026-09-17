@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from lerobot.onlineRL_evoRL import gym_manipulator
+from lerobot.onlineRL_evoRL import gym_manipulator, learner as evorl_learner
 from lerobot.onlineRL_evoRL.actor_new import ActorVLARuntime, OnlineActorRuntime
 from lerobot.onlineRL_evoRL.compact_transition import (
     SLIDING_WINDOW_TRANSITIONS,
@@ -546,3 +546,57 @@ def test_online_actor_rtc_uses_shared_chunk_runner(monkeypatch):
 
     assert torch.equal(result, torch.tensor([[3.0]]))
     assert calls == [(observation, "bi_piper_follower", torch.device("cpu"))]
+
+
+def test_evorl_learner_initializes_and_closes_tensorboard_logger(monkeypatch, tmp_path):
+    events = {}
+
+    class Config(SimpleNamespace):
+        def to_dict(self):
+            return {}
+
+    class FakeTensorBoardLogger:
+        def __init__(self, cfg):
+            events["initialized_with"] = cfg
+            events["logger"] = self
+            self.closed = False
+
+        def finish(self):
+            self.closed = True
+
+    cfg = Config(
+        output_dir=str(tmp_path / "learner"),
+        job_name="tensorboard-test",
+        seed=1000,
+        algorithm=SimpleNamespace(concurrency=SimpleNamespace(learner="threads")),
+        wandb=SimpleNamespace(enable=False, project=None),
+        tensorboard=SimpleNamespace(enable=True, log_dir=str(tmp_path / "tensorboard")),
+    )
+    shutdown_event = Event()
+
+    monkeypatch.setattr(evorl_learner, "_validate_startup_config", lambda _cfg: None)
+    monkeypatch.setattr(evorl_learner, "init_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(evorl_learner, "set_seed", lambda _seed: None)
+    monkeypatch.setattr(
+        evorl_learner,
+        "ProcessSignalHandler",
+        lambda *_args, **_kwargs: SimpleNamespace(shutdown_event=shutdown_event),
+    )
+    monkeypatch.setattr(evorl_learner, "TensorBoardLogger", FakeTensorBoardLogger)
+
+    def start_runtime(runtime_cfg, wandb_logger, tensorboard_logger, runtime_shutdown_event):
+        events["runtime_args"] = (
+            runtime_cfg,
+            wandb_logger,
+            tensorboard_logger,
+            runtime_shutdown_event,
+        )
+
+    monkeypatch.setattr(evorl_learner, "_start_runtime", start_runtime)
+
+    evorl_learner.train(cfg)
+
+    logger = events["logger"]
+    assert events["initialized_with"] is cfg
+    assert events["runtime_args"] == (cfg, None, logger, shutdown_event)
+    assert logger.closed

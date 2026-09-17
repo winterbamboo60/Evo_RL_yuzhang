@@ -516,6 +516,18 @@ EVORL_EXTRACT_DATASET_ROOT=/cloud/datasets/20260915_bipiper_cube_catch_v2-1_merg
 EVORL_EXTRACT_OUTPUT_DIR=/cloud/outputs/20260915_bipiper_cube_catch_v2-1_compact_stride2 \
 EVORL_EXTRACT_POLICY_PATH=/cloud/models/pretrained_model \
 bash scripts/RL_extract_offline_features.sh --episodes 0:1247
+
+
+nohup env \
+  EVORL_EXTRACT_GPUS=2 \
+  EVORL_EXTRACT_BATCH_SIZE=224 \
+  EVORL_EXTRACT_WORKERS=16 \
+  EVORL_EXTRACT_STORAGE_DTYPE=float32 \
+  EVORL_EXTRACT_DATASET_ROOT=/mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
+  EVORL_EXTRACT_OUTPUT_DIR=/mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask_zRL \
+  EVORL_EXTRACT_POLICY_PATH=/mnt/cfs/0z9lxh/yuzhang/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_ddp2/train/checkpoints/002000/pretrained_model \
+  bash scripts/RL_extract_offline_features.sh --episodes 0:1247 \
+  > /mnt/cfs/0z9lxh/yuzhang/datasets/extract_offline_features.log 2>&1 &
 ```
 
 `EVORL_EXTRACT_BATCH_SIZE` 和 `EVORL_EXTRACT_WORKERS` 都是**每个 GPU 进程**的值；先用较小
