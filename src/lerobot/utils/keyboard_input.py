@@ -421,6 +421,16 @@ def init_keyboard_listener(
     def on_key(name: str) -> None:
         nonlocal last_intervention_time
         key = name.lower()
+        # Opt-in phase guard: saving/countdown must not label or discard another episode.
+        if events.get("recording_active") is False and key in {
+            episode_success_key, episode_failure_key, rerecord_episode_key, reset_episode_key,
+            "right", "n", "left", "r",
+        }:
+            logger.info("Recording control ignored while no episode is recording: %s", key)
+            return
+        if events.get("recording_active") is False and intervention_toggle_key and key == intervention_toggle_key:
+            logger.info("纯人工录制模式：C 不切换控制模式，当前已是人工控制。")
+            return
         if episode_success_key and key == episode_success_key.lower():
             events["episode_outcome"] = "success"
             events["exit_early"] = True

@@ -91,7 +91,9 @@ lerobot-record \\
 
 import logging
 import sys
+import threading
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
@@ -219,8 +221,14 @@ class RecordConfig:
     episode_failure_key: str = EVORL_FAILURE_KEY
     rerecord_episode_key: str = EVORL_RERECORD_KEY
     reset_episode_key: str = EVORL_RESET_KEY
+    hold_between_episodes: bool = False
+    episode_start_delay_s: float = 0.0
 
     def __post_init__(self):
+        if not np.isfinite(self.episode_start_delay_s) or self.episode_start_delay_s < 0:
+            raise ValueError("episode_start_delay_s must be finite and nonnegative.")
+        if self.hold_between_episodes and self.robot.type not in {"piper_follower", "bi_piper_follower"}:
+            raise ValueError("Holding between episodes currently requires PiPER followers.")
         if self.teleop is None:
             raise ValueError(
                 "A teleoperator is required for recording. "
@@ -256,6 +264,122 @@ def _log_record_telemetry(
     )
 
 
+def _home_piper_followers(
+    robot: Robot,
+    duration_s: float = 2.0,
+) -> RobotAction:
+    """Home follower joints and fully open grippers before recording starts."""
+    if duration_s <= 0:
+        raise ValueError("Startup homing duration must be positive.")
+    obs = robot.get_observation()
+    current = {}
+    arms = (
+        (("left_", robot.left_arm), ("right_", robot.right_arm))
+        if robot.name == "bi_piper_follower"
+        else (("", robot),)
+    )
+    for prefix, arm in arms:
+        for key in arm.action_features:
+            prefixed_key = f"{prefix}{key}"
+            value = float(obs[prefixed_key])
+            # PiPER observations are raw angles, but send_action applies calibration.
+            # Invert that transform so the first command holds the measured pose.
+            if not arm._use_uncalibrated_passthrough():
+                cal = arm.calibration[key]
+                value -= arm._from_calibration_units(cal.homing_offset)
+                if cal.drive_mode:
+                    value = -value
+            current[prefixed_key] = value
+    target = dict.fromkeys(current, 0.0)
+    for prefix, arm in arms:
+        key = f"{prefix}gripper.pos"
+        if arm._use_uncalibrated_passthrough():
+            # Match the raw-width limit enforced by PiperFollower.send_action.
+            target[key] = 101.1
+        else:
+            cal = arm.calibration["gripper.pos"]
+            open_offset = arm._from_calibration_units(cal.range_max - cal.homing_offset)
+            target[key] = -open_offset if cal.drive_mode else open_offset
+
+    physical_target = {}
+    for prefix, arm in arms:
+        for key in arm.action_features:
+            value = target[f"{prefix}{key}"]
+            physical_target[f"{prefix}{key}"] = (
+                value if arm._use_uncalibrated_passthrough() else arm._offset_to_target(key, value)
+            )
+    logging.info("PiPER homing start (raw feedback): %s", {key: obs[key] for key in current})
+    logging.info("PiPER homing target (action coordinates): %s", target)
+    logging.info("PiPER homing target (raw coordinates after calibration and limits): %s", physical_target)
+    logging.info("Homing PiPER joints and fully opening grippers over %.1f seconds.", duration_s)
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+        fraction = min(elapsed / duration_s, 1.0)
+        # Smoothstep starts and ends with zero commanded velocity.
+        weight = fraction * fraction * (3.0 - 2.0 * fraction)
+        robot.send_action({key: value + (target[key] - value) * weight for key, value in current.items()})
+        if fraction >= 1.0:
+            break
+        remaining = duration_s - (time.monotonic() - start)
+        if remaining > 0:
+            time.sleep(min(1.0 / 50.0, remaining))
+
+    final_obs = robot.get_observation()
+    logging.info("PiPER homing final feedback: %s", {key: final_obs[key] for key in current})
+    logging.info(
+        "PiPER homing residual (actual minus target; joints in degrees, gripper in mm): %s",
+        {key: round(float(final_obs[key]) - value, 3) for key, value in physical_target.items()},
+    )
+    return target
+
+
+@contextmanager
+def _hold_episode_action(robot, action, fps):
+    """Keep commanding the action input while the main thread saves or counts down."""
+    stop = threading.Event()
+    errors = []
+    target = dict(action)
+
+    def hold():
+        try:
+            while not stop.is_set():
+                robot.send_action(dict(target))
+                stop.wait(1.0 / fps)
+        except Exception as exc:
+            errors.append(exc)
+            stop.set()
+
+    worker = threading.Thread(target=hold, name="episode-pose-hold", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join()
+    if errors:
+        raise errors[0]
+
+
+def _episode_start_countdown(events, delay_s, episode_index):
+    logging.info("[准备] 即将录制第 %d 个 episode（dataset index=%d）", episode_index + 1, episode_index)
+    deadline = time.monotonic() + delay_s
+    previous = None
+    while not events["stop_recording"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        seconds = int(np.ceil(remaining))
+        if seconds != previous:
+            logging.info("[倒计时] %d", seconds)
+            previous = seconds
+        if events.get("toggle_intervention"):
+            events["toggle_intervention"] = False
+            logging.info("纯人工录制模式：C 不切换控制模式，当前已是人工控制。")
+        time.sleep(min(0.05, remaining))
+    return False
+
+
 def _reset_evorl_arms(
     robot: Robot,
     teleop: Teleoperator,
@@ -263,7 +387,10 @@ def _reset_evorl_arms(
     robot_action_processor: RobotProcessorPipeline,
     duration_s: float = 3.0,
 ) -> None:
-    """Smoothly return follower and actuated leader to calibrated action-space zero."""
+    """Home PiPER followers with open grippers; retain the generic reset for other robots."""
+    if robot.name in {"piper_follower", "bi_piper_follower"}:
+        _home_piper_followers(robot, duration_s=2.0)
+        return
     obs = robot.get_observation()
     raw_current = teleop.get_action()
     action_current = teleop_action_processor((raw_current, obs))
@@ -299,6 +426,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    last_action: dict | None = None,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -346,7 +474,7 @@ def record_loop(
     while timestamp < control_time_s:
         # Checked before `tick()`: this iteration is not a control tick, so it should not
         # be timed as one.
-        if events["exit_early"]:
+        if events["exit_early"] or events["stop_recording"]:
             events["exit_early"] = False
             break
 
@@ -410,11 +538,17 @@ def record_loop(
             continue
 
         with timer.section("send"):
+            if events["exit_early"] or events["stop_recording"]:
+                events["exit_early"] = False
+                break
             # Send action to robot
             # Action can eventually be clipped using `max_relative_target`,
             # so action actually sent is saved in the dataset. action = postprocessor.process(action)
             # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
             _sent_action = robot.send_action(robot_action_to_send)
+            if last_action is not None:
+                last_action.clear()
+                last_action.update(robot_action_to_send)
 
         # Write to dataset
         if dataset is not None:
@@ -569,6 +703,19 @@ def record(
             reset_episode_key=cfg.reset_episode_key if cfg.enable_evorl_controls else None,
         )
 
+        last_action = {}
+        if cfg.hold_between_episodes:
+            events["recording_active"] = False
+
+        if cfg.hold_between_episodes or (
+            teleop is not None
+            and (robot.name, teleop.name) in {
+                ("piper_follower", "piper_leader"),
+                ("bi_piper_follower", "bi_piper_leader"),
+            }
+        ):
+            last_action.update(_home_piper_followers(robot, duration_s=2.0))
+
         if not cfg.dataset.streaming_encoding:
             logging.info(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
@@ -580,7 +727,17 @@ def record(
                 episode_index = dataset.num_episodes
                 events["episode_outcome"] = None
                 events["reset_episode"] = False
-                log_say(f"Recording episode {episode_index}", cfg.play_sounds)
+                with (
+                    _hold_episode_action(robot, last_action, cfg.dataset.fps)
+                    if cfg.hold_between_episodes else nullcontext()
+                ):
+                    ready = _episode_start_countdown(events, cfg.episode_start_delay_s, episode_index)
+                if not ready or events["stop_recording"]:
+                    break
+                events["exit_early"] = False
+                if cfg.hold_between_episodes:
+                    events["recording_active"] = True
+                logging.info("[录制] 开始第 %d 个 episode（dataset index=%d）", episode_index + 1, episode_index)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -596,93 +753,104 @@ def record(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     timer=timer,
+                    last_action=last_action if cfg.hold_between_episodes else None,
                 )
+                if cfg.hold_between_episodes:
+                    events["recording_active"] = False
 
                 # R aborts the episode, returns both arms to calibrated zero, and re-records.
                 # Clear the loop-stop flag left by the keyboard event before the homing move.
                 if events.get("reset_episode"):
                     events["exit_early"] = False
                     log_say("Reset arms to initial pose and re-record", cfg.play_sounds)
-                    _reset_evorl_arms(
-                        robot,
-                        teleop,
-                        teleop_action_processor,
-                        robot_action_processor,
-                    )
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
-                    if not events.get("reset_episode"):
-                        record_loop(
-                            robot=robot,
-                            events=events,
-                            fps=cfg.dataset.fps,
-                            teleop_action_processor=teleop_action_processor,
-                            robot_action_processor=robot_action_processor,
-                            robot_observation_processor=robot_observation_processor,
-                            teleop=teleop,
-                            control_time_s=cfg.dataset.reset_time_s,
-                            single_task=cfg.dataset.single_task,
-                            display_data=cfg.display_data,
-                            display_mode=cfg.display_mode,
-                            display_compressed_images=display_compressed_images,
+                    if cfg.hold_between_episodes:
+                        last_action.clear()
+                        last_action.update(_home_piper_followers(robot, duration_s=2.0))
+                    else:
+                        _reset_evorl_arms(
+                            robot,
+                            teleop,
+                            teleop_action_processor,
+                            robot_action_processor,
                         )
 
-                if cfg.enable_evorl_controls and events["stop_recording"]:
-                    dataset.clear_episode_buffer()
-                    break
+                with (
+                    _hold_episode_action(robot, last_action, cfg.dataset.fps)
+                    if cfg.hold_between_episodes else nullcontext()
+                ):
+                    # Execute a few seconds without recording to give time to manually reset the environment
+                    # Skip reset for the last episode to be recorded
+                    if not cfg.hold_between_episodes and not events["stop_recording"] and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    ):
+                        log_say("Reset the environment", cfg.play_sounds)
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    timer.log_episode_summary("discarded episode")
-                    timer.restart()
-                    continue
+                        if not events.get("reset_episode"):
+                            record_loop(
+                                robot=robot,
+                                events=events,
+                                fps=cfg.dataset.fps,
+                                teleop_action_processor=teleop_action_processor,
+                                robot_action_processor=robot_action_processor,
+                                robot_observation_processor=robot_observation_processor,
+                                teleop=teleop,
+                                control_time_s=cfg.dataset.reset_time_s,
+                                single_task=cfg.dataset.single_task,
+                                display_data=cfg.display_data,
+                                display_mode=cfg.display_mode,
+                                display_compressed_images=display_compressed_images,
+                            )
 
-                if cfg.enable_evorl_controls and events.get("episode_outcome") is None:
-                    logging.warning(
-                        "Episode ended without %s/%s outcome; discarding it. Press %s=success or %s=failure.",
-                        cfg.episode_success_key.upper(),
-                        cfg.episode_failure_key.upper(),
-                        cfg.episode_success_key.upper(),
-                        cfg.episode_failure_key.upper(),
+                    if cfg.enable_evorl_controls and events["stop_recording"]:
+                        dataset.clear_episode_buffer()
+                        break
+
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        timer.log_episode_summary("discarded episode")
+                        timer.restart()
+                        continue
+
+                    if cfg.enable_evorl_controls and events.get("episode_outcome") is None:
+                        logging.warning(
+                            "Episode ended without %s/%s outcome; discarding it. Press %s=success or %s=failure.",
+                            cfg.episode_success_key.upper(),
+                            cfg.episode_failure_key.upper(),
+                            cfg.episode_success_key.upper(),
+                            cfg.episode_failure_key.upper(),
+                        )
+                        dataset.clear_episode_buffer()
+                        events["exit_early"] = False
+                        timer.log_episode_summary("discarded unlabeled episode")
+                        timer.restart()
+                        continue
+
+                    episode_metadata = None
+                    if cfg.enable_evorl_controls:
+                        episode_metadata = {
+                            "episode_success": normalize_episode_success_label(events["episode_outcome"])
+                        }
+                    episode_frames = (
+                        dataset.writer.episode_buffer["size"] if dataset.writer.episode_buffer is not None else 0
                     )
-                    dataset.clear_episode_buffer()
-                    events["exit_early"] = False
-                    timer.log_episode_summary("discarded unlabeled episode")
+                    dataset.save_episode(episode_metadata=episode_metadata)
+                    logging.info(
+                        "Saved episode %d (outcome=%s, frames=%d)",
+                        episode_index,
+                        events.get("episode_outcome") or "unlabeled",
+                        episode_frames,
+                    )
+                    recorded_episodes += 1
+                    # Close the window on the episode just saved.  The digest is emitted on
+                    # the next episode's first tick, so the reset phase, `save_episode` and
+                    # the spoken prompts in between are excluded from the cadence instead of
+                    # being charged to whichever episode they sit next to.  `restart()` then
+                    # exempts that first tick, whose cameras have been idle for seconds.
+                    timer.log_episode_summary(f"episode {episode_index}")
                     timer.restart()
-                    continue
-
-                episode_metadata = None
-                if cfg.enable_evorl_controls:
-                    episode_metadata = {
-                        "episode_success": normalize_episode_success_label(events["episode_outcome"])
-                    }
-                episode_frames = (
-                    dataset.writer.episode_buffer["size"] if dataset.writer.episode_buffer is not None else 0
-                )
-                dataset.save_episode(episode_metadata=episode_metadata)
-                logging.info(
-                    "Saved episode %d (outcome=%s, frames=%d)",
-                    episode_index,
-                    events.get("episode_outcome") or "unlabeled",
-                    episode_frames,
-                )
-                recorded_episodes += 1
-                # Close the window on the episode just saved.  The digest is emitted on
-                # the next episode's first tick, so the reset phase, `save_episode` and
-                # the spoken prompts in between are excluded from the cadence instead of
-                # being charged to whichever episode they sit next to.  `restart()` then
-                # exempts that first tick, whose cameras have been idle for seconds.
-                timer.log_episode_summary(f"episode {episode_index}")
-                timer.restart()
     finally:
         # Cleanup must not stop after its first failure: a dataset finalization
         # problem must never leave the robot or teleoperator connected.

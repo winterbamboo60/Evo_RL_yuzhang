@@ -142,22 +142,30 @@ for port in "${ACTIVE_PORTS[@]}"; do
     SEEN_PORTS["$port"]=1
 done
 
+# LEFT_CAMERAS="{
+#   wrist: {
+#     type: intelrealsense, serial_number_or_name: \"${LEFT_WRIST_CAM}\",
+#     width: 640, height: 480, fps: 30, use_rgb: true, use_depth: false, warmup_s: 2,
+#     exposure_mode: manual, exposure: ${LEFT_EXPOSURE}, gain: ${CAMERA_GAIN},
+#     white_balance: ${CAMERA_WHITE_BALANCE}
+#   },
+#   top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}
+# }"
+# RIGHT_CAMERAS="{
+#   wrist: {
+#     type: intelrealsense, serial_number_or_name: \"${RIGHT_WRIST_CAM}\",
+#     width: 640, height: 480, fps: 30, use_rgb: true, use_depth: false, warmup_s: 2,
+#     exposure_mode: manual, exposure: ${RIGHT_EXPOSURE}, gain: ${CAMERA_GAIN},
+#     white_balance: ${CAMERA_WHITE_BALANCE}
+#   }
+# }"
+
 LEFT_CAMERAS="{
-  wrist: {
-    type: intelrealsense, serial_number_or_name: \"${LEFT_WRIST_CAM}\",
-    width: 640, height: 480, fps: 30, use_rgb: true, use_depth: false, warmup_s: 2,
-    exposure_mode: manual, exposure: ${LEFT_EXPOSURE}, gain: ${CAMERA_GAIN},
-    white_balance: ${CAMERA_WHITE_BALANCE}
-  },
+  wrist: {type: opencv, index_or_path: \"${LEFT_WRIST_CAM}\", width: 640, height: 480, fps: 30},
   top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}
 }"
 RIGHT_CAMERAS="{
-  wrist: {
-    type: intelrealsense, serial_number_or_name: \"${RIGHT_WRIST_CAM}\",
-    width: 640, height: 480, fps: 30, use_rgb: true, use_depth: false, warmup_s: 2,
-    exposure_mode: manual, exposure: ${RIGHT_EXPOSURE}, gain: ${CAMERA_GAIN},
-    white_balance: ${CAMERA_WHITE_BALANCE}
-  }
+  wrist: {type: opencv, index_or_path: \"${RIGHT_WRIST_CAM}\", width: 640, height: 480, fps: 30}
 }"
 
 COMMON=(
@@ -169,6 +177,8 @@ COMMON=(
     --robot.right_arm_config.speed_ratio=50
     --robot.left_arm_config.require_calibration=true
     --robot.right_arm_config.require_calibration=true
+    --robot.left_arm_config.gripper_effort_default=1000
+    --robot.right_arm_config.gripper_effort_default=5000
     "--robot.left_arm_config.cameras=${LEFT_CAMERAS}"
     "--robot.right_arm_config.cameras=${RIGHT_CAMERAS}"
     --dataset.repo_id=rollout_evorl_bi_piper
@@ -198,12 +208,15 @@ TELEOP=(
 
 if [[ -z "$POLICY_PATH" ]]; then
     echo "[模式] 双臂纯人工录制；B=成功 F=失败 A=放弃并重录 C=人工模式（当前已是人工控制）R=归零重录 Esc=结束。"
+    echo "[录制] 非录制阶段保持从臂和夹爪；保存/丢弃完成后，每次录制前倒计时 2 秒。"
     CMD=(
         lerobot-record
         "${COMMON[@]}"
         "${TELEOP[@]}"
         --teleop.left_arm_config.read_only_teaching_mode=true
         --teleop.right_arm_config.read_only_teaching_mode=true
+        --hold_between_episodes=true
+        --episode_start_delay_s=2
         --enable_evorl_controls=true
         "--episode_success_key=${SUCCESS_KEY}"
         "--episode_failure_key=${FAILURE_KEY}"

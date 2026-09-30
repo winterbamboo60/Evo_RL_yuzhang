@@ -152,6 +152,9 @@ class _PiperLeaderProcessProxy:
     def get_action(self) -> RobotAction:
         return self._call("get_action")
 
+    def get_read_diagnostics(self) -> dict[str, Any]:
+        return self._call("get_read_diagnostics")
+
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         self._call("send_feedback", feedback)
 
@@ -307,6 +310,12 @@ class BiPiperLeader(Teleoperator):
         right_action = self.right_arm.get_action()
         action_dict.update({f"right_{key}": value for key, value in right_action.items()})
         return action_dict
+
+    def get_read_diagnostics(self) -> dict[str, Any]:
+        return {
+            "left": self.left_arm.get_read_diagnostics(),
+            "right": self.right_arm.get_read_diagnostics(),
+        }
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, Any]) -> None:

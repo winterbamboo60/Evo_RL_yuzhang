@@ -82,6 +82,7 @@ class PiperLeader(Teleoperator):
         self._gravity_comp_loop: PiperGravityCompensationLoop | None = None
         self._last_feedback_joint_timestamp = 0.0
         self._last_feedback_gripper_timestamp = 0.0
+        self._last_valid_gripper_pos: float | None = None
 
         interface_cls, _ = get_piper_sdk()
         self.arm = interface_cls(
@@ -116,6 +117,7 @@ class PiperLeader(Teleoperator):
         self._manual_control_enabled = None
         self._last_feedback_joint_timestamp = 0.0
         self._last_feedback_gripper_timestamp = 0.0
+        self._last_valid_gripper_pos: float | None = None
         try:
             if self.config.read_only_teaching_mode:
                 logger.info(
@@ -356,7 +358,7 @@ class PiperLeader(Teleoperator):
     def _read_gripper_from_feedback(self) -> float | None:
         gripper_msg = self.arm.GetArmGripperMsgs()
         gripper_state = getattr(gripper_msg, "gripper_state", None)
-        if gripper_state is None:
+        if getattr(gripper_msg, "time_stamp", 0.0) <= 0 or gripper_state is None:
             return None
         return abs(milli_to_unit(getattr(gripper_state, "grippers_angle", 0)))
 
@@ -408,17 +410,43 @@ class PiperLeader(Teleoperator):
         if action is None:
             action = {f"{joint_name}.pos": 0.0 for joint_name in PIPER_JOINT_NAMES}
 
-        use_ctrl_for_gripper = (
-            self.config.prefer_ctrl_messages and not prefer_feedback and not used_feedback_for_joints
-        )
+        # Joint and gripper control frames arrive independently. Falling back to
+        # joint feedback must not discard a valid gripper target from the leader.
+        use_ctrl_for_gripper = self.config.prefer_ctrl_messages and not prefer_feedback
         gripper_pos = self._read_gripper_from_ctrl() if use_ctrl_for_gripper else None
         if gripper_pos is None and self.config.fallback_to_feedback:
             gripper_pos = self._read_gripper_from_feedback()
             self._last_feedback_gripper_timestamp = float(
                 getattr(self.arm.GetArmGripperMsgs(), "time_stamp", 0.0) or 0.0
             )
+        if gripper_pos is not None:
+            self._last_valid_gripper_pos = gripper_pos
+        elif self.config.read_only_teaching_mode:
+            # Unreceived SDK feedback is not a closed-gripper command. Keep the
+            # startup open pose until the first real sample, then retain that sample.
+            gripper_pos = getattr(self, "_last_valid_gripper_pos", None)
+            if gripper_pos is None:
+                cal = self.calibration.get("gripper.pos")
+                gripper_pos = self._from_calibration_units(cal.range_max) if cal is not None else 100.0
         action["gripper.pos"] = 0.0 if gripper_pos is None else gripper_pos
         return action
+
+    def get_read_diagnostics(self) -> dict[str, Any]:
+        """Return both CAN sources for startup alignment diagnostics, without sending commands."""
+        return {
+            "port": self.config.port,
+            "calibration": str(self.calibration_fpath),
+            "joint_ctrl": self._read_joint_from_ctrl(),
+            "joint_feedback": self._read_joint_from_feedback(),
+            "gripper_ctrl": self._read_gripper_from_ctrl(),
+            "gripper_feedback": self._read_gripper_from_feedback(),
+            "timestamps": {
+                "joint_ctrl": getattr(self.arm.GetArmJointCtrl(), "time_stamp", 0.0),
+                "joint_feedback": getattr(self.arm.GetArmJointMsgs(), "time_stamp", 0.0),
+                "gripper_ctrl": getattr(self.arm.GetArmGripperCtrl(), "time_stamp", 0.0),
+                "gripper_feedback": getattr(self.arm.GetArmGripperMsgs(), "time_stamp", 0.0),
+            },
+        }
 
     def _to_calibration_units(self, angle_deg: float) -> int:
         return int(round(angle_deg * self.config.calibration_scale))

@@ -9,8 +9,11 @@
 export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/home/lenovo/code/Evo-RL-loop-0911}"
 export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/home/lenovo/code/envs/evo_0911}"
 
-export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/root/projects/Evo_RL_yuzhang}"
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/cfs/0z9lxh/yuzhang/projects/Evo_RL_yuzhang}"
 export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
+
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/sda/yuzhang/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/sda/yuzhang/envs/evo_0911}"
 
 source "$EVORL_ENV_ROOT/bin/activate"
 cd "$EVORL_PROJECT_ROOT"
@@ -66,7 +69,7 @@ rsync -P \
 ```bash
 cd "$EVORL_PROJECT_ROOT"
 bash scripts/ci/env/install_evo_0911.sh \
-  --archive /mnt/cfs/0z9lxh/yuzhang/env/evo_0911_tar/evo_0911-20260915-200900-9bc743912816-dirty-ubuntu24.04-x86_64-py312-cu128.tar.gz \
+  --archive /mnt/sda/yuzhang/envs/env_0929/evo_0911-20260915-200900-9bc743912816-dirty-ubuntu24.04-x86_64-py312-cu128.tar.gz \
   --dest "$EVORL_ENV_ROOT"
 ```
 
@@ -96,6 +99,12 @@ uv sync \
   --locked \
   --python 3.12 \
   --extra evo
+
+UV_PROJECT_ENVIRONMENT="$EVORL_ENV_ROOT" \
+uv sync \
+  --python 3.12 \
+  --extra evo \
+  --default-index https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 安装完成后，在当前终端激活并验证：
@@ -187,6 +196,14 @@ bash scripts/RL_data.sh \
   --wrist_camera.index_or_path 260422275792 \
   --top_camera.index_or_path 6
 
+
+bash scripts/RL_data_bimanual.sh \
+  --dataset.root /mnt/sda/datasets/0929_pourWater/0930_pourWater_1 \
+  --dataset.single_task "catch the drink and pour it to cup" \
+  --left_wrist_camera.index_or_path 6 \
+  --right_wrist_camera.index_or_path 16 \
+  --top_camera.index_or_path 24
+
 ## 策略模型 + 人工介入（显式启用 can0）
 bash scripts/RL_data.sh \
   --dataset.root /home/lenovo/datasets/0909_pi05_sft_cube_catch_belt_50k_test1 \
@@ -199,14 +216,15 @@ bash scripts/RL_data.sh \
 
 ## 合并数据集
 python -m lerobot.scripts.lerobot_edit_dataset \
-    --repo_id /home/lenovo/datasets/v9_task123_0728_merged \
+    --new_repo_id 0929_pourWater_merge_v1_needDelete \
+    --new_root /mnt/sda/datasets/0929_pourWater_merge_v1_needDelete \
     --operation.type merge \
-    --operation.repo_ids "['/home/lenovo/datasets/v9_task2_0728/v9_task2_0728_merged', '/home/lenovo/datasets/task0_grab_the_package_and_place_it_on_the_pal', '/home/lenovo/datasets/task2_grab_the_package_and_place_it_into_the_b']"
+    --operation.repo_ids "['/mnt/sda/datasets/0929_pourWater_merge_v1', '/mnt/sda/datasets/0929_pourWater/0929_pourWater_1']"
 
 python -m lerobot.scripts.lerobot_edit_dataset \
-    --repo_id /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged \
+    --repo_id /mnt/sda/datasets/0929_pourWater_merge_v1 \
     --operation.type merge \
-    --operation.source_dir /home/lenovo/datasets/20260914_bipiper_cube_catch_v2
+    --operation.source_dir /mnt/sda/datasets/0929_pourWater
 
 python -m lerobot.scripts.lerobot_edit_dataset \
     --repo_id /home/lenovo/datasets/cube_catch_rollout_v3_merge_test  \
@@ -216,7 +234,7 @@ python -m lerobot.scripts.lerobot_edit_dataset \
     --operation.concatenate_data false
 
 ## 查看并编辑数据集
-python scripts/ci/dataset_checker.py /mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask
+python scripts/ci/dataset_checker.py /mnt/sda/datasets/0929_pourWater/0930_pourWater_1
 
 ## 修改数据集task
 python scripts/ci/replace_dataset_task.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged --task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." --output-suffix "_newTask"
