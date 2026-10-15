@@ -24,6 +24,7 @@ its writes live in the same method.
 """
 
 import logging
+import shutil
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -102,15 +103,17 @@ def get_step_checkpoint_dir(output_dir: Path, total_steps: int, step: int) -> Pa
     return output_dir / CHECKPOINTS_DIR / step_identifier
 
 
-def should_save_checkpoint(step: int, save_freq: int, total_steps: int) -> bool:
+def should_save_checkpoint(step: int, save_freq: int, total_steps: int, rolling_save_freq: int = 0) -> bool:
     """Whether a checkpoint should be saved at ``step``.
 
-    A checkpoint is saved every ``save_freq`` steps and always after the final step. A
-    non-positive ``save_freq`` disables periodic saving (only the final checkpoint is
-    written), mirroring how ``log_freq``/``eval_freq`` treat non-positive values and
-    avoiding a ``ZeroDivisionError`` from ``step % 0``.
+    Save at either positive interval and always after the final step. Non-positive
+    intervals disable their respective periodic saves, avoiding division by zero.
     """
-    return (save_freq > 0 and step % save_freq == 0) or step == total_steps
+    return (
+        (save_freq > 0 and step % save_freq == 0)
+        or (rolling_save_freq > 0 and step % rolling_save_freq == 0)
+        or step == total_steps
+    )
 
 
 def update_last_checkpoint(checkpoint_dir: Path) -> None:
@@ -127,6 +130,27 @@ def update_last_checkpoint(checkpoint_dir: Path) -> None:
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
     last_checkpoint_dir.symlink_to(relative_target)
+
+
+def prune_rolling_checkpoints(checkpoint_dir: Path, step: int, save_freq: int) -> None:
+    """On the main rank, after a successful save, remove older non-milestone checkpoints.
+
+    Only numeric checkpoint directories older than the current step are eligible. Symlinks
+    (including ``last``), unrelated files/directories, and future steps are left untouched.
+    """
+    for candidate in checkpoint_dir.parent.iterdir():
+        if candidate.is_symlink() or not candidate.is_dir() or not candidate.name.isdecimal():
+            continue
+        old_step = int(candidate.name)
+        if candidate == checkpoint_dir or old_step >= step:
+            continue
+        if save_freq > 0 and old_step % save_freq == 0:
+            continue
+        try:
+            shutil.rmtree(candidate)
+            logging.info("Removed old rolling checkpoint: %s", candidate)
+        except OSError:
+            logging.warning("Could not remove old rolling checkpoint: %s", candidate, exc_info=True)
 
 
 # ---------------------------------------------------------------------------------------------

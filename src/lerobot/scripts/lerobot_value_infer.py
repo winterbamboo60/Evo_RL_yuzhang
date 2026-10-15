@@ -16,6 +16,8 @@
 
 import logging
 import math
+import shutil
+import tempfile
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -413,6 +415,36 @@ def _write_columns_in_place(
     _update_feature_metadata(dataset_root=dataset_root, feature_infos=feature_infos)
 
 
+def _marked_dataset_root(source_root: Path) -> Path:
+    source_root = source_root.absolute()
+    return source_root.with_name(f"{source_root.name}_RLMarked")
+
+
+def _write_marked_dataset(
+    source_root: Path,
+    absolute_indices: np.ndarray,
+    columns: dict[str, np.ndarray],
+    feature_infos: dict[str, dict[str, Any]],
+) -> Path:
+    """Copy the complete dataset and publish annotations without modifying the source."""
+    destination = _marked_dataset_root(source_root)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Marked dataset already exists: {destination}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    try:
+        # Dereference symlinks and copy files rather than hard-linking mutable metadata/data.
+        logging.info("Copying dataset from %s to %s before writing annotations", source_root, destination)
+        shutil.copytree(source_root, staging, dirs_exist_ok=True)
+        _write_columns_in_place(staging, absolute_indices, columns, feature_infos)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"Marked dataset already exists: {destination}")
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return destination
+
+
 def _load_value_policy_and_processors(
     cfg: ValueInferencePipelineConfig,
     dataset: LeRobotDataset,
@@ -488,13 +520,18 @@ def run_value_inference_pipeline(
     storage_format = getattr(dataset.meta, "storage_format", DEFAULT_STORAGE_FORMAT)
     if storage_format != DEFAULT_STORAGE_FORMAT:
         raise NotImplementedError(
-            "In-place value annotation currently supports the standard parquet dataset layout only; "
+            "Value annotation currently supports the standard parquet dataset layout only; "
             f"got storage_format={storage_format!r}. Export to the standard LeRobot layout first."
         )
     raw_frames = dataset.hf_dataset.with_format(None)
     frame_count = len(raw_frames)
     if frame_count == 0:
         raise ValueError("Dataset has no frames.")
+
+    if cfg.acp.enable:
+        marked_root = _marked_dataset_root(Path(dataset.root))
+        if marked_root.exists() or marked_root.is_symlink():
+            raise FileExistsError(f"Marked dataset already exists: {marked_root}")
 
     if not cfg.acp.enable:
         #
@@ -768,23 +805,24 @@ def run_value_inference_pipeline(
             feature_infos[cfg.acp.advantage_field] = {"dtype": "float32", "shape": (1,), "names": None}
             feature_infos[cfg.acp.indicator_field] = {"dtype": "int64", "shape": (1,), "names": None}
 
-        # 将 value、advantage、indicator 三列直接写入 Parquet 文件（原地修改）
-        _write_columns_in_place(
-            dataset_root=Path(dataset.root),
+        # 在独立副本中写入标注，保留原数据集的 Parquet、元数据和视频。
+        marked_root = _write_marked_dataset(
+            source_root=Path(dataset.root),
             absolute_indices=absolute_indices,
             columns=columns,
             feature_infos=feature_infos,
         )
 
-        logging.info("Wrote value annotations to dataset root: %s", dataset.root)
+        marked_repo_id = f"{dataset.repo_id}_RLMarked"
+        logging.info("Wrote value annotations to new dataset: %s (repo_id=%s)", marked_root, marked_repo_id)
 
         # The current LeRobotDataset exposes ``hf_dataset`` as a read-only facade
         # property. Reload after the atomic parquet rewrites so visualization reads
         # the updated schema instead of assigning to that property (the 0901 API).
         if cfg.viz.enable:
             dataset = LeRobotDataset(
-                repo_id=dataset.repo_id,
-                root=dataset.root,
+                repo_id=marked_repo_id,
+                root=marked_root,
                 episodes=cfg.dataset.episodes,
                 revision=cfg.dataset.revision,
                 repo_type=cfg.dataset.repo_type,
@@ -850,6 +888,8 @@ def run_value_inference_pipeline(
             "world_size": int(accelerator.num_processes),
             "num_frames": int(frame_count),
             "checkpoint": str(pretrained_dir),
+            "dataset_root": str(marked_root),
+            "dataset_repo_id": marked_repo_id,
             "value_field": cfg.acp.value_field,
             "acp_enabled": bool(cfg.acp.enable),
             "value_inference_skipped": False,

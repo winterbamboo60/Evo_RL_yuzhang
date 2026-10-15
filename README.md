@@ -12,6 +12,9 @@ export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/home/lenovo/code/envs/evo_0911}"
 export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/cfs/0z9lxh/yuzhang/projects/Evo_RL_yuzhang}"
 export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
 
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/cfs/0z9lxh/yuzhang/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911_new}"
+
 export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/sda/yuzhang/projects/Evo_RL_yuzhang}"
 export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/sda/yuzhang/envs/evo_0911}"
 
@@ -234,7 +237,7 @@ python -m lerobot.scripts.lerobot_edit_dataset \
     --operation.concatenate_data false
 
 ## 查看并编辑数据集
-python scripts/ci/dataset_checker.py /mnt/sda/datasets/0929_pourWater/0930_pourWater_1
+python scripts/ci/dataset_checker.py /mnt/cfs/0z9lxh/yuzhang/datasets/1014_pourWater_40ml_60ml_80ml_merged
 
 ## 修改数据集task
 python scripts/ci/replace_dataset_task.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged --task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." --output-suffix "_newTask"
@@ -287,21 +290,73 @@ nohup bash scripts/RL_train.sh \
 两卡 PI0.5 示例（只需在单卡命令中选择显卡并增加 `--num_gpus 2`）：
 
 ```bash
-nohup env CUDA_VISIBLE_DEVICES=0,1 bash scripts/RL_train.sh \
-    --DATASET_ROOT /mnt/cfs/0z9lxh/yuzhang/datasets/20260915_bipiper_cube_catch_v2-1_merged_newTask \
-    --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/outputs/0915_pi05_sft_cube_catch_belt_dual_double/checkpoints/040000/pretrained_model \
-    --OUTPUT_DIR /mnt/cfs/0z9lxh/yuzhang/outputs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_ddp2 \
-    --policy_type pi05_rlt \
-    --num_gpus 2 \
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/cfs/0z9lxh/yuzhang/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd "$EVORL_PROJECT_ROOT"
+env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/RL_train.sh \
+    --DATASET_ROOT /mnt/cfs/0z9lxh/yuzhang/datasets/0929_pourWater_merge_v1 \
+    --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/modelZoo/pi05base \
+    --OUTPUT_DIR /mnt/cfs/0z9lxh/yuzhang/outputs/0930_pi05_rlt_sft_0929_pourWater_merge_v1_8gpu \
+    --policy_type pi05 \
+    --num_gpus 8 \
     --batch_size 8 \
-    --gradient_accumulation_steps 4 \
-    --steps 2000 \
-    --save_freq 1000 \
+    --gradient_accumulation_steps 1 \
+    --steps 1000 \
+    --save_freq 500 \
     --train_expert_only false \
     --tensorboard \
     -- \
+    --rename_map='{"observation.images.left_top":"observation.images.base_0_rgb","observation.images.left_wrist":"observation.images.left_wrist_0_rgb","observation.images.right_wrist":"observation.images.right_wrist_0_rgb"}' \
+    --policy.compile_model=false
+
+# 单臂任务加上--rename_map
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/mnt/cfs/0z9lxh/yuzhang/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
+
+source "$EVORL_ENV_ROOT/bin/activate"
+cd "$EVORL_PROJECT_ROOT"
+env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/RL_train.sh \
+    --DATASET_ROOT /mnt/cfs/0z9lxh/yuzhang/datasets/0929_pourWater_merge_v1 \
+    --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/modelZoo/pi05base \
+    --OUTPUT_DIR /mnt/cfs/0z9lxh/yuzhang/outputs/0930_pi05_rlt_sft_0929_pourWater_merge_v1_2gpu \
+    --policy_type pi05 \
+    --num_gpus 2 \
+    --batch_size 8 \
+    --gradient_accumulation_steps 1 \
+    --steps 50000 \
+    --save_freq 10000 \
+    --train_expert_only false \
+    --tensorboard \
+    -- \
+    --rename_map='{"observation.images.top":"observation.images.base_0_rgb","observation.images.wrist":"observation.images.left_wrist_0_rgb"}' \
+    --policy.compile_model=false
+
+# 单臂任务加上--rename_map
+export EVORL_PROJECT_ROOT="${EVORL_PROJECT_ROOT:-/root/projects/Evo_RL_yuzhang}"
+export EVORL_ENV_ROOT="${EVORL_ENV_ROOT:-/mnt/cfs/0z9lxh/yuzhang/env/evo_0911}"
+source "$EVORL_ENV_ROOT/bin/activate"
+cd "$EVORL_PROJECT_ROOT"
+nohup env CUDA_VISIBLE_DEVICES=0,1 \
+    TORCHELASTIC_SIGNALS_TO_HANDLE=SIGTERM,SIGINT,SIGQUIT \
+    bash scripts/RL_train.sh \
+    --DATASET_ROOT /mnt/cfs/0z9lxh/yuzhang/datasets/20260921_conveyor_belt_stackCube_v3-1_merged_recap \
+    --history_pretrained_path /mnt/cfs/0z9lxh/yuzhang/modelZoo/pi05base \
+    --OUTPUT_DIR /mnt/cfs/0z9lxh/yuzhang/outputs/1009_pi05_sft_20260921_conveyor_belt_stackCube_v3-1_merged_recap_trained0922_2gpu \
+    --policy_type pi05 \
+    --num_gpus 2 \
+    --batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --steps 50000 \
+    --save_freq 10000 \
+    --train_expert_only false \
+    --tensorboard \
+    -- \
+    --rename_map='{"observation.images.top":"observation.images.base_0_rgb","observation.images.wrist":"observation.images.left_wrist_0_rgb"}' \
     --policy.compile_model=false \
-    > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/0915_pi05_rlt_sft_20260915_bipiper_cube_catch_v21_merged_newTask_ddp2.log" 2>&1 < /dev/null &
+    > "/mnt/cfs/0z9lxh/yuzhang/outputs/logs/0922_pi05_sft_20260921_conveyor_belt_stackCube_v3-1_merged_recap_trained0922_2gpu.log" 2>&1 < /dev/null &
+
 ```
 
 四卡时改为 `CUDA_VISIBLE_DEVICES=0,1,2,3` 和 `--num_gpus 4`。显卡编号的数量必须不小于
@@ -614,3 +669,171 @@ bash scripts/RL_online.sh both
 
 日志默认写入配置的 `output_dir/logs/actor_<job_name>.log`；若环境中的
 `processor.observation.display_cameras=true`，会继续启动 Rerun。
+
+/mnt/cfs/0z9lxh/lizhehan/output/1010_pourWater_40ml_merge/checkpoints/1010_pourWater_40ml_merge.tar
+
+# RECAP：云端价值训练、优势标注与 VLA 训练
+
+三个阶段分别提供云端任务入口。路径和训练参数直接写在脚本中，无需提前 export 数据集、
+模型或输出路径，也无需手动激活环境。默认使用当前数据
+`craig/datasets/yida880/640/y480-merged`，8 张 GPU。
+
+| 阶段 | 云端入口 | 输入与输出 |
+| --- | --- | --- |
+| 价值训练 | [recap_valueTrain.sh](train_scripts/train_rl/recap_valueTrain.sh) | 原数据集 → Pistar06 价值模型 |
+| 价值推理 | [recap_valueInfer](train_scripts/train_rl/recap_valueInfer.sh) | 原数据集 + 价值模型 → 新的 `_RLMarked` 数据集 |
+| VLA 训练 | [recap_vlaTrain.sh](train_scripts/train_rl/recap_vlaTrain.sh) | `_RLMarked` 数据集 + PI0.5 初始模型 → 优势条件 VLA |
+
+公共环境逻辑位于 [recap_common.sh](train_scripts/train_rl/recap_common.sh)，上传项目时需一同保留。
+
+## 1. 云端提交方式
+
+在云端任务中将工作目录设置为项目根目录，三个任务的启动命令分别为：
+
+```bash
+bash train_scripts/train_rl/recap_valueTrain.sh
+
+cd /mnt/cfs/0z9lxh/yuzhang/projects
+python3 -m pai_jobs submit \
+  --name 1015_rl_valueTrain_pistar06_yida880-640-y480-merged_recap_valueTrain_8gpu \
+  --gpus 8 \
+  --script train_scripts/train_rl/recap_valueTrain.sh \
+  --gpu-type A800 \
+  --env MODE=train
+```
+
+价值训练完成后提交推理任务：
+
+```bash
+bash train_scripts/train_rl/recap_valueInfer.sh
+
+cd /mnt/cfs/0z9lxh/yuzhang/projects
+python3 -m pai_jobs submit \
+  --name 1015_rl_valueTrain_pistar06_yida880-640-y480-merged_recap_valueInfer_8gpu \
+  --gpus 8 \
+  --script train_scripts/train_rl/recap_valueInfer.sh \
+  --gpu-type A800 \
+  --env MODE=train
+```
+
+确认推理任务生成完整的 `_RLMarked` 数据集后，再提交 VLA 训练任务：
+
+```bash
+bash train_scripts/train_rl/recap_vlaTrain.sh
+
+cd /mnt/cfs/0z9lxh/yuzhang/projects
+python3 -m pai_jobs submit \
+  --name 1015_rl_valueTrain_pistar06_yida880-640-y480-merged_recap_vlaTrain_8gpu \
+  --gpus 8 \
+  --script train_scripts/train_rl/recap_vlaTrain.sh \
+  --gpu-type A800 \
+  --env MODE=train
+
+```
+
+也可使用脚本的绝对路径启动，不依赖任务初始工作目录。脚本自动识别所在共享盘，支持
+`/mnt/cfs/0z9lxh`、`/mnt/cfs/popa97` 以及其他 CFS 挂载前缀。共享盘内部保持以下布局：
+
+```text
+<CFS_ROOT>/yuzhang/projects/Evo_RL_yuzhang
+<CFS_ROOT>/yuzhang/env/evo_0911_new
+<CFS_ROOT>/yuzhang/modelZoo
+<CFS_ROOT>/craig/datasets/yida880/640/y480-merged
+```
+
+脚本自动激活 `evo_0911_new`，使用当前项目源码，并修正环境激活文件中的旧路径。
+和现有云端训练脚本一样，挂载前缀变化时会创建 `/mnt/cfs/0z9lxh` 路径别名，兼容模型配置、
+checkpoint 或打包环境中保存的旧绝对路径。已有路径指向其他共享盘时会报错，不覆盖；
+云端容器需要允许创建该别名。
+
+数据集与模型均读取本地路径，默认设置 `HF_HUB_OFFLINE=1` 和 `HF_DATASETS_OFFLINE=1`，
+不下载网络资源；模型、tokenizer 和数据需要预先放齐。`dataset.repo_id` 自动由目录名生成，
+仅作为本地逻辑名称，不要求存在对应的远程仓库。
+
+## 2. 检查命令与调整参数
+
+提交前可检查自动识别的路径和最终命令。该模式不启动 Python、训练或推理，不创建路径别名
+或输出目录：
+
+```bash
+bash train_scripts/train_rl/recap_valueTrain.sh --dry_run
+bash train_scripts/train_rl/recap_valueInfer --dry_run
+bash train_scripts/train_rl/recap_vlaTrain.sh --dry_run
+```
+
+默认 8 GPU，脚本通过 torchrun 启动多进程；单卡调试使用 `--num_gpus 1`。
+需要选择物理 GPU 时，可由云端任务设置 `CUDA_VISIBLE_DEVICES`，可见 GPU 数应至少为
+`--num_gpus` 指定的数量。
+
+```bash
+bash train_scripts/train_rl/recap_valueTrain.sh --num_gpus 1
+bash train_scripts/train_rl/recap_vlaTrain.sh --rolling_save_freq 2000
+```
+
+修改数据或实验名称时，直接编辑各入口脚本中的 `DATASET_ROOT`、`OUTPUT_DIR` 等变量，
+路径以 `$CFS_ROOT` 开头，不写死共享盘前缀。价值推理的 `VALUE_CHECKPOINT` 应匹配价值训练
+的 `OUTPUT_DIR`；VLA 训练的 `DATASET_ROOT` 应匹配推理生成的目录。
+VLA 默认使用 `modelZoo/pi05base`，也可将 `POLICY_INIT` 改为上一轮策略 checkpoint。
+
+底层 CLI 参数可以放在 `--` 后覆盖。例如：
+
+```bash
+bash train_scripts/train_rl/recap_valueTrain.sh -- --batch_size=4 --policy.use_gradient_checkpointing=true
+bash train_scripts/train_rl/recap_valueInfer -- --runtime.batch_size=32 --viz.enable=true
+```
+
+入口日志写入各脚本 `OUTPUT_DIR` 同级的 `<OUTPUT_DIR>_logs/<阶段名>.log`，同时输出到云端任务日志。
+价值训练 TensorBoard 位于 `<OUTPUT_DIR>/tensorboard`；VLA 的训练结果位于
+`<OUTPUT_DIR>/train`，TensorBoard 位于 `<OUTPUT_DIR>/tensoborad`（沿用现有脚本目录名）。
+VLA 脚本沿用 `RL_train.sh` 的 checkpoint 自动恢复逻辑。价值训练首次运行要求输出目录不存在；
+恢复已有价值训练可通过 `--` 传入标准 `--resume=true --config_path=.../pretrained_model/train_config.json`。
+
+## 3. 价值模型训练与优势标注
+
+本流程承接旧提交 `656a5b9d775262fb4cd65ea6f5520d546eaf3420` 的三阶段方案，使用当前接口。
+数据应为完整的标准 LeRobot v3 Parquet 数据集，包含图像、状态、动作、任务和 episode 成功/失败
+标注；兼容 `episode_success`、`success`、`episode_outcome` 等字段。标注整套数据，不设置
+`--dataset.episodes`。
+缺少可识别的成功/失败标签时，价值训练和价值推理均默认按成功处理；明确的失败标签仍保留。
+对应参数分别为 `--targets.default_success=success` 和 `--dataset.default_success=success`。
+
+Pistar06 使用本地 `siglip-so400m-patch14-384` 和 `gemma-3-270m`，根据成功/失败和剩余步数
+学习归一化未来价值。当前训练参数使用 `--policy.*`，旧版 `--value.*` 已不适用。
+默认每卡 batch=8、梯度累积=1，8 GPU 的有效 batch 为 64，训练 8000 steps，每 2000 steps 保存。
+当前 steps 统计 micro-batch 迭代数，调整梯度累积时应同时考虑实际优化器更新次数。
+
+推理自动读取价值训练目录的 `last` checkpoint，使用 n-step=50、positive_ratio=0.3，
+并可将人工介入帧强制标为正样本。训练与推理的 `c_fail_coef` 默认均为 1.0，应保持一致。
+
+推理完整复制原数据集，在同级目录生成 `y480-merged_RLMarked`，原数据集保持不变。
+副本需要额外存储空间；仅在复制和标注成功后发布目标目录，目标目录已存在时报错，不覆盖。
+新增字段如下：
+
+| 字段 | 含义 |
+| --- | --- |
+| `complementary_info.value` | 当前帧的价值预测 |
+| `complementary_info.advantage` | n-step 累计奖励 + 后续价值 − 当前价值 |
+| `complementary_info.acp_indicator` | 二值优势标签，1 为正、0 为负 |
+
+正标签按任务优势分布选取约前 30%；人工介入强制正标签可能使实际比例更高。
+推理结果摘要与可视化放在推理 `OUTPUT_DIR` 中，标注数据集始终位于原数据集同级目录。
+需要可视化时可覆盖 `--viz.enable=true`，按实际相机字段配置 `--viz.video_keys=...`。
+`--acp.enable=false` 仅复用已有标注，跳过推理，也不创建新数据集。
+
+## 4. 使用标注数据训练 VLA
+
+当前 ACP 接入 `pi05_rlt`。VLA 脚本读取 `y480-merged_RLMarked`，默认开启 ACP，
+使用 `complementary_info.acp_indicator`；默认每卡 batch=8、8 GPU、50000 steps，
+每 10000 steps 保留里程碑 checkpoint，额外每 2000 steps 滚动保存。
+相机重命名沿用 `train_3.sh` 的 main/wrist 映射，更换数据集时需对应修改 `--rename_map`。
+
+训练时向任务文本加入 `Advantage: positive` 或 `Advantage: negative`，
+`acp_indicator_dropout_prob=0.3` 表示随机丢弃 30% 的优势标签。
+当前方案同时训练 RLT 模块，总损失为 `RLT loss + rlt_alpha × VLA loss`，默认
+`rlt_alpha=1.0`；设置为 0 会关闭动作损失，不能用于关闭 RLT。
+普通 `pi05` 在当前接口中不支持开启 ACP。
+
+策略训练底层参数为 `--policy.acp_enabled`、`--policy.acp_indicator_field` 和
+`--policy.acp_indicator_dropout_prob`，价值推理仍使用 `--acp.*`。
+部署 ACP 策略时需在输入中提供正优势 indicator；当前 processor 不会自动补齐缺失 indicator。
+下一轮采集保留新的原始数据，再依次执行价值训练、生成该轮 `_RLMarked` 数据集和 VLA 训练。

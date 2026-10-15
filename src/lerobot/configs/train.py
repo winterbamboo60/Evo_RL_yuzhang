@@ -158,8 +158,11 @@ class TrainPipelineConfig(HubMixin):
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
-    # A non-positive value disables periodic saving, keeping only the final checkpoint.
+    # A non-positive value disables this interval; rolling saves and the final save still apply.
     save_freq: int = 20_000
+    # Extra rolling checkpoints for offline training. Keep only the latest, plus save_freq milestones.
+    # Zero disables both extra saves and pruning, preserving the existing behavior.
+    rolling_save_freq: int = 0
     # Model-artifact format inside checkpoints; non-default values require a sharded run.
     checkpoint_format: CheckpointFormat = CheckpointFormat.SAFETENSORS
     use_policy_training_preset: bool = True
@@ -273,6 +276,8 @@ class TrainPipelineConfig(HubMixin):
             self.reward_model.pretrained_path = str(policy_dir)
 
     def validate(self) -> None:
+        if self.rolling_save_freq < 0:
+            raise ValueError("rolling_save_freq must be non-negative (0 disables rolling checkpoints).")
         available_contexts = multiprocessing.get_all_start_methods()
         if (
             self.dataloader_multiprocessing_context is not None

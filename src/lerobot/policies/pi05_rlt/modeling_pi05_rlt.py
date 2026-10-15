@@ -221,7 +221,6 @@ class PI05RLTPolicy(PI05Policy):
     name = "pi05_rlt"
 
     def __init__(self, config: PI05RLTConfig, **kwargs):
-        skip_device_placement = kwargs.pop("_skip_device_placement", False)
         del kwargs
         require_package("transformers", extra="pi")
         PreTrainedPolicy.__init__(self, config)
@@ -231,8 +230,7 @@ class PI05RLTPolicy(PI05Policy):
         self.model = PI05RLTPytorch(config, rtc_processor=self.rtc_processor)
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
-        if not skip_device_placement:
-            self.model.to(config.device)
+        self.model.to(config.device)
         self.reset()
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):

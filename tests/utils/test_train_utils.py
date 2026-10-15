@@ -23,6 +23,7 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    prune_rolling_checkpoints,
     push_checkpoint_to_hub,
     save_training_metadata,
     save_training_state,
@@ -65,6 +66,55 @@ def test_get_step_checkpoint_dir():
     output_dir = Path("/checkpoints")
     step_dir = get_step_checkpoint_dir(output_dir, 1000, 5)
     assert step_dir == output_dir / CHECKPOINTS_DIR / "000005"
+
+
+def test_should_save_rolling_checkpoint():
+    assert should_save_checkpoint(2000, 10000, 23001, 2000) is True
+    assert should_save_checkpoint(1999, 10000, 23001, 2000) is False
+    assert should_save_checkpoint(10000, 10000, 23001, 3000) is True
+    assert should_save_checkpoint(23001, 10000, 23001, 2000) is True
+    assert should_save_checkpoint(2000, 10000, 23001, 0) is False
+
+
+@pytest.mark.parametrize("rolling_freq", [2000, 3000])
+def test_rolling_checkpoint_retention(tmp_path, rolling_freq):
+    # Simulate successful saves through a final step that is not on either interval.
+    final_step = 23001
+    for step in range(1, final_step + 1):
+        if not should_save_checkpoint(step, 10000, final_step, rolling_freq):
+            continue
+        checkpoint = get_step_checkpoint_dir(tmp_path, final_step, step)
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "weights").write_text("saved")
+        update_last_checkpoint(checkpoint)
+        prune_rolling_checkpoints(checkpoint, step, 10000)
+        expected = {f"{milestone:06d}" for milestone in (10000, 20000) if milestone <= step}
+        expected.add(f"{step:06d}")
+        assert {p.name for p in checkpoint.parent.iterdir() if not p.is_symlink()} == expected
+        assert (checkpoint.parent / "last" / "weights").read_text() == "saved"
+
+
+def test_prune_checkpoints_preserves_unrelated_entries(tmp_path):
+    current = tmp_path / "012000"
+    current.mkdir()
+    for name in ("002000", "010000", "014000", "notes"):
+        (tmp_path / name).mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "004000").symlink_to(external, target_is_directory=True)
+    (tmp_path / "006000").write_text("unrelated file")
+    update_last_checkpoint(current)
+    prune_rolling_checkpoints(current, 12000, 10000)
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "012000",
+        "010000",
+        "014000",
+        "notes",
+        "external",
+        "004000",
+        "006000",
+        "last",
+    }
 
 
 def make_cfg(batch_size: int = 32) -> TrainPipelineConfig:

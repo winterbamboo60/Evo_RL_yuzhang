@@ -49,6 +49,7 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    prune_rolling_checkpoints,
     publish_trained_model,
     push_checkpoint_to_hub,
     resume_after_prepare,
@@ -789,7 +790,7 @@ def train(cfg: TrainPipelineConfig):
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
+        is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps, cfg.rolling_save_freq)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
@@ -880,6 +881,8 @@ def train(cfg: TrainPipelineConfig):
                     )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+                if cfg.rolling_save_freq > 0:
+                    prune_rolling_checkpoints(checkpoint_dir, step, cfg.save_freq)
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:
