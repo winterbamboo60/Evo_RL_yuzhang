@@ -33,11 +33,12 @@ from lerobot.datasets.dataset_tools import (
     merge_datasets,
     modify_features,
     modify_tasks,
+    recompute_stats,
     reencode_dataset,
     remove_feature,
     split_dataset,
 )
-from lerobot.datasets.io_utils import load_info
+from lerobot.datasets.io_utils import load_info, load_stats
 from tests.datasets.test_video_encoding import require_h264, require_hevc, require_libsvtav1
 from tests.fixtures.constants import DUMMY_DEPTH_FEATURES, DUMMY_DEPTH_KEY
 from tests.fixtures.dataset_factories import add_frames
@@ -303,6 +304,89 @@ def test_merge_empty_list(tmp_path):
     """Test error when merging empty list."""
     with pytest.raises(ValueError, match="No datasets to merge"):
         merge_datasets([], output_repo_id="merged", output_dir=tmp_path)
+
+
+@pytest.mark.parametrize("recompute_statistics", [False, True])
+def test_recompute_stats_after_merge_uses_global_data(
+    empty_lerobot_dataset_factory, tmp_path, recompute_statistics
+):
+    """Recompute after merge must reflect the pooled data, not per-source summaries."""
+    features = {
+        "action": {"dtype": "float32", "shape": (3,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+    }
+
+    def _make(root, loc, episodes, frames, seed):
+        rng = np.random.default_rng(seed)
+        ds = empty_lerobot_dataset_factory(root=root, features=features)
+        for _ in range(episodes):
+            for _ in range(frames):
+                ds.add_frame(
+                    {
+                        "action": rng.normal(loc, 1.0, size=(3,)).astype(np.float32),
+                        "observation.state": rng.normal(loc, 1.0, size=(4,)).astype(np.float32),
+                        "task": "pick",
+                    }
+                )
+            ds.save_episode()
+        ds.finalize()
+        return ds
+
+    small = _make(tmp_path / "small", 0.0, 3, 5, seed=0)
+    big = _make(tmp_path / "big", 10.0, 20, 20, seed=1)
+    out = tmp_path / "merged"
+
+    with (
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
+    ):
+        mock_get_safe_version.return_value = "v3.0"
+        mock_snapshot_download.return_value = str(out)
+        kwargs = {} if recompute_statistics else {"recompute_statistics": False}
+        merged = merge_datasets([small, big], output_repo_id="merged", output_dir=out, **kwargs)
+
+    old_q50 = load_stats(out)["action"]["q50"].copy()
+    recompute_stats(merged)
+    new_q50 = load_stats(out)["action"]["q50"].copy()
+
+    pooled = np.concatenate(
+        [
+            np.stack(small.hf_dataset["action"]).astype(np.float64),
+            np.stack(big.hf_dataset["action"]).astype(np.float64),
+        ]
+    )
+    expected = np.quantile(pooled, 0.5, axis=0)
+
+    # Both the default merge and explicit recomputation reflect the pooled data.
+    # Legacy aggregation takes min(per-source q50), near the small dataset.
+    np.testing.assert_allclose(new_q50, expected, atol=1e-12, rtol=1e-12)
+    if recompute_statistics:
+        np.testing.assert_allclose(old_q50, expected, atol=1e-12, rtol=1e-12)
+    else:
+        assert not np.allclose(old_q50, expected, atol=0.5), (old_q50, expected)
+
+    frame_count = len(merged)
+    stats = load_stats(out)
+    assert stats["index"]["max"].item() == frame_count - 1
+    assert stats["episode_index"]["max"].item() == 22
+    for key in (
+        "action",
+        "observation.state",
+        "index",
+        "episode_index",
+        "task_index",
+        "frame_index",
+        "timestamp",
+    ):
+        values = np.asarray(merged.hf_dataset[key], dtype=np.float64)
+        if values.ndim == 1:
+            values = values[:, None]
+        for metric, q in (("q01", 0.01), ("q10", 0.1), ("q50", 0.5), ("q90", 0.9), ("q99", 0.99)):
+            np.testing.assert_allclose(
+                stats[key][metric], np.quantile(values, q, axis=0), atol=1e-12, rtol=1e-12
+            )
+        np.testing.assert_allclose(stats[key]["std"], values.std(axis=0), atol=1e-12, rtol=1e-12)
+        assert stats[key]["count"].item() == frame_count
 
 
 @pytest.mark.parametrize(

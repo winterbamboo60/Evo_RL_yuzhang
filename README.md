@@ -194,10 +194,10 @@ lerobot-setup-can --mode=test --interfaces=can1
 ## 纯人工
 
 bash scripts/RL_data.sh \
-  --dataset.root /home/lenovo/datasets/cube_catch_rollout_v3/0911_1 \
+  --dataset.root /mnt/sda/datasets/0930_test \
   --dataset.single_task "Grab the cube" \
-  --wrist_camera.index_or_path 260422275792 \
-  --top_camera.index_or_path 6
+  --wrist_camera.index_or_path 12 \
+  --top_camera.index_or_path 4
 
 
 bash scripts/RL_data_bimanual.sh \
@@ -225,9 +225,10 @@ python -m lerobot.scripts.lerobot_edit_dataset \
     --operation.repo_ids "['/mnt/sda/datasets/0929_pourWater_merge_v1', '/mnt/sda/datasets/0929_pourWater/0929_pourWater_1']"
 
 python -m lerobot.scripts.lerobot_edit_dataset \
-    --repo_id /mnt/sda/datasets/0929_pourWater_merge_v1 \
+    --repo_id /mnt/sda/datasets/1014_pourWater_40ml_60ml_80ml_merged \
     --operation.type merge \
-    --operation.source_dir /mnt/sda/datasets/0929_pourWater
+    --operation.source_dir /mnt/sda/datasets/1014_pourWater_40ml_60ml_80ml \
+    --operation.old true
 
 python -m lerobot.scripts.lerobot_edit_dataset \
     --repo_id /home/lenovo/datasets/cube_catch_rollout_v3_merge_test  \
@@ -236,11 +237,20 @@ python -m lerobot.scripts.lerobot_edit_dataset \
     --operation.concatenate_videos false \
     --operation.concatenate_data false
 
+# 默认：扫描全部合并帧，以 float64 稳定计算总体标准差和精确线性分位数
+# 同时更新全局索引统计和每条轨迹的数值统计；图像/视频保留采集时统计
+# 加 --operation.old true 则保留旧方式（汇总各源数据集自身的 stats）
+# 输出目录须不存在
+python -m lerobot.scripts.lerobot_edit_dataset \
+    --repo_id /mnt/sda/datasets/1010_pourWater_40ml_merge_test_v2 \
+    --operation.type merge \
+    --operation.source_dir /mnt/sda/datasets/1010_pourWater_40ml
+
 ## 查看并编辑数据集
-python scripts/ci/dataset_checker.py /mnt/cfs/0z9lxh/yuzhang/datasets/1014_pourWater_40ml_60ml_80ml_merged
+python scripts/ci/dataset_checker.py /mnt/sda/datasets/1014_pourWater_40ml/1014_pourWater_40ml_10
 
 ## 修改数据集task
-python scripts/ci/replace_dataset_task.py /home/lenovo/datasets/20260914_bipiper_cube_catch_v2_merged --task "Sort the moving blocks on the conveyor belt: use the left arm to place only yellow blocks into the left basket, and use the right arm to place only red blocks into the right basket." --output-suffix "_newTask"
+python scripts/ci/replace_dataset_task.py /mnt/sda/datasets/1014_pourWater_40ml_merged --task "catch the drink and pour 40ml water to cup" --output-suffix "_newTask"
 
 ## 数据集转化
 

@@ -108,6 +108,16 @@ Evo-RL 0901 compatibility: recursively merge all datasets below a local director
         --operation.type merge \
         --operation.source_dir /path/to/datasets_parent
 
+By default, merge recomputes exact numeric stats from every merged row, including reindexed
+fields, and refreshes numeric episode summaries. Image/video stats keep their recorded values.
+Pass --operation.old true to
+keep the legacy behavior of aggregating the source datasets' existing stats summaries:
+    lerobot-edit-dataset \
+        --new_repo_id lerobot/pusht_merged \
+        --operation.type merge \
+        --operation.repo_ids "['lerobot/pusht_train', 'lerobot/pusht_val']" \
+        --operation.old true
+
 For new scripts, prefer the explicit --new_repo_id/--new_root/--operation.roots form above.
 
 Remove camera feature:
@@ -307,6 +317,9 @@ class MergeConfig(OperationConfig):
     # When False, keep one file per source file instead of packing into shards.
     concatenate_videos: bool = True
     concatenate_data: bool = True
+    # Legacy behavior: write stats aggregated from the source datasets' existing stats.
+    # When False (default), recompute stats from the actual merged data instead.
+    old: bool = False
 
 
 @OperationConfig.register_subclass("remove_feature")
@@ -595,7 +608,14 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
         output_dir=output_dir,
         concatenate_videos=cfg.operation.concatenate_videos,
         concatenate_data=cfg.operation.concatenate_data,
+        recompute_statistics=not cfg.operation.old,
     )
+
+    if cfg.operation.old:
+        logging.info(
+            "Using legacy merge stats aggregated from the source datasets' existing stats "
+            "(--operation.old true)."
+        )
 
     logging.info(f"Merged dataset saved to {output_dir}")
     logging.info(

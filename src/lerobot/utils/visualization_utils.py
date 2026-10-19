@@ -21,10 +21,15 @@ this module does not import ``rerun`` or ``foxglove`` (each backend imports its 
 ``require_package`` guard).
 """
 
-from lerobot.lerobot_types import RobotAction, RobotObservation
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from .foxglove_visualization import init_foxglove, log_foxglove_data, shutdown_foxglove
 from .rerun_visualization import init_rerun, log_rerun_data, shutdown_rerun
+
+if TYPE_CHECKING:
+    from lerobot.lerobot_types import RobotAction, RobotObservation
 
 # Visualization backends selectable at runtime via a display-mode string (e.g. a --display_mode flag).
 VISUALIZATION_MODES = ("rerun", "foxglove")

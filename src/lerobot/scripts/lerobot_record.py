@@ -161,6 +161,7 @@ from lerobot.teleoperators import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard import KeyboardTeleop
+from lerobot.utils.async_visualization import AsyncVisualization
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
@@ -208,6 +209,10 @@ class RecordConfig:
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
+    # Keep image conversion and visualization SDK calls outside the hardware control process.
+    display_async: bool = True
+    # Preview refresh rate is independent of the dataset/control rate.
+    display_fps: float = 15.0
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -225,6 +230,8 @@ class RecordConfig:
     episode_start_delay_s: float = 0.0
 
     def __post_init__(self):
+        if not np.isfinite(self.display_fps) or self.display_fps <= 0:
+            raise ValueError("display_fps must be finite and positive.")
         if not np.isfinite(self.episode_start_delay_s) or self.episode_start_delay_s < 0:
             raise ValueError("episode_start_delay_s must be finite and nonnegative.")
         if self.hold_between_episodes and self.robot.type not in {"piper_follower", "bi_piper_follower"}:
@@ -427,6 +434,7 @@ def record_loop(
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
     last_action: dict | None = None,
+    preview: AsyncVisualization | None = None,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -436,6 +444,9 @@ def record_loop(
     statistics span the whole session and are reported per episode.  Without it each
     call gets a private timer: identical pacing and identical slow-loop warnings, just
     no end-of-run summary, since a single phase has no run to summarise.
+
+    *preview* submits the latest observation/action pair to a separate visualization
+    process without waiting for rendering. Skipped previews never skip dataset frames.
     """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -574,12 +585,18 @@ def record_loop(
 
         if display_data:
             with timer.section("telemetry"):
-                _log_record_telemetry(
-                    display_mode,
-                    observation=obs_processed,
-                    action=action_values,
-                    compress_images=display_compressed_images,
-                )
+                if preview is not None:
+                    preview.submit(
+                        observation={**obs_processed, "intervention": True},
+                        action=action_values,
+                    )
+                else:
+                    _log_record_telemetry(
+                        display_mode,
+                        observation=obs_processed,
+                        action=action_values,
+                        compress_images=display_compressed_images,
+                    )
 
         timer.wait()
 
@@ -595,10 +612,6 @@ def record(
 ) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
-    if cfg.display_data:
-        init_visualization(
-            cfg.display_mode, session_name="recording", ip=cfg.display_ip, port=cfg.display_port
-        )
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -639,6 +652,8 @@ def record(
 
     dataset = None
     listener = None
+    preview = None
+    visualization_initialized = False
     # One timer for the whole session, so its statistics describe the recording rather
     # than one episode's slice of it.  The reset phases below deliberately run on their
     # own private timers: they write no frames, so folding their ticks in would dilute
@@ -646,6 +661,30 @@ def record(
     timer = CycleTimer(cfg.dataset.fps)
 
     try:
+        # Spawn the preview sender before CAN/camera threads are connected. Its SDK
+        # initialization is covered by cleanup even if dataset or hardware setup fails.
+        if cfg.display_data:
+            if cfg.display_async:
+                preview = AsyncVisualization(
+                    cfg.display_mode,
+                    session_name="recording",
+                    ip=cfg.display_ip,
+                    port=cfg.display_port,
+                    compress_images=display_compressed_images,
+                    max_fps=cfg.display_fps,
+                )
+                preview.start()
+                logging.info(
+                    "Live preview runs in a separate process at up to %g FPS; recording remains at %g FPS.",
+                    cfg.display_fps,
+                    cfg.dataset.fps,
+                )
+            else:
+                init_visualization(
+                    cfg.display_mode, session_name="recording", ip=cfg.display_ip, port=cfg.display_port
+                )
+                visualization_initialized = True
+
         if cfg.resume:
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
             dataset = LeRobotDataset.resume(
@@ -709,7 +748,8 @@ def record(
 
         if cfg.hold_between_episodes or (
             teleop is not None
-            and (robot.name, teleop.name) in {
+            and (robot.name, teleop.name)
+            in {
                 ("piper_follower", "piper_leader"),
                 ("bi_piper_follower", "bi_piper_leader"),
             }
@@ -729,7 +769,8 @@ def record(
                 events["reset_episode"] = False
                 with (
                     _hold_episode_action(robot, last_action, cfg.dataset.fps)
-                    if cfg.hold_between_episodes else nullcontext()
+                    if cfg.hold_between_episodes
+                    else nullcontext()
                 ):
                     ready = _episode_start_countdown(events, cfg.episode_start_delay_s, episode_index)
                 if not ready or events["stop_recording"]:
@@ -737,7 +778,9 @@ def record(
                 events["exit_early"] = False
                 if cfg.hold_between_episodes:
                     events["recording_active"] = True
-                logging.info("[录制] 开始第 %d 个 episode（dataset index=%d）", episode_index + 1, episode_index)
+                logging.info(
+                    "[录制] 开始第 %d 个 episode（dataset index=%d）", episode_index + 1, episode_index
+                )
                 record_loop(
                     robot=robot,
                     events=events,
@@ -754,6 +797,7 @@ def record(
                     display_compressed_images=display_compressed_images,
                     timer=timer,
                     last_action=last_action if cfg.hold_between_episodes else None,
+                    preview=preview,
                 )
                 if cfg.hold_between_episodes:
                     events["recording_active"] = False
@@ -776,12 +820,15 @@ def record(
 
                 with (
                     _hold_episode_action(robot, last_action, cfg.dataset.fps)
-                    if cfg.hold_between_episodes else nullcontext()
+                    if cfg.hold_between_episodes
+                    else nullcontext()
                 ):
                     # Execute a few seconds without recording to give time to manually reset the environment
                     # Skip reset for the last episode to be recorded
-                    if not cfg.hold_between_episodes and not events["stop_recording"] and (
-                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    if (
+                        not cfg.hold_between_episodes
+                        and not events["stop_recording"]
+                        and ((recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"])
                     ):
                         log_say("Reset the environment", cfg.play_sounds)
 
@@ -799,6 +846,7 @@ def record(
                                 display_data=cfg.display_data,
                                 display_mode=cfg.display_mode,
                                 display_compressed_images=display_compressed_images,
+                                preview=preview,
                             )
 
                     if cfg.enable_evorl_controls and events["stop_recording"]:
@@ -834,7 +882,9 @@ def record(
                             "episode_success": normalize_episode_success_label(events["episode_outcome"])
                         }
                     episode_frames = (
-                        dataset.writer.episode_buffer["size"] if dataset.writer.episode_buffer is not None else 0
+                        dataset.writer.episode_buffer["size"]
+                        if dataset.writer.episode_buffer is not None
+                        else 0
                     )
                     dataset.save_episode(episode_metadata=episode_metadata)
                     logging.info(
@@ -886,7 +936,9 @@ def record(
         if listener is not None:
             run_cleanup("Keyboard listener shutdown", listener.stop)
 
-        if cfg.display_data:
+        if preview is not None:
+            run_cleanup("Preview process shutdown", preview.close)
+        elif visualization_initialized:
             run_cleanup(
                 "Visualization shutdown",
                 lambda: shutdown_visualization(cfg.display_mode),

@@ -165,6 +165,7 @@ wandb/
 # Data folders
 data/
 outputs/
+output/
 /artifacts/evo_0911/
 !scripts/ci/env/
 !scripts/ci/env/**

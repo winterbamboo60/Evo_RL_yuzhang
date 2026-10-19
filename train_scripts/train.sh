@@ -74,7 +74,7 @@ hash -r
 if ! "$VIRTUAL_ENV/bin/python" --version; then
     echo "[错误] 虚拟环境 Python 无法执行，请检查软链接目标和镜像：$VIRTUAL_ENV/bin/python" >&2
     exit 2
-firolling_save_freq
+fi
 
 echo "共享盘：$CFS_ROOT"
 echo "训练项目：$EVORL_PROJECT_ROOT"

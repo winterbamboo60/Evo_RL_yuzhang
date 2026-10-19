@@ -19,16 +19,19 @@ backend at runtime through the dispatch in :mod:`lerobot.utils.visualization_uti
 importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot[viz]'``).
 """
 
+from __future__ import annotations
+
 import numbers
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from lerobot.configs import DEPTH_MILLIMETER_UNIT, infer_depth_unit
-from lerobot.lerobot_types import RobotAction, RobotObservation
-
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
+
+if TYPE_CHECKING:
+    from lerobot.lerobot_types import RobotAction, RobotObservation
 
 
 def _is_scalar(x):
@@ -162,6 +165,10 @@ def log_rerun_data(
                     observation_paths.add(key)
                 else:
                     if arr.shape[-1] == 1:
+                        # RGB preview startup does not need the configuration
+                        # package and its training/recording dependencies.
+                        from lerobot.configs import DEPTH_MILLIMETER_UNIT, infer_depth_unit
+
                         # At record time, the depth unit is inferred from the frame type.
                         depth_unit = infer_depth_unit(arr.dtype)
                         img_entity = rr.DepthImage(

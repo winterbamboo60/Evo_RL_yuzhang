@@ -22,11 +22,17 @@
 # VLA + 人工介入时额外传入：
 #   --policy.path /path/to/checkpoint
 #   --can0.control true
+# VLA 相机键与 checkpoint 不一致时，可通过 --rename_map '{"机器人观测键":"策略输入键"}' 映射。
 # --can0.control 是左右主臂的总开关：VLA 模式默认 false，不连接 can0/can2。
 # 可继续复用 RL_data.sh 的：
 #   --rtc.enabled true
 #   --rtc.execution_horizon 25
 #   --rtc_action_queue_threshold 32
+# 纯人工录制的数据集帧率可通过 --fps 正整数调整（默认 30）；相机仍采集 30 FPS。
+# 实时预览默认开启；纯人工模式使用异步预览，最多 15 FPS，不改变 --fps 数采目标。
+# 可覆盖：--display_data true|false、--display_fps 正数、--display_compressed_images true|false。
+# --display_fps 仅适用于 lerobot-record；VLA rollout 暂时仍使用原有预览路径。
+# RGB 编码保持默认 libsvtav1，可通过 --dataset.rgb_encoder.vcodec h264 等覆盖。
 
 set -euo pipefail
 
@@ -45,6 +51,7 @@ TOP_CAM=""
 LEFT_WRIST_CAM=""
 RIGHT_WRIST_CAM=""
 POLICY_PATH=""
+RENAME_MAP=""
 VLA_CAN0_CONTROL="false"
 SUCCESS_KEY="b"
 FAILURE_KEY="f"
@@ -54,6 +61,7 @@ RESET_KEY="r"
 RTC_ENABLED="false"
 RTC_EXECUTION_HORIZON="25"
 RTC_QUEUE_THRESHOLD="32"
+FPS="30"
 LEFT_EXPOSURE="10000"
 RIGHT_EXPOSURE="10000"
 CAMERA_GAIN="16"
@@ -62,8 +70,20 @@ LEFT_LEADER_PORT="can0"
 LEFT_FOLLOWER_PORT="can1"
 RIGHT_LEADER_PORT="can2"
 RIGHT_FOLLOWER_PORT="can3"
+DISPLAY_DATA="true"
+DISPLAY_FPS="15"
+DISPLAY_COMPRESSED_IMAGES="false"
+RGB_ENCODER_VCODEC="libsvtav1"
 
 while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --display_data|--display_fps|--display_compressed_images|--dataset.rgb_encoder.vcodec|--fps|--rename_map)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "[错误] 参数缺少值：$1" >&2
+                exit 1
+            fi
+            ;;
+    esac
     case "$1" in
         --dataset.root) DATASET_ROOT="$2"; shift 2 ;;
         --dataset.single_task) SINGLE_TASK="$2"; shift 2 ;;
@@ -75,11 +95,23 @@ while [[ $# -gt 0 ]]; do
         --wrist_camera.gain|--wrist_camera.manual_gain) CAMERA_GAIN="$2"; shift 2 ;;
         --wrist_camera.white_balance|--wrist_camera.white_balance_kelvin) CAMERA_WHITE_BALANCE="$2"; shift 2 ;;
         --policy.path) POLICY_PATH="$2"; shift 2 ;;
+        --rename_map) RENAME_MAP="$2"; shift 2 ;;
+        --rename_map=*) RENAME_MAP="${1#*=}"; shift ;;
+        --fps) FPS="$2"; shift 2 ;;
+        --fps=*) FPS="${1#*=}"; shift ;;
         --can0.control|--vla.can0_control) VLA_CAN0_CONTROL="$2"; shift 2 ;;
         --can0.control=*|--vla.can0_control=*) VLA_CAN0_CONTROL="${1#*=}"; shift ;;
         --rtc.enabled) RTC_ENABLED="$2"; shift 2 ;;
         --rtc.execution_horizon) RTC_EXECUTION_HORIZON="$2"; shift 2 ;;
         --rtc_action_queue_threshold|--rtc.queue_threshold) RTC_QUEUE_THRESHOLD="$2"; shift 2 ;;
+        --display_data) DISPLAY_DATA="$2"; shift 2 ;;
+        --display_data=*) DISPLAY_DATA="${1#*=}"; shift ;;
+        --display_fps) DISPLAY_FPS="$2"; shift 2 ;;
+        --display_fps=*) DISPLAY_FPS="${1#*=}"; shift ;;
+        --display_compressed_images) DISPLAY_COMPRESSED_IMAGES="$2"; shift 2 ;;
+        --display_compressed_images=*) DISPLAY_COMPRESSED_IMAGES="${1#*=}"; shift ;;
+        --dataset.rgb_encoder.vcodec) RGB_ENCODER_VCODEC="$2"; shift 2 ;;
+        --dataset.rgb_encoder.vcodec=*) RGB_ENCODER_VCODEC="${1#*=}"; shift ;;
         --teleop.left_arm_config.port) LEFT_LEADER_PORT="$2"; shift 2 ;;
         --robot.left_arm_config.port) LEFT_FOLLOWER_PORT="$2"; shift 2 ;;
         --teleop.right_arm_config.port) RIGHT_LEADER_PORT="$2"; shift 2 ;;
@@ -98,6 +130,27 @@ if (( ${#missing[@]} )); then
     echo "[错误] 缺少必填参数：${missing[*]}" >&2
     exit 1
 fi
+if [[ "$DISPLAY_DATA" != "true" && "$DISPLAY_DATA" != "false" ]]; then
+    echo "[错误] --display_data 只能是 true 或 false：$DISPLAY_DATA" >&2
+    exit 1
+fi
+if [[ "$DISPLAY_COMPRESSED_IMAGES" != "true" && "$DISPLAY_COMPRESSED_IMAGES" != "false" ]]; then
+    echo "[错误] --display_compressed_images 只能是 true 或 false：$DISPLAY_COMPRESSED_IMAGES" >&2
+    exit 1
+fi
+# Accept positive decimal rates without evaluating user input as shell arithmetic.
+if [[ ! "$DISPLAY_FPS" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ || ! "$DISPLAY_FPS" =~ [1-9] ]]; then
+    echo "[错误] --display_fps 必须是正数：$DISPLAY_FPS" >&2
+    exit 1
+fi
+if [[ -z "$RGB_ENCODER_VCODEC" ]]; then
+    echo "[错误] --dataset.rgb_encoder.vcodec 不能为空" >&2
+    exit 1
+fi
+if [[ ! "$FPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[错误] --fps 必须是正整数（仅用于纯人工录制）：$FPS" >&2
+    exit 1
+fi
 if [[ "$RTC_ENABLED" != "true" && "$RTC_ENABLED" != "false" ]]; then
     echo "[错误] --rtc.enabled 只能是 true 或 false：$RTC_ENABLED" >&2
     exit 1
@@ -108,6 +161,10 @@ if [[ "$VLA_CAN0_CONTROL" != "true" && "$VLA_CAN0_CONTROL" != "false" ]]; then
 fi
 if [[ "$RTC_ENABLED" == "true" && -z "$POLICY_PATH" ]]; then
     echo "[错误] --rtc.enabled=true 必须同时提供 --policy.path" >&2
+    exit 1
+fi
+if [[ -n "$RENAME_MAP" && -z "$POLICY_PATH" ]]; then
+    echo "[错误] --rename_map 仅用于 VLA 模式，必须同时提供 --policy.path" >&2
     exit 1
 fi
 if [[ "$RTC_ENABLED" == "true" && ! "$RTC_EXECUTION_HORIZON" =~ ^[1-9][0-9]*$ ]]; then
@@ -122,7 +179,6 @@ if [[ -n "$POLICY_PATH" && ! -f "$POLICY_PATH/config.json" ]]; then
     echo "[错误] --policy.path 不是当前 LeRobot checkpoint：$POLICY_PATH" >&2
     exit 1
 fi
-
 USE_LEADERS="false"
 if [[ -z "$POLICY_PATH" || "$VLA_CAN0_CONTROL" == "true" ]]; then
     USE_LEADERS="true"
@@ -191,7 +247,9 @@ COMMON=(
     --dataset.push_to_hub=false
     --dataset.streaming_encoding=true
     --dataset.encoder_threads=2
-    --display_data=true
+    "--dataset.rgb_encoder.vcodec=${RGB_ENCODER_VCODEC}"
+    "--display_data=${DISPLAY_DATA}"
+    "--display_compressed_images=${DISPLAY_COMPRESSED_IMAGES}"
     --resume=false
 )
 TELEOP=(
@@ -209,9 +267,14 @@ TELEOP=(
 if [[ -z "$POLICY_PATH" ]]; then
     echo "[模式] 双臂纯人工录制；B=成功 F=失败 A=放弃并重录 C=人工模式（当前已是人工控制）R=归零重录 Esc=结束。"
     echo "[录制] 非录制阶段保持从臂和夹爪；保存/丢弃完成后，每次录制前倒计时 2 秒。"
+    echo "[录制] 数据集帧率=${FPS}"
     CMD=(
-        lerobot-record
+        # Use the lightweight entry point even in environments installed before
+        # lerobot-record was updated, so spawn does not reload recording imports.
+        python -m lerobot.scripts.lerobot_record_cli
         "${COMMON[@]}"
+        "--display_fps=${DISPLAY_FPS}"
+        "--dataset.fps=${FPS}"
         "${TELEOP[@]}"
         --teleop.left_arm_config.read_only_teaching_mode=true
         --teleop.right_arm_config.read_only_teaching_mode=true
@@ -225,6 +288,9 @@ if [[ -z "$POLICY_PATH" ]]; then
         "--reset_episode_key=${RESET_KEY}"
     )
 else
+    if [[ "$DISPLAY_DATA" == "true" ]]; then
+        echo "[警告] VLA 实时预览暂使用原有同步路径；--display_fps=${DISPLAY_FPS} 仅适用于纯人工录制，本模式不传此参数。" >&2
+    fi
     CMD=(
         lerobot-rollout
         "${COMMON[@]}"
@@ -238,6 +304,9 @@ else
         --fps=30
         --return_to_initial_position=false
     )
+    if [[ -n "$RENAME_MAP" ]]; then
+        CMD+=("--rename_map=${RENAME_MAP}")
+    fi
     if [[ "$VLA_CAN0_CONTROL" == "true" ]]; then
         echo "[模式] 双臂 VLA + can0/can2 随动及人工介入；B=成功 F=失败 A=放弃并重录 C=立即人工接管 R=归零重录 Esc=结束。"
         CMD+=(

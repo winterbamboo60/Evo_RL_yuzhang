@@ -20,14 +20,15 @@ backend at runtime through the dispatch in :mod:`lerobot.utils.visualization_uti
 importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot[viz]'``).
 """
 
+from __future__ import annotations
+
 import logging
 import numbers
 import time
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-
-from lerobot.lerobot_types import RobotAction, RobotObservation
 
 from .constants import (
     ACTION,
@@ -42,6 +43,9 @@ from .constants import (
     TRUNCATED,
 )
 from .import_utils import require_package
+
+if TYPE_CHECKING:
+    from lerobot.lerobot_types import RobotAction, RobotObservation
 
 # Static schema shared by all scalar topics. Each message carries a flat list of ``{label, value}``
 # pairs rather than one field per feature, so the same schema fits any robot regardless of which

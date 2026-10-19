@@ -150,7 +150,7 @@ class EpisodeHoldTests(unittest.TestCase):
                 enable_evorl_controls=True, display_data=False, display_mode="rerun", episode_success_key="b",
                 episode_failure_key="f", dataset=SimpleNamespace(num_episodes=2, fps=30,
                     episode_time_s=120000, single_task="pour")),
-            robot=object(), teleop=object(), teleop_action_processor=None, robot_action_processor=None,
+            robot=object(), teleop=object(), preview=None, teleop_action_processor=None, robot_action_processor=None,
             robot_observation_processor=None, display_compressed_images=False,
             timer=SimpleNamespace(log_episode_summary=lambda *a: None, restart=lambda: None),
             logging=logging, log_say=lambda *a: None, nullcontext=nullcontext,

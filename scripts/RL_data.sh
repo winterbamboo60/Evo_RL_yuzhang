@@ -234,17 +234,24 @@ PY
     fi
 fi
 
+# CAMERAS="{
+#   wrist: {
+#     type: intelrealsense,
+#     serial_number_or_name: \"${WRIST_CAM}\",
+#     width: 640, height: 480, fps: 30,
+#     use_rgb: true, use_depth: false, warmup_s: 2,
+#     exposure_mode: manual,
+#     exposure: ${WRIST_EXPOSURE}, gain: ${WRIST_GAIN}, white_balance: ${WRIST_WHITE_BALANCE}
+#   },
+#   top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}
+# }"
+
+
 CAMERAS="{
-  wrist: {
-    type: intelrealsense,
-    serial_number_or_name: \"${WRIST_CAM}\",
-    width: 640, height: 480, fps: 30,
-    use_rgb: true, use_depth: false, warmup_s: 2,
-    exposure_mode: manual,
-    exposure: ${WRIST_EXPOSURE}, gain: ${WRIST_GAIN}, white_balance: ${WRIST_WHITE_BALANCE}
-  },
+  wrist: {type: opencv, index_or_path: ${WRIST_CAM}, width: 640, height: 480, fps: 30},
   top: {type: opencv, index_or_path: ${TOP_CAM}, width: 640, height: 480, fps: 30}
 }"
+
 
 COMMON=(
     --robot.type=piper_follower
@@ -276,7 +283,9 @@ TELEOP=(
 if [[ -z "$POLICY_PATH" ]]; then
     echo "[模式] 纯人工录制；B=成功 F=失败 A=放弃并重录 C=人工模式（当前已是人工控制）R=归零重录 Esc=结束。"
     CMD=(
-        lerobot-record
+        # Avoid reloading recording dependencies in spawned preview workers,
+        # including environments with an older installed lerobot-record wrapper.
+        python -m lerobot.scripts.lerobot_record_cli
         "${COMMON[@]}"
         "${TELEOP[@]}"
         --teleop.read_only_teaching_mode=true

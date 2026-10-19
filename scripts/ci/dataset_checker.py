@@ -552,13 +552,18 @@ def _verify_export(root: Path) -> None:
 
     frame_index = np.asarray(data["frame_index"], dtype=np.int64)
     timestamps = np.asarray(data["timestamp"], dtype=float)
+    timestamp_type = data.schema.field("timestamp").type
     fps = float(info["fps"])
     for ep_idx, length in enumerate(lengths):
         mask = data_episode_index == ep_idx
         expected_frames = np.arange(length)
         if not np.array_equal(frame_index[mask], expected_frames):
             raise RuntimeError(f"导出后的 episode {ep_idx} frame_index 不连续")
-        if not np.allclose(timestamps[mask], expected_frames / fps, rtol=0, atol=1e-6):
+        # Match the stored precision: float32 rounding can exceed 1e-6 seconds.
+        expected_timestamps = np.asarray(
+            pa.array(expected_frames / fps, type=timestamp_type), dtype=float
+        )
+        if not np.allclose(timestamps[mask], expected_timestamps, rtol=0, atol=1e-6):
             raise RuntimeError(f"导出后的 episode {ep_idx} timestamp 不正确")
 
     if int(info["total_episodes"]) != len(lengths):

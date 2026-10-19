@@ -100,6 +100,18 @@ class TestOperationTypeParsing:
         assert isinstance(cfg.operation, MergeConfig)
         assert getattr(cfg.operation, flag) is False
 
+    def test_merge_old_flag_defaults_false(self):
+        cfg = parse_cfg(["--new_repo_id", "test/merged", "--operation.type", "merge"])
+        assert isinstance(cfg.operation, MergeConfig)
+        assert cfg.operation.old is False
+
+    def test_merge_old_flag_can_be_enabled(self):
+        cfg = parse_cfg(
+            ["--new_repo_id", "test/merged", "--operation.type", "merge", "--operation.old", "true"]
+        )
+        assert isinstance(cfg.operation, MergeConfig)
+        assert cfg.operation.old is True
+
     def test_non_merge_requires_repo_id(self):
         cfg = parse_cfg(["--operation.type", "delete_episodes"])
         with pytest.raises(ValueError, match="--repo_id is required for delete_episodes"):
